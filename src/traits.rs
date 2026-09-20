@@ -8,8 +8,9 @@ use sutram_io::ByteSource;
 use crate::types::{CarveHit, DetectConfidence, FsEntry, FsInfo};
 use crate::{FsError, Result};
 
-/// Parser behaviour knobs. Default = lenient/forensic.
-#[derive(Debug, Clone, Default)]
+/// Parser behaviour knobs. Default = lenient/forensic (strict off, magic
+/// checks on, orphans on).
+#[derive(Debug, Clone)]
 pub struct MountOptions {
     /// When `true`, the first corruption aborts the affected walk branch
     /// with an error instead of emitting partial results. Default `false`
@@ -23,6 +24,16 @@ pub struct MountOptions {
     /// (unreferenced inodes, unlinked cluster chains, journal orphans).
     /// Default `true` — this is a forensic tool.
     pub include_orphans: bool,
+}
+
+impl Default for MountOptions {
+    fn default() -> Self {
+        MountOptions {
+            strict: false,
+            check_magic: true,
+            include_orphans: true,
+        }
+    }
 }
 
 impl MountOptions {
