@@ -1,0 +1,18 @@
+[package]
+name = "sutram-hfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "HFS+/HFSX forensic filesystem parser (catalog B-tree residue, extents overflow, xattrs/decmpfs, journal awareness, magic verdicts)"
+keywords = ["forensics", "filesystem", "hfsplus", "hfs", "dfir"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
+# Pure-Rust DEFLATE for decmpfs zlib payloads (types 3/4). Justified: Apple's
+# AppleFSCompression stores most compressed files as zlib; without a DEFLATE
+# codec those files would all be Unrecoverable-in-practice.
+miniz_oxide = "0.9"
