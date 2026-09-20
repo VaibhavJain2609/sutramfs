@@ -1,0 +1,11 @@
+[package]
+name = "sutram-io"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Read-only byte-source abstractions, partition tables and sparse-image plumbing for filesystem forensics"
+keywords = ["forensics", "filesystem", "dfir", "partition", "sparse"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
