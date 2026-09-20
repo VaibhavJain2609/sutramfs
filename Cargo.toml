@@ -1,0 +1,14 @@
+[package]
+name = "sutram-ntfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "NTFS forensic filesystem parser (MFT/fixup, ADS, INDX slack, dual SI/FN timestamps, deleted-record recovery)"
+keywords = ["forensics", "filesystem", "ntfs", "dfir", "carving"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
