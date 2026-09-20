@@ -1,0 +1,14 @@
+[package]
+name = "sutram-ext4"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "ext2/3/4 forensic filesystem parser (extent trees, deleted inodes, dirent slack carving, journal awareness)"
+keywords = ["forensics", "filesystem", "ext4", "dfir", "carving"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
