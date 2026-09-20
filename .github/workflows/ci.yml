@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native: build + full test suite.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Cross: build + test via `cross` (Linux aarch64) or build-only.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            build-only: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+        if: matrix.cross
+      - name: Test (native)
+        if: "!matrix.cross && !matrix.build-only"
+        run: cargo test --all-targets --target ${{ matrix.target }}
+      - name: Test (cross)
+        if: matrix.cross
+        run: cross test --all-targets --target ${{ matrix.target }}
+      - name: Build (cross-compile only; cannot execute tests)
+        if: matrix.build-only
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Release build
+        if: "!matrix.build-only"
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Test (all features; ureq+rusqlite are feature-gated)
+        if: matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --all-targets --all-features --target ${{ matrix.target }}

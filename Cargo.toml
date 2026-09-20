@@ -1,0 +1,38 @@
+[package]
+name = "sutram-reputation"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "File reputation, VirusTotal hash lookup, and masquerade/suspicious-file analysis for SUTRAM-FS forensic pipelines"
+keywords = ["forensics", "reputation", "virustotal", "dfir", "masquerade"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-fs    = { path = "../sutram-fs",    version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1" }
+
+# OPTIONAL, feature-gated dependencies. All default-OFF; the crate builds
+# pure-Rust + network-free without them.
+#
+# `net`: thin blocking HTTP client. NOTE: ureq pulls rustls -> ring
+# (contains asm/C). This is the documented exception to the project's
+# pure-Rust rule; it is compiled only when `net` is requested.
+ureq = { version = "3", optional = true }
+#
+# `cache`: persistent reputation cache. NOTE: rusqlite/bundled compiles the
+# SQLite C amalgamation (libsqlite3-sys) — second documented exception,
+# also compiled only when `cache` is requested.
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+
+[features]
+default = []
+# Enable the `ureq`-backed HTTP transport (VirusTotal reachable).
+net = ["dep:ureq"]
+# Enable the sqlite-backed persistent cache.
+cache = ["dep:rusqlite"]
+# Allow the pipeline to consult a `SandboxProvider` (hash query only — the
+# pipeline NEVER submits file contents; see `SandboxProvider::submit_file`).
+sandbox = []
