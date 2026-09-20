@@ -1,0 +1,473 @@
+//! Compile-time signature database.
+//!
+//! A row matches when `buf[offset .. offset + magic.len()] == magic`.
+//! Detection scans all rows and keeps the longest-matching one; a handful of
+//! formats that need *interpretation* (PE confirmation inside an `MZ`, RIFF
+//! sub-types, `ftyp` brands, LUKS version, MP3 frame sync, the
+//! `CA FE BA BE` class-vs-fat-binary collision) are handled by dedicated
+//! checks in `verdict.rs` before/around the table scan.
+
+use crate::MagicType;
+
+/// One content signature.
+pub struct Signature {
+    /// Magic bytes to compare.
+    pub magic: &'static [u8],
+    /// Byte offset where the magic must appear.
+    pub offset: usize,
+    /// Type reported on match.
+    pub kind: MagicType,
+    /// Human-readable signature name for reasons/reports.
+    pub name: &'static str,
+}
+
+/// Content signatures. Order matters only for equal-length matches at the
+/// same offset; the scan prefers the *longest* magic.
+pub static SIGNATURES: &[Signature] = &[
+    // ---- executables & bytecode -------------------------------------------
+    Signature { magic: b"MZ", offset: 0, kind: MagicType::Pe, name: "MZ/PE stub" },
+    Signature { magic: b"\x7fELF", offset: 0, kind: MagicType::Elf, name: "ELF" },
+    Signature { magic: b"\xCE\xFA\xED\xFE", offset: 0, kind: MagicType::MachO32, name: "Mach-O 32 LE" },
+    Signature { magic: b"\xFE\xED\xFA\xCE", offset: 0, kind: MagicType::MachO32, name: "Mach-O 32 BE" },
+    Signature { magic: b"\xCF\xFA\xED\xFE", offset: 0, kind: MagicType::MachO64, name: "Mach-O 64 LE" },
+    Signature { magic: b"\xFE\xED\xFA\xCF", offset: 0, kind: MagicType::MachO64, name: "Mach-O 64 BE" },
+    Signature { magic: b"\xCA\xFE\xBA\xBF", offset: 0, kind: MagicType::MachOFat, name: "Mach-O fat64" },
+    Signature { magic: b"\0asm", offset: 0, kind: MagicType::Wasm, name: "WebAssembly" },
+    Signature { magic: b"dex\n", offset: 0, kind: MagicType::Dex, name: "Android dex" },
+    Signature { magic: b"#!", offset: 0, kind: MagicType::ShellScript, name: "shebang script" },
+    Signature { magic: b"dyld_v1", offset: 0, kind: MagicType::DyldCache, name: "dyld cache" },
+    // ---- documents ---------------------------------------------------------
+    Signature { magic: b"%PDF-", offset: 0, kind: MagicType::Pdf, name: "PDF" },
+    Signature { magic: b"%!PS", offset: 0, kind: MagicType::PostScript, name: "PostScript" },
+    Signature { magic: b"{\\rtf", offset: 0, kind: MagicType::Rtf, name: "RTF" },
+    Signature {
+        magic: b"\xE4\x52\x5C\x7B\x8C\xD8\xA7\x4D\xAE\xB1\x53\x78\xD0\x29\x96\xD3",
+        offset: 0,
+        kind: MagicType::OneNote,
+        name: "OneNote",
+    },
+    Signature { magic: b"!BDN", offset: 0, kind: MagicType::Pst, name: "Outlook PST" },
+    // ---- images ------------------------------------------------------------
+    Signature {
+        magic: b"\x89PNG\x0D\x0A\x1A\x0A",
+        offset: 0,
+        kind: MagicType::Png,
+        name: "PNG",
+    },
+    Signature { magic: b"\xFF\xD8\xFF", offset: 0, kind: MagicType::Jpeg, name: "JPEG" },
+    Signature { magic: b"GIF87a", offset: 0, kind: MagicType::Gif87, name: "GIF87a" },
+    Signature { magic: b"GIF89a", offset: 0, kind: MagicType::Gif89, name: "GIF89a" },
+    Signature { magic: b"BM", offset: 0, kind: MagicType::Bmp, name: "BMP" },
+    Signature { magic: b"II*\0", offset: 0, kind: MagicType::TiffLe, name: "TIFF LE" },
+    Signature { magic: b"MM\0*", offset: 0, kind: MagicType::TiffBe, name: "TIFF BE" },
+    Signature { magic: b"\0\0\x01\0", offset: 0, kind: MagicType::Ico, name: "ICO" },
+    Signature { magic: b"\0\0\x02\0", offset: 0, kind: MagicType::Cur, name: "CUR" },
+    Signature { magic: b"8BPS", offset: 0, kind: MagicType::Psd, name: "Photoshop" },
+    // ---- audio / video -----------------------------------------------------
+    Signature { magic: b"ID3", offset: 0, kind: MagicType::Mp3, name: "ID3v2" },
+    Signature { magic: b"fLaC", offset: 0, kind: MagicType::Flac, name: "FLAC" },
+    Signature { magic: b"OggS", offset: 0, kind: MagicType::Ogg, name: "Ogg" },
+    Signature { magic: b"FLV\x01", offset: 0, kind: MagicType::Flv, name: "Flash video" },
+    Signature {
+        magic: b"\x1A\x45\xDF\xA3",
+        offset: 0,
+        kind: MagicType::Mkv,
+        name: "EBML (mkv/webm)",
+    },
+    // ---- archives ----------------------------------------------------------
+    Signature { magic: b"PK\x03\x04", offset: 0, kind: MagicType::Zip, name: "ZIP" },
+    Signature { magic: b"PK\x05\x06", offset: 0, kind: MagicType::Zip, name: "ZIP empty/EOCD" },
+    Signature { magic: b"PK\x07\x08", offset: 0, kind: MagicType::Zip, name: "ZIP spanned" },
+    Signature { magic: b"\x1F\x8B", offset: 0, kind: MagicType::Gzip, name: "gzip" },
+    Signature { magic: b"BZh", offset: 0, kind: MagicType::Bzip2, name: "bzip2" },
+    Signature {
+        magic: b"\xFD7zXZ\0",
+        offset: 0,
+        kind: MagicType::Xz,
+        name: "xz",
+    },
+    Signature {
+        magic: b"7z\xBC\xAF\x27\x1C",
+        offset: 0,
+        kind: MagicType::SevenZ,
+        name: "7-Zip",
+    },
+    Signature {
+        magic: b"Rar!\x1A\x07\0",
+        offset: 0,
+        kind: MagicType::Rar4,
+        name: "RAR4",
+    },
+    Signature {
+        magic: b"Rar!\x1A\x07\x01",
+        offset: 0,
+        kind: MagicType::Rar5,
+        name: "RAR5",
+    },
+    Signature { magic: b"ustar", offset: 257, kind: MagicType::Tar, name: "ustar tar" },
+    Signature {
+        magic: b"\x28\xB5\x2F\xFD",
+        offset: 0,
+        kind: MagicType::Zstd,
+        name: "zstd",
+    },
+    Signature {
+        magic: b"\x04\x22\x4D\x18",
+        offset: 0,
+        kind: MagicType::Lz4,
+        name: "LZ4 frame",
+    },
+    Signature { magic: b"MSCF", offset: 0, kind: MagicType::Cab, name: "MS Cabinet" },
+    Signature { magic: b"!<arch>\n", offset: 0, kind: MagicType::Ar, name: "ar archive" },
+    // ---- databases ---------------------------------------------------------
+    Signature {
+        magic: b"SQLite format 3\0",
+        offset: 0,
+        kind: MagicType::Sqlite,
+        name: "SQLite3",
+    },
+    Signature {
+        magic: b"\x37\x7F\x06\x82",
+        offset: 0,
+        kind: MagicType::SqliteWal,
+        name: "SQLite WAL (LE ckpt)",
+    },
+    Signature {
+        magic: b"\x37\x7F\x06\x83",
+        offset: 0,
+        kind: MagicType::SqliteWal,
+        name: "SQLite WAL (BE ckpt)",
+    },
+    Signature {
+        magic: b"\xD9\xD5\x05\xF9\x20\xA1\x63\xD7",
+        offset: 0,
+        kind: MagicType::SqliteJournal,
+        name: "SQLite journal",
+    },
+    // ---- forensic artefacts ------------------------------------------------
+    Signature {
+        magic: b"ElfFile\0",
+        offset: 0,
+        kind: MagicType::Evtx,
+        name: "EVTX file",
+    },
+    Signature {
+        magic: b"ElfChnk\0",
+        offset: 0,
+        kind: MagicType::Evtx,
+        name: "EVTX chunk",
+    },
+    Signature { magic: b"regf", offset: 0, kind: MagicType::RegHive, name: "registry hive" },
+    Signature { magic: b"SCCA", offset: 0, kind: MagicType::Prefetch, name: "prefetch" },
+    Signature {
+        magic: b"MAM\x04",
+        offset: 0,
+        kind: MagicType::Prefetch,
+        name: "prefetch (compressed)",
+    },
+    Signature { magic: b"bplist00", offset: 0, kind: MagicType::Bplist, name: "binary plist" },
+    Signature {
+        magic: b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1",
+        offset: 0,
+        kind: MagicType::Ole2,
+        name: "OLE2/CFB",
+    },
+    Signature { magic: b"sdbf", offset: 0, kind: MagicType::Sdb, name: "shim database" },
+    Signature {
+        magic: b"\x4C\0\0\0\x01\x14\x02\0\0\0\0\0\xC0\0\0\0\0\0\0\x46",
+        offset: 0,
+        kind: MagicType::Lnk,
+        name: "LNK (size+CLSID)",
+    },
+    // ---- captures ----------------------------------------------------------
+    Signature {
+        magic: b"\xD4\xC3\xB2\xA1",
+        offset: 0,
+        kind: MagicType::Pcap,
+        name: "pcap LE us",
+    },
+    Signature {
+        magic: b"\xA1\xB2\xC3\xD4",
+        offset: 0,
+        kind: MagicType::Pcap,
+        name: "pcap BE us",
+    },
+    Signature {
+        magic: b"\x4D\x3C\xB2\xA1",
+        offset: 0,
+        kind: MagicType::Pcap,
+        name: "pcap LE ns",
+    },
+    Signature {
+        magic: b"\xA1\xB2\x3C\x4D",
+        offset: 0,
+        kind: MagicType::Pcap,
+        name: "pcap BE ns",
+    },
+    Signature {
+        magic: b"\x0A\x0D\x0D\x0A",
+        offset: 0,
+        kind: MagicType::PcapNg,
+        name: "pcapng",
+    },
+    // ---- disk / forensic images -------------------------------------------
+    Signature {
+        magic: b"EVF\x09\x0d\x0a\xff\0",
+        offset: 0,
+        kind: MagicType::Ewf,
+        name: "EWF E01",
+    },
+    Signature { magic: b"AFF", offset: 0, kind: MagicType::Aff, name: "AFF image" },
+    Signature { magic: b"KDMV", offset: 0, kind: MagicType::Vmdk, name: "VMDK" },
+    Signature {
+        magic: b"<<< Oracle VM VirtualBox Disk Image >>>",
+        offset: 0,
+        kind: MagicType::Vdi,
+        name: "VDI",
+    },
+    Signature { magic: b"QFI\xFB", offset: 0, kind: MagicType::Qcow, name: "qcow" },
+    Signature {
+        magic: b"LUKS\xBA\xBE",
+        offset: 0,
+        kind: MagicType::Luks1,
+        name: "LUKS (v from field)",
+    },
+    Signature {
+        magic: b"-FVE-FS-",
+        offset: 0,
+        kind: MagicType::BitLocker,
+        name: "BitLocker",
+    },
+    Signature {
+        magic: b"-FVE-FS-",
+        offset: 3,
+        kind: MagicType::BitLocker,
+        name: "BitLocker @3",
+    },
+    Signature {
+        magic: b"MSWIN4.1",
+        offset: 3,
+        kind: MagicType::BitLockerToGo,
+        name: "BitLocker-To-Go OEM label",
+    },
+    Signature {
+        magic: b"CD001",
+        offset: 0x8001,
+        kind: MagicType::Iso9660,
+        name: "ISO9660 PVD",
+    },
+    Signature {
+        magic: b"CD001",
+        offset: 0x8801,
+        kind: MagicType::Iso9660,
+        name: "ISO9660 (2K sector)",
+    },
+    Signature {
+        magic: b"CD001",
+        offset: 0x9001,
+        kind: MagicType::Iso9660,
+        name: "ISO9660 (4K sector)",
+    },
+    Signature {
+        magic: b"BEA01",
+        offset: 0x8000,
+        kind: MagicType::Udf,
+        name: "UDF BEA01",
+    },
+    // ---- filesystems -------------------------------------------------------
+    Signature { magic: b"NTFS    ", offset: 3, kind: MagicType::Ntfs, name: "NTFS OEM" },
+    Signature { magic: b"EXFAT   ", offset: 3, kind: MagicType::ExFat, name: "exFAT OEM" },
+    Signature { magic: b"FAT12   ", offset: 0x36, kind: MagicType::Fat, name: "FAT12 label" },
+    Signature { magic: b"FAT16   ", offset: 0x36, kind: MagicType::Fat, name: "FAT16 label" },
+    Signature { magic: b"FAT32   ", offset: 0x52, kind: MagicType::Fat, name: "FAT32 label" },
+    Signature {
+        magic: b"\x53\xEF",
+        offset: 0x438,
+        kind: MagicType::Ext,
+        name: "ext superblock",
+    },
+    Signature {
+        magic: b"_BHRfS_M",
+        offset: 0x10040,
+        kind: MagicType::Btrfs,
+        name: "btrfs superblock",
+    },
+    Signature {
+        magic: b"\x10\x20\xF5\xF2",
+        offset: 0x400,
+        kind: MagicType::F2fs,
+        name: "F2FS superblock",
+    },
+    Signature { magic: b"NXSB", offset: 0x20, kind: MagicType::Apfs, name: "APFS container" },
+    Signature { magic: b"APSB", offset: 0x20, kind: MagicType::Apfs, name: "APFS volume" },
+    Signature { magic: b"H+", offset: 0x400, kind: MagicType::HfsPlus, name: "HFS+" },
+    Signature { magic: b"HX", offset: 0x400, kind: MagicType::HfsPlus, name: "HFSX" },
+    Signature { magic: b"XFSB", offset: 0, kind: MagicType::Xfs, name: "XFS superblock" },
+    Signature {
+        magic: b"FILE",
+        offset: 0,
+        kind: MagicType::NtfsMftRecord,
+        name: "MFT FILE record",
+    },
+    // ---- crypto / encoded --------------------------------------------------
+    Signature { magic: b"-----BEGIN ", offset: 0, kind: MagicType::Pem, name: "PEM armour" },
+    Signature {
+        magic: b"Salted__",
+        offset: 0,
+        kind: MagicType::OpenSslSalted,
+        name: "OpenSSL salted",
+    },
+    // NOTE: PKCS#12 has no distinctive prefix (generic DER SEQUENCE) — it is
+    // declared-by-extension only, like WhatsAppCrypt.
+    // ---- misc --------------------------------------------------------------
+    Signature { magic: b"<?xml ", offset: 0, kind: MagicType::Xml, name: "XML" },
+];
+
+/// Trailer signatures: `(type, trailer bytes)`. [`crate::has_trailer`]
+/// searches the *end* of a buffer for these. Used to confirm types whose
+/// strongest signal is a footer (DMG `koly`, VHD `conectix`) and to sanity-
+/// check well-formedness (PNG `IEND`, PDF `%%EOF`, ZIP EOCD).
+pub static TRAILERS: &[(MagicType, &[u8])] = &[
+    (MagicType::Png, b"IEND\xAE\x42\x60\x82"),
+    (MagicType::Pdf, b"%%EOF"),
+    (MagicType::Zip, b"PK\x05\x06"),
+    (MagicType::Dmg, b"koly"),
+    (MagicType::Vhd, b"conectix"),
+    (MagicType::Gif89, b"\x3B"),
+];
+
+/// Extension → declared type. Lowercase, no dot. `PlainText` marks
+/// text-extension files (any binary magic under them is suspicious).
+/// Types like `WhatsAppCrypt` have no reliable magic — they exist so a
+/// `.crypt14` file *has* a declared type for verdict reasons.
+pub static EXT_TO_TYPE: &[(&str, MagicType)] = &[
+    // executables
+    ("exe", MagicType::Pe),
+    ("dll", MagicType::Pe),
+    ("sys", MagicType::Pe),
+    ("scr", MagicType::Pe),
+    ("com", MagicType::Pe),
+    ("ocx", MagicType::Pe),
+    ("efi", MagicType::Pe),
+    ("elf", MagicType::Elf),
+    ("so", MagicType::Elf),
+    ("ko", MagicType::Elf),
+    ("dylib", MagicType::MachO64),
+    ("wasm", MagicType::Wasm),
+    ("class", MagicType::JavaClass),
+    ("dex", MagicType::Dex),
+    ("sh", MagicType::ShellScript),
+    ("bash", MagicType::ShellScript),
+    ("lnk", MagicType::Lnk),
+    // documents
+    ("pdf", MagicType::Pdf),
+    ("ps", MagicType::PostScript),
+    ("rtf", MagicType::Rtf),
+    ("docx", MagicType::Docx),
+    ("docm", MagicType::Docx),
+    ("dotx", MagicType::Docx),
+    ("xlsx", MagicType::Xlsx),
+    ("xlsm", MagicType::Xlsx),
+    ("pptx", MagicType::Pptx),
+    ("pptm", MagicType::Pptx),
+    ("doc", MagicType::Doc),
+    ("xls", MagicType::Xls),
+    ("ppt", MagicType::Ppt),
+    ("msi", MagicType::Ole2),
+    ("odt", MagicType::Odt),
+    ("ods", MagicType::Ods),
+    ("odp", MagicType::Odp),
+    ("epub", MagicType::Epub),
+    ("one", MagicType::OneNote),
+    ("msg", MagicType::Msg),
+    ("pst", MagicType::Pst),
+    // images
+    ("png", MagicType::Png),
+    ("jpg", MagicType::Jpeg),
+    ("jpeg", MagicType::Jpeg),
+    ("gif", MagicType::Gif89),
+    ("bmp", MagicType::Bmp),
+    ("dib", MagicType::Bmp),
+    ("tif", MagicType::TiffLe),
+    ("tiff", MagicType::TiffLe),
+    ("webp", MagicType::WebP),
+    ("ico", MagicType::Ico),
+    ("cur", MagicType::Cur),
+    ("psd", MagicType::Psd),
+    ("heic", MagicType::Heic),
+    ("heif", MagicType::Heic),
+    ("avif", MagicType::Avif),
+    // audio / video
+    ("mp3", MagicType::Mp3),
+    ("wav", MagicType::Wav),
+    ("avi", MagicType::Avi),
+    ("mp4", MagicType::Mp4),
+    ("m4a", MagicType::Mp4),
+    ("m4v", MagicType::Mp4),
+    ("mov", MagicType::Mov),
+    ("3gp", MagicType::ThreeGpp),
+    ("mkv", MagicType::Mkv),
+    ("webm", MagicType::Mkv),
+    ("flv", MagicType::Flv),
+    ("ogg", MagicType::Ogg),
+    ("flac", MagicType::Flac),
+    // archives
+    ("zip", MagicType::Zip),
+    ("jar", MagicType::Jar),
+    ("apk", MagicType::Apk),
+    ("gz", MagicType::Gzip),
+    ("tgz", MagicType::Gzip),
+    ("bz2", MagicType::Bzip2),
+    ("xz", MagicType::Xz),
+    ("7z", MagicType::SevenZ),
+    ("rar", MagicType::Rar5),
+    ("tar", MagicType::Tar),
+    ("zst", MagicType::Zstd),
+    ("lz4", MagicType::Lz4),
+    ("cab", MagicType::Cab),
+    ("deb", MagicType::Ar),
+    ("a", MagicType::Ar),
+    // databases
+    ("sqlite", MagicType::Sqlite),
+    ("sqlite3", MagicType::Sqlite),
+    ("db", MagicType::Sqlite),
+    ("wal", MagicType::SqliteWal),
+    // disk / fs
+    ("e01", MagicType::Ewf),
+    ("aff", MagicType::Aff),
+    ("dmg", MagicType::Dmg),
+    ("vmdk", MagicType::Vmdk),
+    ("vhd", MagicType::Vhd),
+    ("vdi", MagicType::Vdi),
+    ("qcow2", MagicType::Qcow),
+    ("iso", MagicType::Iso9660),
+    // forensic artefacts
+    ("dat", MagicType::RegHive), // ntuser.dat etc.
+    ("evtx", MagicType::Evtx),
+    ("pf", MagicType::Prefetch),
+    ("plist", MagicType::Bplist),
+    ("sdb", MagicType::Sdb),
+    ("pcap", MagicType::Pcap),
+    ("pcapng", MagicType::PcapNg),
+    // crypto / encoded
+    ("pem", MagicType::Pem),
+    ("key", MagicType::Pem),
+    ("crt", MagicType::Pem),
+    ("p12", MagicType::Pkcs12),
+    ("pfx", MagicType::Pkcs12),
+    ("crypt12", MagicType::WhatsAppCrypt),
+    ("crypt14", MagicType::WhatsAppCrypt),
+    ("crypt15", MagicType::WhatsAppCrypt),
+    ("enc", MagicType::OpenSslSalted),
+    // text-ish
+    ("xml", MagicType::Xml),
+    ("txt", MagicType::PlainText),
+    ("log", MagicType::PlainText),
+    ("csv", MagicType::PlainText),
+    ("md", MagicType::PlainText),
+    ("json", MagicType::PlainText),
+    ("ini", MagicType::PlainText),
+    ("cfg", MagicType::PlainText),
+    ("html", MagicType::Xml),
+    ("htm", MagicType::Xml),
+];
