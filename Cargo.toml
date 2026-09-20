@@ -1,0 +1,14 @@
+[package]
+name = "sutram-apfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "APFS forensic filesystem parser (checkpoint recovery, deleted objects via superseded omap generations, snapshots, magic verdicts)"
+keywords = ["forensics", "filesystem", "apfs", "dfir", "macos"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
