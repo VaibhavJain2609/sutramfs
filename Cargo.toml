@@ -1,0 +1,14 @@
+[package]
+name = "sutram-f2fs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "F2FS forensic filesystem parser (log-structured recovery, orphan/deleted inodes, stale-segment prior versions, fscrypt awareness)"
+keywords = ["forensics", "filesystem", "f2fs", "android", "dfir"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
