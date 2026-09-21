@@ -11,3 +11,10 @@
 //! untrusted input, and every claim carries the signal that produced it.
 
 #![forbid(unsafe_code)]
+
+pub mod hash;
+
+pub use hash::{
+    hash_entry, hash_reader, hash_source, verify_acquisition, verify_ewf, verify_source,
+    AcqVerification, Digests, HashMismatch, HashResult, Md5, MediaHashes, Sha1, Sha256,
+};
