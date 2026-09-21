@@ -382,10 +382,7 @@ fn vbmeta_desc_overrun_warns_not_panics() {
     img[104..112].copy_from_slice(&(1u64 << 20).to_be_bytes());
     let info = vbmeta::parse(&img.as_slice()).unwrap();
     assert!(info.descriptors.is_empty());
-    assert!(info
-        .warnings
-        .iter()
-        .any(|w| w.contains("past auxiliary")));
+    assert!(info.warnings.iter().any(|w| w.contains("past auxiliary")));
 }
 
 #[test]
@@ -446,4 +443,21 @@ fn crypt_footer_detected() {
     // no magic → None
     let clean = vec![0u8; 0x10000];
     assert!(find_crypt_footer(&clean.as_slice()).is_none());
+}
+
+#[test]
+fn vbmeta_pubkey_size_field_not_offset() {
+    // public_key_size lives at header+64; +72 is public_key_offset.
+    // A blob with a key at aux-offset 0 (offset field = 0) must still
+    // report has_public_key from the size field.
+    let mut img = vbmeta_image(0, 0, &[]);
+    w64be(&mut img, 64, 2048); // public_key_size
+                               // public_key_offset @72 stays 0.
+    let info = vbmeta::parse(&img.as_slice()).unwrap();
+    assert!(info.has_public_key);
+    // Size 0 with a nonzero offset → no key.
+    let mut img = vbmeta_image(0, 0, &[]);
+    w64be(&mut img, 72, 4096); // public_key_offset only
+    let info = vbmeta::parse(&img.as_slice()).unwrap();
+    assert!(!info.has_public_key);
 }

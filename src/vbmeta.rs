@@ -208,29 +208,46 @@ pub struct VbmetaInfo {
     pub warnings: Vec<String>,
 }
 
-/// Parse an `AvbFooter` at `src.len() - 64`, if present.
+/// Parse an `AvbFooter`, if present.
+///
+/// The canonical position is `src.len() - 64`. Partition views, however,
+/// are usually padded to a sector boundary, so the real footer can sit a
+/// few sectors *before* the view's end — scan the tail (up to 4 KiB) at
+/// 64-byte alignment for the `AVBf` magic.
 pub fn parse_footer(src: &dyn ByteSource) -> Result<Option<VbmetaFooter>> {
     let len = src.len();
     if len < FOOTER_SIZE {
         return Ok(None);
     }
-    let off = len - FOOTER_SIZE;
-    let buf = src
-        .read_slice(off, FOOTER_SIZE as usize)
-        .map_err(FsError::Io)?;
-    if buf.len() < FOOTER_SIZE as usize || &buf[0..4] != FOOTER_MAGIC {
+    let scan = (len as usize).min(4096);
+    let start = len - scan as u64;
+    let buf = src.read_slice(start, scan).map_err(FsError::Io)?;
+    if buf.len() < FOOTER_SIZE as usize {
         return Ok(None);
     }
-    Ok(Some(VbmetaFooter {
+    let last = buf.len() - FOOTER_SIZE as usize;
+    for pos in (0..=last / FOOTER_SIZE as usize).rev() {
+        let pos = pos * FOOTER_SIZE as usize + last % FOOTER_SIZE as usize;
+        if &buf[pos..pos + 4] == FOOTER_MAGIC {
+            let b = &buf[pos..pos + FOOTER_SIZE as usize];
+            let off = start + pos as u64;
+            return Ok(Some(parse_footer_at(b, off)));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_footer_at(buf: &[u8], off: u64) -> VbmetaFooter {
+    VbmetaFooter {
         version: (
-            le::u32_be(&buf, 4).unwrap_or(0),
-            le::u32_be(&buf, 8).unwrap_or(0),
+            le::u32_be(buf, 4).unwrap_or(0),
+            le::u32_be(buf, 8).unwrap_or(0),
         ),
-        original_image_size: le::u64_be(&buf, 12).unwrap_or(0),
-        vbmeta_offset: le::u64_be(&buf, 20).unwrap_or(0),
-        vbmeta_size: le::u64_be(&buf, 28).unwrap_or(0),
+        original_image_size: le::u64_be(buf, 12).unwrap_or(0),
+        vbmeta_offset: le::u64_be(buf, 20).unwrap_or(0),
+        vbmeta_size: le::u64_be(buf, 28).unwrap_or(0),
         footer_offset: off,
-    }))
+    }
 }
 
 /// Parse a vbmeta blob whose header sits at offset 0 of `src`.
@@ -266,7 +283,8 @@ pub fn parse_at(
     let hash_size = le::u64_be(&hdr, 40).unwrap_or(0);
     let sig_offset = le::u64_be(&hdr, 48).unwrap_or(0);
     let sig_size = le::u64_be(&hdr, 56).unwrap_or(0);
-    let pubkey_size = le::u64_be(&hdr, 72).unwrap_or(0);
+    // public_key_size @64; @72 is public_key_offset.
+    let pubkey_size = le::u64_be(&hdr, 64).unwrap_or(0);
     let desc_offset = le::u64_be(&hdr, 96).unwrap_or(0);
     let desc_size = le::u64_be(&hdr, 104).unwrap_or(0);
     let rollback_index = le::u64_be(&hdr, 112).unwrap_or(0);

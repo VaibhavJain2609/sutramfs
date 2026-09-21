@@ -226,6 +226,19 @@ fn analyze_layer(src: Arc<dyn ByteSource>, depth: u32) -> Result<AndroidLayout> 
                         continue;
                     }
                 };
+                // OffsetView tolerates over-claimed sizes (truncated reads);
+                // flag it — like the LP extent check, a partition table
+                // claiming bytes the image doesn't hold is a corruption
+                // signal the report should surface.
+                if p.offset.saturating_add(p.size) > src.len() {
+                    warnings.push(format!(
+                        "partition {} end {:#x} exceeds source length {:#x} — \
+                         truncated image or corrupt table",
+                        p.index,
+                        p.offset.saturating_add(p.size),
+                        src.len()
+                    ));
+                }
                 let name = p
                     .label
                     .clone()
