@@ -320,9 +320,9 @@ impl<'m> Walk<'m> {
         let recoverable_bytes = surviving_bytes
             .saturating_add(sparse_in_window.saturating_mul(csz))
             .min(s.real_size);
-        let state = if expected == 0 {
-            RecoveryState::Intact
-        } else if surviving_in_window + sparse_in_window >= expected {
+        let state = if expected == 0
+            || surviving_in_window + sparse_in_window >= expected
+        {
             RecoveryState::Intact
         } else if recoverable_bytes == 0 {
             RecoveryState::Unrecoverable
