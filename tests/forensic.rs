@@ -466,3 +466,98 @@ fn read_file_at() {
     let n = fs.read_file_at(e, 6, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"F2FS f");
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests: sparse reads, unmapped extents, multi-block orphans
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sparse_file_reads_holes_as_zeros() {
+    // hello.txt → 3-block sparse file: i_addr[1] is a NULL hole.
+    // The flat extent reader would shift LONGER_DATA_BLK into the hole;
+    // the live reader must zero-fill at the right offsets.
+    let mut img = image().as_ref().clone();
+    let ib = HELLO_INODE_BLK as usize * BLK;
+    img[ib + 16..ib + 20].copy_from_slice(&(3 * BLK as u32).to_le_bytes()); // i_size
+    img[ib + 360 + 8..ib + 360 + 12]
+        .copy_from_slice(&(LONGER_DATA_BLK as u32).to_le_bytes()); // i_addr[2]
+    let src: Arc<dyn sutram_io::ByteSource> = Arc::new(img);
+    let fs = F2fsParser.mount(src).unwrap();
+    let es = entries(&*fs);
+    let e = by_path(&es, "/hello.txt");
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), 3 * BLK);
+    assert!(buf.starts_with(HELLO_CONTENT));
+    assert!(buf[BLK..2 * BLK].iter().all(|&b| b == 0), "hole not zeros");
+    assert!(buf[2 * BLK..].starts_with(LONGER_CONTENT));
+}
+
+#[test]
+fn deleted_inode_missing_extent_not_intact() {
+    // Zero dead.txt's only data pointer — a needed logical block is now
+    // unmapped. That is a loss, not Intact.
+    let mut img = image().as_ref().clone();
+    let ib = DEAD_INODE_BLK as usize * BLK;
+    img[ib + 360..ib + 364].copy_from_slice(&0u32.to_le_bytes()); // i_addr[0]
+    let src: Arc<dyn sutram_io::ByteSource> = Arc::new(img);
+    let fs = F2fsParser.mount(src).unwrap();
+    let es = entries(&*fs);
+    let dead = es
+        .iter()
+        .find(|e| e.name == "dead.txt")
+        .expect("dead.txt residue missing");
+    assert!(
+        matches!(
+            dead.status,
+            FsEntryStatus::Deleted {
+                recovery: RecoveryState::Unrecoverable
+            }
+        ),
+        "unmapped extent must not read Intact: {:?}",
+        dead.status
+    );
+}
+
+#[test]
+fn orphan_list_spans_multiple_blocks() {
+    // Two orphan blocks sharing a CP-total entry_count (1021) larger than
+    // one block's capacity — the old per-block cap skipped the whole list.
+    let mut img = image().as_ref().clone();
+    let w32 = |img: &mut [u8], off: usize, v: u32| {
+        img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    let w16 = |img: &mut [u8], off: usize, v: u16| {
+        img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    // Pack 0 at blk 512 becomes [cp][orphan][orphan][cp-copy] (total 4,
+    // start_sum 3). The cp copy moves to blk 515; version agreement is
+    // what pack validation checks (stale CRC only downgrades crc_ok).
+    let cp = 512 * BLK;
+    w32(&mut img, cp + 136, 4); // cp_pack_total_block_count
+    w32(&mut img, cp + 140, 3); // cp_pack_start_sum
+    img.copy_within(cp..cp + BLK, 515 * BLK);
+    // Orphan block 0 (blk 513): ino[0] = ORPHAN_NID.
+    let o0 = 513 * BLK;
+    w16(&mut img, o0 + BLK - 12, 0); // blk_addr
+    w16(&mut img, o0 + BLK - 10, 2); // blk_count
+    w32(&mut img, o0 + BLK - 8, 1021); // entry_count (CP total)
+    // Orphan block 1 (blk 514, previously the cp copy): ino[0] = nid 25.
+    let o1 = 514 * BLK;
+    img[o1..o1 + BLK].fill(0);
+    w32(&mut img, o1, 25);
+    w16(&mut img, o1 + BLK - 12, 1); // blk_addr
+    w16(&mut img, o1 + BLK - 10, 2); // blk_count
+    w32(&mut img, o1 + BLK - 8, 1021); // entry_count
+    let src: Arc<dyn sutram_io::ByteSource> = Arc::new(img);
+    let fs = F2fsParser.mount(src).unwrap();
+    let es = entries(&*fs);
+    for nid in [ORPHAN_NID, 25] {
+        assert!(
+            es.iter()
+                .any(|e| e.entry_id == nid as u64
+                    && e.meta.get("orphan").map(String::as_str) == Some("true")),
+            "orphan nid {nid} not recovered"
+        );
+    }
+}

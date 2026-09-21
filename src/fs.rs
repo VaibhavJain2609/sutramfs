@@ -747,8 +747,18 @@ impl F2fsFs {
             notes.push("inode records no extents".into());
             return (RecoveryState::Unrecoverable, ranges, notes);
         }
+        // Logical blocks the size needs that no extent maps at all —
+        // the pointers are gone (zeroed i_addr/dnode), which is a loss
+        // just like a reallocated block and must not read as Intact.
+        let mapped_needed = extents.iter().filter(|(l, _)| *l < needed).count() as u64;
+        let lost_nomap = needed.saturating_sub(mapped_needed);
+        if lost_nomap > 0 {
+            notes.push(format!(
+                "extent info lost for {lost_nomap} logical block(s)"
+            ));
+        }
         let recovered = (ranges.iter().map(|(_, l)| *l).sum::<u64>()).min(inode.size);
-        let state = if lost == 0 && unknown == 0 {
+        let state = if lost == 0 && unknown == 0 && lost_nomap == 0 {
             RecoveryState::Intact
         } else if recovered == 0 {
             RecoveryState::Unrecoverable
@@ -984,6 +994,16 @@ impl FileSystem for F2fsFs {
                 })
             }
         }
+        // Live files: re-resolve the inode and stream logical→physical so
+        // sparse holes yield zeros at the right offsets. The flat
+        // ExtentReader would silently shift later blocks into the hole —
+        // corrupting the content of any sparse file.
+        if !entry.is_deleted() {
+            if let Some(r) = self.live_reader(entry.entry_id as u32) {
+                return Ok(r);
+            }
+        }
+        // Deleted (or unresolvable) entries stream surviving extents only.
         Ok(Box::new(ExtentReader {
             src: self.src.clone(),
             ranges: entry.allocated_ranges.clone(),
@@ -998,6 +1018,92 @@ impl FileSystem for F2fsFs {
     /// stale node blocks, old file versions and dentry residue.
     fn unallocated_ranges(&self) -> Vec<(u64, u64)> {
         self.free_ranges()
+    }
+}
+
+impl F2fsFs {
+    /// Hole-aware reader for a live file: re-resolve `nid` through the
+    /// current NAT, then stream its extents with logical indices so
+    /// unmapped regions yield zeros. `None` when the inode can't be
+    /// resolved/parsed or carries inline data (flat readers handle those).
+    fn live_reader(&self, nid: u32) -> Option<Box<dyn Read + Send>> {
+        let e = self.tables().nat_entry(nid).ok()??;
+        if e.block_addr == 0 {
+            return None;
+        }
+        let (_, _, view) = self.read_node_at(e.block_addr, Some(nid)).ok()?;
+        let inode = match view {
+            NodeView::Inode(i) => i,
+            NodeView::Indirect(_) => return None,
+        };
+        if inode.inline_flags & inline_flag::INLINE_DATA != 0 {
+            return None;
+        }
+        let (exts, _) = self.extents(nid, &inode);
+        Some(Box::new(HoleReader {
+            src: self.src.clone(),
+            exts,
+            blk: self.sb.block_size,
+            pos: 0,
+            size: inode.size,
+        }))
+    }
+}
+
+/// Hole-aware reader for live files: `(logical block, physical block)`
+/// extents; unmapped logical regions yield zeros at the right offsets.
+struct HoleReader {
+    src: Arc<dyn ByteSource>,
+    /// Sorted by logical block (one entry per mapped block).
+    exts: Vec<(u64, u32)>,
+    blk: u64,
+    pos: u64,
+    size: u64,
+}
+
+impl Read for HoleReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.size || buf.is_empty() {
+            return Ok(0);
+        }
+        let lb = self.pos / self.blk;
+        let phys = self
+            .exts
+            .binary_search_by_key(&lb, |(l, _)| *l)
+            .ok()
+            .map(|i| self.exts[i].1);
+        match phys {
+            Some(p) => {
+                let off_in_blk = self.pos % self.blk;
+                let want = buf
+                    .len()
+                    .min((self.blk - off_in_blk).min(self.size - self.pos) as usize);
+                let n = self
+                    .src
+                    .read_at(p as u64 * self.blk + off_in_blk, &mut buf[..want])?;
+                self.pos += n as u64;
+                if n == 0 {
+                    return Ok(0); // short source — EOF
+                }
+                Ok(n)
+            }
+            None => {
+                // Sparse hole — zeros until the next mapped block or EOF.
+                let next = self
+                    .exts
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .find(|&l| l > lb)
+                    .map(|l| l * self.blk)
+                    .unwrap_or(self.size);
+                let want = buf
+                    .len()
+                    .min((next.min(self.size) - self.pos) as usize);
+                buf[..want].fill(0);
+                self.pos += want as u64;
+                Ok(want)
+            }
+        }
     }
 }
 

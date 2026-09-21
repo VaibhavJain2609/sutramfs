@@ -261,15 +261,22 @@ fn read_orphan_blocks(src: &dyn ByteSource, sb: &SuperBlock, cp: &Checkpoint) ->
             break; // truncated — emit what we have
         }
         let tail = sb.block_size as usize - 16;
-        let blk_addr = le::u16(&b, tail + 4).unwrap_or(0);
-        let blk_count = le::u16(&b, tail + 6).unwrap_or(0);
+        let blk_addr = le::u16(&b, tail + 4).unwrap_or(0) as usize;
+        let blk_count = le::u16(&b, tail + 6).unwrap_or(0) as usize;
+        // entry_count is the TOTAL orphan count across all blocks of
+        // this CP, not the count stored in this block.
         let entry_count = le::u32(&b, tail + 8).unwrap_or(0) as usize;
-        // Structural sanity before trusting the ino array.
-        if entry_count > inos_per_blk || blk_addr as usize >= count || (blk_count as usize) < count
-        {
+        // Structural sanity before trusting the ino array: the block
+        // index must be in range and the claimed total must fit the
+        // declared number of orphan blocks.
+        if blk_addr >= count || blk_count > count || entry_count > inos_per_blk * count {
             continue; // lenient: skip blocks that don't look like orphan lists
         }
-        for j in 0..entry_count {
+        // Entries in *this* block = total minus those in earlier blocks.
+        let have = entry_count
+            .saturating_sub(blk_addr * inos_per_blk)
+            .min(inos_per_blk);
+        for j in 0..have {
             if let Some(ino) = le::u32(&b, j * 4) {
                 if ino != 0 {
                     out.push(ino);
