@@ -53,7 +53,7 @@ pub fn detect(buf: &[u8]) -> Option<MagicType> {
     for s in SIGNATURES {
         if let Some(field) = buf.get(s.offset..s.offset + s.magic.len()) {
             if field == s.magic
-                && best.map_or(true, |b| s.magic.len() >= b.magic.len())
+                && best.is_none_or(|b| s.magic.len() >= b.magic.len())
             {
                 best = Some(s);
             }
@@ -142,6 +142,19 @@ fn detect_special(buf: &[u8]) -> Option<MagicType> {
             _ => MagicType::Wav, // unknown RIFF form — still a RIFF media file
         });
     }
+    // IFF/FORM container (big-endian cousin of RIFF): AIFF audio.
+    if buf.len() >= 12 && &buf[0..4] == b"FORM" {
+        return match &buf[8..12] {
+            b"AIFF" | b"AIFC" => Some(MagicType::Aiff),
+            _ => None,
+        };
+    }
+    // ZIP local-file-header subtypes: the *first entry name* identifies the
+    // container (ODF/EPUB `mimetype`, APK `AndroidManifest.xml`, jar
+    // `META-INF/…`). Falls through to the `PK` table rows on no match.
+    if let Some(t) = zip_subtype(buf) {
+        return Some(t);
+    }
     // ISO-BMFF `ftyp` box at offset 4.
     if buf.len() >= 12 && &buf[4..8] == b"ftyp" {
         let brand = &buf[8..12];
@@ -180,8 +193,56 @@ fn detect_special(buf: &[u8]) -> Option<MagicType> {
         if version != 1 && layer != 0 {
             return Some(MagicType::Mp3);
         }
+        // ADTS AAC: sync + layer bits == 00 (`FF F0`–`FF F9` family), which
+        // the MP3 rule above deliberately excludes.
+        if (buf[1] & 0xF6) == 0xF0 {
+            return Some(MagicType::Aac);
+        }
     }
     None
+}
+
+/// Identify the ZIP container's payload type from the *first* local-file
+/// header — the name (and, for ODF/EPUB, the stored `mimetype` content)
+/// distinguishes ODF documents, EPUB, APK and jar from a generic archive.
+/// Returns `None` when the first entry gives no answer (→ generic Zip).
+fn zip_subtype(buf: &[u8]) -> Option<MagicType> {
+    // Local file header: sig(4) ver(2) flags(2) method(2) mtime(2) mdate(2)
+    // crc(4) csize(4) usize(4) namelen(2) extralen(2) name[n] extra[m] data…
+    if buf.len() < 30 || &buf[0..4] != b"PK\x03\x04" {
+        return None;
+    }
+    let method = u16::from_le_bytes(buf[8..10].try_into().ok()?);
+    let name_len = u16::from_le_bytes(buf[26..28].try_into().ok()?) as usize;
+    let extra_len = u16::from_le_bytes(buf[28..30].try_into().ok()?) as usize;
+    let name = buf.get(30..30usize.checked_add(name_len)?)?;
+    match name {
+        b"AndroidManifest.xml" | b"classes.dex" | b"resources.arsc" => Some(MagicType::Apk),
+        b"mimetype" if method == 0 => {
+            // ODF/EPUB store the mime string uncompressed as the first entry.
+            let data = buf.get(30 + name_len + extra_len..)?;
+            let t = if data.starts_with(b"application/epub+zip") {
+                MagicType::Epub
+            } else if data.starts_with(b"application/vnd.oasis.opendocument.text")
+                || data.starts_with(b"application/vnd.sun.xml.writer")
+            {
+                MagicType::Odt
+            } else if data.starts_with(b"application/vnd.oasis.opendocument.spreadsheet")
+                || data.starts_with(b"application/vnd.sun.xml.calc")
+            {
+                MagicType::Ods
+            } else if data.starts_with(b"application/vnd.oasis.opendocument.presentation")
+                || data.starts_with(b"application/vnd.sun.xml.impress")
+            {
+                MagicType::Odp
+            } else {
+                return None;
+            };
+            Some(t)
+        }
+        n if n.starts_with(b"META-INF/") => Some(MagicType::Jar),
+        _ => None,
+    }
 }
 
 /// Extract the lowercase extension (without dot) from a filename.
@@ -206,6 +267,22 @@ fn extension(name: &str) -> Option<&str> {
 /// **not** a mismatch — OOXML is a ZIP container. `.doc` expecting OLE2
 /// likewise. The inverse (a `.docx` that is really `MZ`) is `High`.
 pub fn check_entry(name: &str, header: &[u8]) -> MagicVerdict {
+    check_entry_inner(name, header, None)
+}
+
+/// Like [`check_entry`] but the caller states the file's *total* size, so
+/// trailer verification (PNG `IEND`, PDF `%%EOF`, JPEG `FFD9`, …) only runs
+/// when `header` actually contains the whole file. Passing a 4 KiB header
+/// of a 1 MiB file produces no spurious "truncated" notes.
+pub fn check_entry_sized(name: &str, header: &[u8], total_size: u64) -> MagicVerdict {
+    check_entry_inner(name, header, Some(total_size))
+}
+
+fn check_entry_inner(
+    name: &str,
+    header: &[u8],
+    total_size: Option<u64>,
+) -> MagicVerdict {
     let ext = extension(name).map(|e| e.to_ascii_lowercase());
     let declared = ext
         .as_deref()
@@ -284,11 +361,12 @@ pub fn check_entry(name: &str, header: &[u8]) -> MagicVerdict {
         }
     }
 
-    // Missing-trailer note for container types when we likely have the whole
-    // file (small buffers only — large reads are headers, not whole files).
-    if let Some(x) = detected {
+    // Missing-trailer note — only when the caller confirmed the buffer is
+    // the *whole* file (`check_entry_sized` with total_size ≤ header len).
+    // A header-only probe can never prove a footer is missing.
+    let whole_file = total_size.is_some_and(|t| t <= header.len() as u64);
+    if let (Some(x), true) = (detected, whole_file) {
         if TRAILERS.iter().any(|(k, _)| *k == x)
-            && header.len() < 1024 * 1024
             && !has_trailer(x, header)
             && !matches!(x, MagicType::Zip)
         {

@@ -63,6 +63,9 @@ pub enum MagicType {
     Dex,
     /// Unix shebang script (`#!`).
     ShellScript,
+    /// Script source declared by extension (.ps1/.bat/.py/.vbs/…); a `#!`
+    /// shebang under one of those extensions still accepts [`MagicType::ShellScript`].
+    Script,
     /// Windows .lnk shortcut (execution artefact).
     Lnk,
     /// macOS dyld shared cache.
@@ -101,6 +104,10 @@ pub enum MagicType {
     Msg,
     /// Outlook PST (`!BDN`).
     Pst,
+    /// Compiled HTML Help (`ITSF`).
+    Chm,
+    /// Mobipocket / Kindle AZW ebook (`BOOKMOBI` at 60).
+    Mobi,
 
     // --- images ---
     /// PNG.
@@ -129,6 +136,10 @@ pub enum MagicType {
     Heic,
     /// AVIF (ftyp).
     Avif,
+    /// JPEG 2000 (jp2 signature box or raw codestream).
+    Jp2,
+    /// JPEG XL (container box or codestream).
+    Jxl,
 
     // --- audio / video ---
     /// MP3 (ID3v2 tag or MPEG audio frame sync).
@@ -151,6 +162,14 @@ pub enum MagicType {
     Ogg,
     /// FLAC audio.
     Flac,
+    /// AAC audio (ADTS framing, `FF Fx` with layer bits 00).
+    Aac,
+    /// AIFF/AIFC audio (`FORM`+`AIFF`).
+    Aiff,
+    /// Standard MIDI file (`MThd`).
+    Midi,
+    /// ASF/WMV/WMA container (header GUID).
+    Asf,
 
     // --- archives / compression ---
     /// ZIP (also the container for docx/jar/apk/epub/…).
@@ -181,6 +200,16 @@ pub enum MagicType {
     Cab,
     /// Unix ar archive (`!<arch>`).
     Ar,
+    /// Windows Imaging Format (`MSWIM` — .wim/.esd/.swm).
+    Wim,
+    /// Raw zlib stream (level bytes `78 01`/`9C`/`DA`).
+    Zlib,
+    /// ASCII cpio archive (`070701`/`070702`/`070707`).
+    Cpio,
+    /// RPM package (`ED AB EE DB`).
+    Rpm,
+    /// eXtensible ARchive (`xar!` — macOS .pkg).
+    Xar,
 
     // --- disk / forensic images ---
     /// Expert Witness Format segment (E01).
@@ -209,6 +238,10 @@ pub enum MagicType {
     Iso9660,
     /// UDF optical image.
     Udf,
+    /// Android sparse image (`3A FF 26 ED` — img2simg output).
+    AndroidSparse,
+    /// Android boot/recovery image (`ANDROID!`).
+    AndroidBoot,
 
     // --- filesystems ---
     /// FAT12/16/32 boot sector.
@@ -231,6 +264,16 @@ pub enum MagicType {
     Xfs,
     /// NTFS MFT record (`FILE`).
     NtfsMftRecord,
+    /// NTFS index record (`INDX`).
+    NtfsIndx,
+    /// NTFS $LogFile record (`RCRD`/`RSTR`).
+    NtfsLog,
+    /// squashfs filesystem (`hsqs`/`sqsh`/…).
+    Squashfs,
+    /// cramfs filesystem.
+    Cramfs,
+    /// GPT partition-table header (`EFI PART` at LBA 1).
+    Gpt,
 
     // --- databases ---
     /// SQLite 3 database.
@@ -253,6 +296,19 @@ pub enum MagicType {
     Ole2,
     /// Windows shell shim database (`sdb`).
     Sdb,
+    /// Extensible Storage Engine database (`EF CD AB 89` at 4 — ese.dll
+    /// artefacts: WebCacheV01.dat, Windows.edb, …).
+    Esedb,
+    /// Windows thumbcache (`CMMM`).
+    Thumbcache,
+    /// macOS Finder metadata (`.DS_Store`, `Bud1`/`Bud2`).
+    DsStore,
+    /// Legacy Windows event log (`LfLe` — .evt).
+    Evt,
+    /// Windows hibernation file (`hibr`/`HIBR`/`WAKE`/`wake`).
+    Hiberfil,
+    /// Windows crash dump (`PAGEDUMP`/`PAGEDU64`/`MDMP`).
+    Crashdump,
 
     // --- crypto / encoded ---
     /// PEM-armoured key/cert (`-----BEGIN `).
@@ -268,6 +324,8 @@ pub enum MagicType {
     // --- text / misc ---
     /// XML document.
     Xml,
+    /// HTML document.
+    Html,
     /// Generic text-like content (declared-by-extension only).
     PlainText,
     /// Capture file: libpcap.
@@ -290,6 +348,7 @@ impl MagicType {
             JavaClass => "Java class",
             Dex => "Android dex",
             ShellScript => "shell script",
+            Script => "script source",
             Lnk => "Windows shortcut (LNK)",
             DyldCache => "dyld shared cache",
             Pdf => "PDF",
@@ -308,6 +367,8 @@ impl MagicType {
             OneNote => "OneNote",
             Msg => "Outlook MSG",
             Pst => "Outlook PST",
+            Chm => "Compiled HTML Help",
+            Mobi => "Mobipocket/Kindle ebook",
             Png => "PNG image",
             Jpeg => "JPEG image",
             Gif87 => "GIF87a image",
@@ -320,6 +381,8 @@ impl MagicType {
             Psd => "Photoshop PSD",
             Heic => "HEIC/HEIF image",
             Avif => "AVIF image",
+            Jp2 => "JPEG 2000 image",
+            Jxl => "JPEG XL image",
             Mp3 => "MP3 audio",
             Wav => "WAV audio",
             Avi => "AVI video",
@@ -330,6 +393,10 @@ impl MagicType {
             Flv => "Flash video",
             Ogg => "Ogg container",
             Flac => "FLAC audio",
+            Aac => "AAC/ADTS audio",
+            Aiff => "AIFF audio",
+            Midi => "MIDI file",
+            Asf => "ASF/WMV/WMA media",
             Zip => "ZIP archive",
             Jar => "Java archive",
             Apk => "Android package",
@@ -344,6 +411,11 @@ impl MagicType {
             Lz4 => "LZ4 frame",
             Cab => "MS Cabinet",
             Ar => "ar archive",
+            Wim => "Windows Imaging (WIM/ESD)",
+            Zlib => "zlib stream",
+            Cpio => "cpio archive",
+            Rpm => "RPM package",
+            Xar => "xar archive (pkg)",
             Ewf => "EWF forensic image",
             Aff => "AFF forensic image",
             Dmg => "Apple DMG image",
@@ -357,6 +429,8 @@ impl MagicType {
             Qcow => "qcow image",
             Iso9660 => "ISO9660 image",
             Udf => "UDF image",
+            AndroidSparse => "Android sparse image",
+            AndroidBoot => "Android boot image",
             Fat => "FAT filesystem",
             ExFat => "exFAT filesystem",
             Ntfs => "NTFS filesystem",
@@ -367,6 +441,11 @@ impl MagicType {
             HfsPlus => "HFS+/HFSX volume",
             Xfs => "XFS filesystem",
             NtfsMftRecord => "NTFS MFT record",
+            NtfsIndx => "NTFS index record",
+            NtfsLog => "NTFS $LogFile record",
+            Squashfs => "squashfs filesystem",
+            Cramfs => "cramfs filesystem",
+            Gpt => "GPT partition table",
             Sqlite => "SQLite3 database",
             SqliteWal => "SQLite WAL",
             SqliteJournal => "SQLite journal",
@@ -376,11 +455,18 @@ impl MagicType {
             Bplist => "binary plist",
             Ole2 => "OLE2/CFB container",
             Sdb => "shim database",
+            Esedb => "ESE database",
+            Thumbcache => "Windows thumbcache",
+            DsStore => "macOS .DS_Store",
+            Evt => "Windows event log (.evt)",
+            Hiberfil => "Windows hibernation file",
+            Crashdump => "Windows crash dump",
             Pem => "PEM key/cert",
             OpenSslSalted => "OpenSSL salted data",
             WhatsAppCrypt => "WhatsApp encrypted backup",
             Pkcs12 => "PKCS#12 keystore",
             Xml => "XML document",
+            Html => "HTML document",
             PlainText => "text data",
             Pcap => "pcap capture",
             PcapNg => "pcapng capture",
@@ -394,22 +480,24 @@ impl MagicType {
             Pe | Elf | MachO32 | MachO64 | MachOFat | Wasm | JavaClass | Dex | DyldCache => {
                 Category::Executable
             }
-            ShellScript | Lnk => Category::Script,
+            ShellScript | Lnk | Script => Category::Script,
             Pdf | PostScript | Rtf | Docx | Xlsx | Pptx | Doc | Xls | Ppt | Odt | Ods | Odp
-            | Epub | OneNote | Msg | Pst => Category::Document,
+            | Epub | OneNote | Msg | Pst | Chm | Mobi | Html => Category::Document,
             Png | Jpeg | Gif87 | Gif89 | Bmp | TiffLe | TiffBe | WebP | Ico | Cur | Psd | Heic
-            | Avif => Category::Image,
-            Mp3 | Wav | Flac | Ogg => Category::Audio,
-            Avi | Mp4 | Mov | ThreeGpp | Mkv | Flv => Category::Video,
+            | Avif | Jp2 | Jxl => Category::Image,
+            Mp3 | Wav | Flac | Ogg | Aac | Aiff | Midi => Category::Audio,
+            Avi | Mp4 | Mov | ThreeGpp | Mkv | Flv | Asf => Category::Video,
             Zip | Jar | Apk | Gzip | Bzip2 | Xz | SevenZ | Rar4 | Rar5 | Tar | Zstd | Lz4 | Cab
-            | Ar => Category::Archive,
+            | Ar | Zlib | Cpio | Rpm | Xar => Category::Archive,
             Ewf | Aff | Dmg | Luks1 | Luks2 | BitLocker | BitLockerToGo | Vmdk | Vhd | Vdi
-            | Qcow | Iso9660 | Udf => Category::DiskImage,
-            Fat | ExFat | Ntfs | Ext | Btrfs | F2fs | Apfs | HfsPlus | Xfs | NtfsMftRecord => {
-                Category::FileSystem
+            | Qcow | Iso9660 | Udf | Wim | AndroidSparse | AndroidBoot | Gpt => {
+                Category::DiskImage
             }
-            Sqlite | SqliteWal | SqliteJournal => Category::Database,
-            RegHive | Evtx | Prefetch | Bplist | Ole2 | Sdb | Pcap | PcapNg => Category::Artifact,
+            Fat | ExFat | Ntfs | Ext | Btrfs | F2fs | Apfs | HfsPlus | Xfs | NtfsMftRecord
+            | NtfsIndx | NtfsLog | Squashfs | Cramfs => Category::FileSystem,
+            Sqlite | SqliteWal | SqliteJournal | Esedb => Category::Database,
+            RegHive | Evtx | Prefetch | Bplist | Ole2 | Sdb | Pcap | PcapNg | Thumbcache
+            | DsStore | Evt | Hiberfil | Crashdump => Category::Artifact,
             Pem | OpenSslSalted | WhatsAppCrypt | Pkcs12 => Category::Crypto,
             Xml | PlainText => Category::Text,
         }
@@ -445,6 +533,19 @@ impl MagicType {
             // MP4-family brands overlap.
             Mov | ThreeGpp => detected == Mp4,
             Mp4 => matches!(detected, Mov | ThreeGpp),
+            // HEIF family: an .heic with an AVIF-compatible brand (or vice
+            // versa) is the same ISOBMFF container, not a masquerade.
+            Heic => detected == Avif,
+            Avif => detected == Heic,
+            // A generic .zip that is really a jar/apk/ODF/epub is the same
+            // container family — informational, not suspicious.
+            Zip => matches!(detected, Jar | Apk | Odt | Ods | Odp | Epub),
+            // A plist may legitimately be binary or XML.
+            Bplist => detected == Xml,
+            // A script extension may carry a detectable shebang.
+            Script => detected == ShellScript,
+            // HTML and XHTML overlap.
+            Html => detected == Xml,
             // Plain text/xml have no magic — a *detected* binary under a text
             // extension is never acceptable.
             PlainText | Xml => false,

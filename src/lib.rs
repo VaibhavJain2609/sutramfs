@@ -35,7 +35,9 @@ mod verdict;
 
 pub use table::{Signature, EXT_TO_TYPE, SIGNATURES, TRAILERS};
 pub use types::{Category, MagicType};
-pub use verdict::{check_entry, detect, detect_all, has_trailer, MagicVerdict, Severity};
+pub use verdict::{
+    check_entry, check_entry_sized, detect, detect_all, has_trailer, MagicVerdict, Severity,
+};
 
 #[cfg(test)]
 mod tests;

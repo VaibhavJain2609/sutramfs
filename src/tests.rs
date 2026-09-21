@@ -168,6 +168,223 @@ fn detect_all_polyglot() {
 }
 
 #[test]
+fn zip_subtype_detection() {
+    // ODF: stored "mimetype" entry first → Odt (not generic Zip).
+    let mut odt = b"PK\x03\x04".to_vec();
+    odt.extend_from_slice(&[0x14, 0x00]); // version
+    odt.extend_from_slice(&[0x00, 0x00]); // flags
+    odt.extend_from_slice(&[0x00, 0x00]); // method = stored
+    odt.extend_from_slice(&[0; 16]); // time/date/crc/sizes
+    odt.extend_from_slice(&(8u16).to_le_bytes()); // name len
+    odt.extend_from_slice(&(0u16).to_le_bytes()); // extra len
+    odt.extend_from_slice(b"mimetype");
+    odt.extend_from_slice(b"application/vnd.oasis.opendocument.text");
+    assert_eq!(detect(&odt), Some(MagicType::Odt));
+    // Verdict for the real name stays consistent.
+    let v = check_entry("notes.odt", &odt);
+    assert!(!v.mismatch, "{:?}", v.reasons);
+
+    // EPUB
+    let mut epub = odt.clone();
+    epub.truncate(38);
+    epub.extend_from_slice(b"application/epub+zip");
+    assert_eq!(detect(&epub), Some(MagicType::Epub));
+
+    // APK via first entry name
+    let mut apk = b"PK\x03\x04".to_vec();
+    apk.extend_from_slice(&[0x14, 0x00, 0x00, 0x00, 0x08, 0x00]);
+    apk.extend_from_slice(&[0; 16]);
+    apk.extend_from_slice(&(19u16).to_le_bytes());
+    apk.extend_from_slice(&(0u16).to_le_bytes());
+    apk.extend_from_slice(b"AndroidManifest.xml");
+    assert_eq!(detect(&apk), Some(MagicType::Apk));
+    // .apk with a real APK layout is consistent, not "just a zip".
+    let v = check_entry("app.apk", &apk);
+    assert!(!v.mismatch);
+
+    // jar via META-INF first entry ("META-INF/MANIFEST.MF" is 20 bytes)
+    let mut jar = apk.clone();
+    jar.truncate(30);
+    jar.splice(26..28, (20u16).to_le_bytes());
+    jar.extend_from_slice(b"META-INF/MANIFEST.MF");
+    assert_eq!(detect(&jar), Some(MagicType::Jar));
+
+    // Unrecognised first entry → generic Zip.
+    let mut z = apk.clone();
+    z.splice(26..28, (7u16).to_le_bytes());
+    z.truncate(30);
+    z.extend_from_slice(b"foo.txt");
+    assert_eq!(detect(&z), Some(MagicType::Zip));
+}
+
+#[test]
+fn new_media_and_fs_signatures() {
+    assert_eq!(detect(b"MThd\0\0\0\x06"), Some(MagicType::Midi));
+    assert_eq!(
+        detect(b"\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C"),
+        Some(MagicType::Asf)
+    );
+    assert_eq!(detect(b"FORM\0\0\x10\0AIFFCOMM"), Some(MagicType::Aiff));
+    assert_eq!(detect(b"\xFF\xF1\x50"), Some(MagicType::Aac)); // ADTS
+    assert_eq!(detect(b"\xFF\xFB\x90"), Some(MagicType::Mp3)); // frame sync still MP3
+    assert_eq!(detect(b"MSWIM\0\0\0rest"), Some(MagicType::Wim));
+    assert_eq!(detect(b"\xED\xAB\xEE\xDBx"), Some(MagicType::Rpm));
+    assert_eq!(detect(b"xar!\0"), Some(MagicType::Xar));
+    assert_eq!(detect(b"0707010000"), Some(MagicType::Cpio));
+    assert_eq!(detect(b"\x78\x9Crest"), Some(MagicType::Zlib));
+    assert_eq!(detect(b"hsqs...."), Some(MagicType::Squashfs));
+    assert_eq!(detect(b"\x45\x3D\xCD\x28"), Some(MagicType::Cramfs));
+    assert_eq!(detect(b"ANDROID!boot"), Some(MagicType::AndroidBoot));
+    assert_eq!(detect(b"\x3A\xFF\x26\xED"), Some(MagicType::AndroidSparse));
+    assert_eq!(detect(b"INDX...."), Some(MagicType::NtfsIndx));
+    assert_eq!(detect(b"RCRD...."), Some(MagicType::NtfsLog));
+    assert_eq!(detect(b"LfLerest"), Some(MagicType::Evt));
+    assert_eq!(detect(b"Bud1...."), Some(MagicType::DsStore));
+    assert_eq!(detect(b"CMMM...."), Some(MagicType::Thumbcache));
+    assert_eq!(detect(b"hibr...."), Some(MagicType::Hiberfil));
+    assert_eq!(detect(b"MDMP...."), Some(MagicType::Crashdump));
+    // ESE db: signature at offset 4
+    assert_eq!(detect(b"\0\0\0\0\xEF\xCD\xAB\x89"), Some(MagicType::Esedb));
+    // GPT header at LBA 1
+    let mut disk = vec![0u8; 0x400];
+    disk[0x200..0x208].copy_from_slice(b"EFI PART");
+    assert_eq!(detect(&disk), Some(MagicType::Gpt));
+    // JP2/JXL
+    assert_eq!(
+        detect(b"\x00\x00\x00\x0CjP  \x0D\x0A\x87\x0A"),
+        Some(MagicType::Jp2)
+    );
+    assert_eq!(
+        detect(b"\x00\x00\x00\x0CJXL \x0D\x0A\x87\x0A"),
+        Some(MagicType::Jxl)
+    );
+    // HTML
+    assert_eq!(detect(b"<!DOCTYPE html>\n"), Some(MagicType::Html));
+    assert_eq!(detect(b"<html><body>"), Some(MagicType::Html));
+}
+
+#[test]
+fn container_family_accepts() {
+    // .heic whose brand reads as avif — same HEIF family, not suspicious.
+    let mut f = vec![0, 0, 0, 0x20];
+    f.extend_from_slice(b"ftypavif");
+    let v = check_entry("img.heic", &f);
+    assert!(!v.mismatch, "{:?}", v.reasons);
+    // .plist that is an XML plist — legit.
+    let v = check_entry("Info.plist", b"<?xml version=\"1.0\"?>");
+    assert!(!v.mismatch);
+    // .zip that is really a jar — same family, Info.
+    let mut j = b"PK\x03\x04".to_vec();
+    j.extend_from_slice(&[0x14, 0x00, 0x00, 0x00, 0x08, 0x00]);
+    j.extend_from_slice(&[0; 16]);
+    j.extend_from_slice(&(20u16).to_le_bytes());
+    j.extend_from_slice(&(0u16).to_le_bytes());
+    j.extend_from_slice(b"META-INF/MANIFEST.MF");
+    let v = check_entry("libs.zip", &j);
+    assert_eq!(v.detected, Some(MagicType::Jar));
+    assert!(!v.mismatch, "{:?}", v.reasons);
+    // .ps1 containing a PE → High (script extension masquerade).
+    let v = check_entry("setup.ps1", b"MZ\x90\0\x03\0\0\0");
+    assert!(v.mismatch);
+    assert_eq!(v.severity, Severity::High);
+    // .py with a real shebang → consistent (Script accepts ShellScript).
+    let v = check_entry("tool.py", b"#!/usr/bin/env python3\n");
+    assert!(!v.mismatch, "{:?}", v.reasons);
+}
+
+#[test]
+fn trailer_note_only_with_size() {
+    // Header-only probe of a big PNG must NOT claim "may be truncated".
+    let hdr = *b"\x89PNG\x0D\x0A\x1A\x0A\x00\x00\x00\x0DIHDR";
+    let v = check_entry("big.png", &hdr);
+    assert!(!v.reasons.iter().any(|r| r.contains("trailer")));
+    // Whole file without IEND → the note fires via check_entry_sized.
+    let v = check_entry_sized("tiny.png", &hdr, hdr.len() as u64);
+    assert!(v.reasons.iter().any(|r| r.contains("trailer")));
+    // Whole file WITH the trailer → no note.
+    let ok = *b"\x89PNG\x0D\x0A\x1A\x0A....IEND\xAE\x42\x60\x82";
+    let v = check_entry_sized("ok.png", &ok, ok.len() as u64);
+    assert!(!v.reasons.iter().any(|r| r.contains("trailer")));
+}
+
+#[test]
+fn script_extension_masquerade() {
+    // .bat containing ELF → High.
+    let v = check_entry("runme.bat", b"\x7fELF\x02\x01");
+    assert!(v.mismatch);
+    assert_eq!(v.severity, Severity::High);
+    // .bat that is plain text → Info (no magic, no panic).
+    let v = check_entry("runme.bat", b"@echo off\r\ndir\r\n");
+    assert!(!v.mismatch);
+    assert_eq!(v.severity, Severity::Info);
+}
+
+#[test]
+fn verdict_edge_reasons() {
+    // Detected content with an unmapped extension → Info with detection note.
+    let v = check_entry("blob.xyz", b"MZ\x90\0\x03\0\0\0");
+    assert_eq!(v.declared, None);
+    assert_eq!(v.detected, Some(MagicType::Pe));
+    assert!(v.reasons[0].contains("no declared type"));
+    // ODS/ODP subtype detection.
+    let mk = |mime: &[u8]| {
+        let mut z = b"PK\x03\x04".to_vec();
+        z.extend_from_slice(&[0x14, 0, 0, 0, 0, 0]);
+        z.extend_from_slice(&[0; 16]);
+        z.extend_from_slice(&(8u16).to_le_bytes());
+        z.extend_from_slice(&(0u16).to_le_bytes());
+        z.extend_from_slice(b"mimetype");
+        z.extend_from_slice(mime);
+        z
+    };
+    assert_eq!(
+        detect(&mk(b"application/vnd.oasis.opendocument.spreadsheet")),
+        Some(MagicType::Ods)
+    );
+    assert_eq!(
+        detect(&mk(b"application/vnd.oasis.opendocument.presentation")),
+        Some(MagicType::Odp)
+    );
+    assert_eq!(
+        detect(&mk(b"application/vnd.sun.xml.writer")),
+        Some(MagicType::Odt)
+    );
+    assert_eq!(detect(&mk(b"application/x-unknown")), Some(MagicType::Zip));
+}
+
+#[test]
+fn all_types_have_names_categories_and_self_accept() {
+    use MagicType::*;
+    let all = [
+        Pe, Elf, MachO32, MachO64, MachOFat, Wasm, JavaClass, Dex, ShellScript, Script, Lnk,
+        DyldCache, Pdf, PostScript, Rtf, Docx, Xlsx, Pptx, Doc, Xls, Ppt, Odt, Ods, Odp, Epub,
+        OneNote, Msg, Pst, Chm, Mobi, Png, Jpeg, Gif87, Gif89, Bmp, TiffLe, TiffBe, WebP, Ico,
+        Cur, Psd, Heic, Avif, Jp2, Jxl, Mp3, Wav, Avi, Mp4, Mov, ThreeGpp, Mkv, Flv, Ogg, Flac,
+        Aac, Aiff, Midi, Asf, Zip, Jar, Apk, Gzip, Bzip2, Xz, SevenZ, Rar4, Rar5, Tar, Zstd,
+        Lz4, Cab, Ar, Wim, Zlib, Cpio, Rpm, Xar, Ewf, Aff, Dmg, Luks1, Luks2, BitLocker,
+        BitLockerToGo, Vmdk, Vhd, Vdi, Qcow, Iso9660, Udf, AndroidSparse, AndroidBoot, Fat,
+        ExFat, Ntfs, Ext, Btrfs, F2fs, Apfs, HfsPlus, Xfs, NtfsMftRecord, NtfsIndx, NtfsLog,
+        Squashfs, Cramfs, Gpt, Sqlite, SqliteWal, SqliteJournal, RegHive, Evtx, Prefetch,
+        Bplist, Ole2, Sdb, Esedb, Thumbcache, DsStore, Evt, Hiberfil, Crashdump, Pem,
+        OpenSslSalted, WhatsAppCrypt, Pkcs12, Xml, Html, PlainText, Pcap, PcapNg,
+    ];
+    for t in all {
+        assert!(!t.name().is_empty(), "{t:?} has no name");
+        let _ = t.category();
+        let _ = t.is_code();
+        // Every type must at least accept itself.
+        assert!(t.accepts(t), "{t:?} does not accept itself");
+    }
+    // Spot-check category assignments.
+    assert_eq!(Pe.category(), Category::Executable);
+    assert_eq!(Script.category(), Category::Script);
+    assert!(Pe.is_code() && Script.is_code() && !Png.is_code());
+    assert_eq!(Esedb.category(), Category::Database);
+    assert_eq!(Hiberfil.category(), Category::Artifact);
+    assert_eq!(Squashfs.category(), Category::FileSystem);
+}
+
+#[test]
 fn whatsapp_crypt_declared_only() {
     // .crypt14 has a declared type but no stable magic — never a panic,
     // verdict explains itself.
