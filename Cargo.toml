@@ -1,0 +1,11 @@
+[package]
+name = "sutram-artifacts"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Forensic file-content parsers for Windows/macOS artifacts (LNK, registry hive, $I recycle-bin, bplist, prefetch)"
+keywords = ["forensics", "dfir", "lnk", "registry", "prefetch"]
+categories = ["parsing"]
+
+[dependencies]
