@@ -20,8 +20,10 @@ between a raw acquisition and a filesystem parser:
   including `SparseFile::from_android_sparse` for Android sparse images.
 - MBR + GPT partition parsing (`partitions`, `open_partitions`) producing
   partitions with absolute byte offsets.
-- `ewf::EwfSource` — documented stub for the planned pure-Rust EWF (E01)
-  reader. Never FFI to libewf.
+- `ewf::EwfSource` — pure-Rust EWF (Expert Witness Format / `.E01`)
+  reader: zlib-compressed and raw chunks, `table`/`table2` chunk maps,
+  `error2` acquisition-error ranges, and stored MD5/SHA-1 integrity
+  hashes. Never FFI to libewf.
 
 ## Forensic guarantees
 
@@ -54,6 +56,55 @@ for part in open_partitions(disk)? {
 # Ok::<(), sutram_io::Error>(())
 ```
 
+## EWF (E01) support
+
+`ewf::EwfSource::open` turns a single-segment EnCase/FTK `.E01` image into
+a `ByteSource`, so every parser built on this crate can mount forensic
+images directly:
+
+```rust,no_run
+use std::sync::Arc;
+use sutram_io::{into_arc, ByteSource, FileSource};
+use sutram_io::ewf::EwfSource;
+
+let seg = into_arc(FileSource::open("case01.E01")?);
+let img = EwfSource::open(vec![seg])?;
+println!("{} bytes, chunk size {}", img.len(), img.info().chunk_size);
+if let Some(h) = img.acquisition_hash() {
+    println!("stored MD5: {:?}", h.md5_hex());
+}
+for w in img.warnings() { eprintln!("ewf: {w}"); }
+// `img` is a ByteSource: read_at / read_slice / partitions(&img)/…
+# Ok::<(), sutram_io::Error>(())
+```
+
+- Chunks are zlib-deflate or raw (auto-detected per table-entry flag bit);
+  reads are served through a bounded 8-chunk LRU cache.
+- `error2` acquisition-error ranges read as zeros (what the acquisition
+  tool stored) and are listed via `error_ranges()`.
+- Stored `hash`/`digest` MD5 + SHA-1 are exposed via `acquisition_hash()` —
+  they are the acquisition tool's *claims*, verify them yourself.
+- Non-fatal anomalies (checksum mismatches, table/count mismatches,
+  degraded entries) are collected in `warnings()`, never panics.
+- `table2` mirrors are used automatically when a `table` section is
+  missing or yields fewer entries.
+
+### EWF limitations
+
+- **Single-segment only.** Multi-segment images (`.E02`+, detected via the
+  `next` section or multiple `segments` arguments) return
+  `Error::Unsupported`; segment 1 is still parsed fully to make that
+  detection definitive.
+- EWF2 (`.Ex01`), logical evidence files (`.L01` / media type `0x0e`) and
+  SMART `.s01` layouts return `Error::Unsupported`.
+- A chunk whose zlib stream is corrupt yields `io::Error(InvalidData)` on
+  reads touching it — corrupt stored data is never silently replaced with
+  zeros. Missing/out-of-range *table entries* do zero-fill (documented
+  leniency) plus a warning.
+- `session`, `ltree`, `xheader` and other metadata sections are skipped,
+  not interpreted. Section-internal checksums beyond the descriptor's are
+  recorded but not yet verified.
+
 ## Deleted / recovery semantics
 
 This crate is below the filesystem layer and therefore reports no file
@@ -63,8 +114,9 @@ regions — nothing is filtered).
 
 ## Known limitations
 
-- EWF (E01) and other compressed forensic containers are stubbed; only raw
-  images and Android sparse are readable today.
+- EWF support covers single-segment E01 only — multi-segment (`.E02`+),
+  EWF2 (`.Ex01`), L01 and SMART `.s01` variants return `Unsupported`.
+  qcow2/VMDK/VHD are not yet decoded.
 - Partition parsing assumes 512-byte sectors, probing 4096 only for GPT.
 - BSD disklabels, APM and dynamic (LDM) disks are not parsed.
 

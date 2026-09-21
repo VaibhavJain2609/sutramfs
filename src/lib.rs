@@ -24,8 +24,9 @@
 //! * Partition tables: [`partitions`] parses MBR and GPT and returns
 //!   [`Partition`] records with byte offsets; [`open_partitions`] returns
 //!   ready-to-mount [`PartitionSource`]s.
-//! * [`EwfSource`] — a documented stub for the planned pure-Rust EWF (E01)
-//!   reader. No FFI to libewf.
+//! * [`ewf::EwfSource`] — pure-Rust EWF (E01) reader exposing the image as
+//!   a `ByteSource` plus acquisition hashes and error ranges. No FFI to
+//!   libewf.
 //!
 //! Endianness is never implicit: all multi-byte reads in this crate use the
 //! explicit `*_le` helpers in [`le`], and parser crates are expected to do the
@@ -39,16 +40,16 @@ mod partition;
 mod source;
 mod views;
 
-/// Planned pure-Rust EWF (Expert Witness Format / E01) reader.
+/// Pure-Rust EWF (Expert Witness Format / E01) reader.
 ///
-/// EWF segment files (`*.E01`, `*.Ex01`, …) are self-describing containers:
-/// a `EVF` file header, section descriptors and `table`/`table2` block maps
-/// pointing at zlib/deflate-compressed 32 KiB chunks. A pure-Rust reader is
-/// planned on top of [`ByteSource`] + [`SparseFile`]; **it is intentionally
-/// not implemented via FFI to libewf** so the crate graph stays portable.
-///
-/// Until then, [`EwfSource::open`] returns [`Error::Unsupported`] so callers
-/// can probe for the capability without `#[cfg]` gates.
+/// EWF segment files (`*.E01`) are self-describing containers: an `EVF`
+/// file header, framed section descriptors and `table`/`table2` block maps
+/// pointing at zlib/deflate-compressed chunks. [`ewf::EwfSource`] opens a
+/// single-segment E01 and exposes it as a [`ByteSource`] alongside the
+/// stored acquisition hashes and error ranges. Multi-segment (`.E02`+),
+/// EWF2 (`*.Ex01`) and logical (`.L01`) images are detected and reported
+/// as [`Error::Unsupported`]. No FFI to libewf — decompression is pure
+/// Rust via `miniz_oxide`.
 pub mod ewf;
 
 pub use error::{Error, Result};

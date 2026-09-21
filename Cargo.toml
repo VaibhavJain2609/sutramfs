@@ -9,3 +9,5 @@ keywords = ["forensics", "filesystem", "dfir", "partition", "sparse"]
 categories = ["filesystem", "parsing"]
 
 [dependencies]
+# Pure-Rust DEFLATE/zlib for EWF (E01) chunk decompression. No C FFI.
+miniz_oxide = "0.9"

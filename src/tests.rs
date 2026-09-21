@@ -475,13 +475,549 @@ fn error_display_and_source() {
 }
 
 #[test]
-fn ewf_stub_reports_unsupported() {
+fn ewf_signature_without_volume_is_corrupt() {
+    // Bare EVF signature but no section chain → parses, then fails on the
+    // missing volume/disk geometry.
     let mut e01 = vec![0u8; 512];
     e01[..ewf::EWF_SIGNATURE.len()].copy_from_slice(ewf::EWF_SIGNATURE);
+    e01[8] = 0x01;
+    e01[9..11].copy_from_slice(&1u16.to_le_bytes());
     assert!(ewf::EwfSource::is_ewf(&e01.as_slice()));
     let res = ewf::EwfSource::open(vec![vec_src(e01)]);
-    assert!(matches!(res, Err(Error::Unsupported { .. })));
+    assert!(matches!(res, Err(Error::Corrupt { .. })));
     // non-EWF input → corrupt, not unsupported
     let res = ewf::EwfSource::open(vec![vec_src(vec![0u8; 64])]);
     assert!(matches!(res, Err(Error::Corrupt { .. })));
+    // >1 segment → unsupported (multi-segment not implemented yet)
+    let res = ewf::EwfSource::open(vec![vec_src(vec![0u8; 64]), vec_src(vec![0u8; 64])]);
+    assert!(matches!(res, Err(Error::Unsupported { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// EWF (E01) synthetic-image corpus
+// ---------------------------------------------------------------------------
+
+/// Byte-at-a-time EWF segment writer: appends 76-byte section descriptors
+/// and data, patching each descriptor's `next` offset and Adler-32 checksum
+/// as the chain grows.
+struct E01 {
+    img: Vec<u8>,
+    last_desc: Option<usize>,
+}
+
+impl E01 {
+    fn new() -> Self {
+        let mut img = Vec::new();
+        img.extend_from_slice(ewf::EWF_SIGNATURE);
+        img.push(0x01); // start of fields
+        img.extend_from_slice(&1u16.to_le_bytes()); // segment number
+        img.extend_from_slice(&0u16.to_le_bytes()); // end of fields
+        Self {
+            img,
+            last_desc: None,
+        }
+    }
+
+    /// Append `name` section carrying `data`; returns the descriptor offset.
+    fn section(&mut self, name: &str, data: &[u8]) -> usize {
+        let off = self.img.len();
+        if let Some(p) = self.last_desc {
+            self.set_next(p, off as u64);
+        }
+        let mut d = vec![0u8; 76];
+        let n = name.len().min(16);
+        d[..n].copy_from_slice(&name.as_bytes()[..n]);
+        d[24..32].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        self.img.extend_from_slice(&d);
+        self.img.extend_from_slice(data);
+        self.last_desc = Some(off);
+        off
+    }
+
+    /// Write `next` into a descriptor and refresh its checksum.
+    fn set_next(&mut self, desc: usize, next: u64) {
+        self.img[desc + 16..desc + 24].copy_from_slice(&next.to_le_bytes());
+        let sum = ewf::adler32(&self.img[desc..desc + 72]);
+        self.img[desc + 72..desc + 76].copy_from_slice(&sum.to_le_bytes());
+    }
+
+    /// Terminate the chain: the last descriptor's `next` points at itself.
+    fn finish(mut self) -> Vec<u8> {
+        if let Some(p) = self.last_desc {
+            let self_off = p as u64;
+            self.set_next(p, self_off);
+        }
+        self.img
+    }
+}
+
+const E01_BPS: u32 = 512;
+const E01_SPC: u32 = 64;
+const E01_CS: usize = (E01_BPS * E01_SPC) as usize; // 32 KiB chunks
+
+/// 1052-byte EnCase-style `volume`/`data` section payload.
+fn e01_volume(chunk_count: u32, sector_count: u64) -> Vec<u8> {
+    let mut v = vec![0u8; 1052];
+    v[0] = 0x01; // fixed media
+    v[4..8].copy_from_slice(&chunk_count.to_le_bytes());
+    v[8..12].copy_from_slice(&E01_SPC.to_le_bytes());
+    v[12..16].copy_from_slice(&E01_BPS.to_le_bytes());
+    v[16..24].copy_from_slice(&sector_count.to_le_bytes());
+    v[36] = 0x03; // media flags: image + physical
+    v[52] = 0x01; // compression level: good
+    v[56..60].copy_from_slice(&64u32.to_le_bytes()); // error granularity
+    // set-identifier GUID (16 nonzero bytes)
+    for (i, b) in v[64..80].iter_mut().enumerate() {
+        *b = 0xA0 + i as u8;
+    }
+    let sum = ewf::adler32(&v[..1048]);
+    v[1048..1052].copy_from_slice(&sum.to_le_bytes());
+    v
+}
+
+/// `table`/`table2` payload: 24-byte header + entries + 4-byte footer.
+fn e01_table(entries: &[u32]) -> Vec<u8> {
+    let mut t = vec![0u8; 24 + entries.len() * 4 + 4];
+    t[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    // base offset @8 stays 0 (pre-EnCase-6 style absolute entries)
+    for (i, e) in entries.iter().enumerate() {
+        t[24 + i * 4..28 + i * 4].copy_from_slice(&e.to_le_bytes());
+    }
+    let h = ewf::adler32(&t[..20]);
+    t[20..24].copy_from_slice(&h.to_le_bytes());
+    let f = ewf::adler32(&t[24..24 + entries.len() * 4]);
+    let n = t.len();
+    t[n - 4..].copy_from_slice(&f.to_le_bytes());
+    t
+}
+
+/// `hash` section: MD5 @0..16, 16 unknown bytes, checksum @32.
+fn e01_hash(md5: &[u8; 16]) -> Vec<u8> {
+    let mut h = vec![0u8; 36];
+    h[..16].copy_from_slice(md5);
+    let sum = ewf::adler32(&h[..32]);
+    h[32..36].copy_from_slice(&sum.to_le_bytes());
+    h
+}
+
+/// `digest` section: MD5 @0, SHA-1 @16, padding, checksum @76.
+fn e01_digest(md5: &[u8; 16], sha1: &[u8; 20]) -> Vec<u8> {
+    let mut d = vec![0u8; 80];
+    d[..16].copy_from_slice(md5);
+    d[16..36].copy_from_slice(sha1);
+    let sum = ewf::adler32(&d[..76]);
+    d[76..80].copy_from_slice(&sum.to_le_bytes());
+    d
+}
+
+/// `error2` section: 520-byte header + 8-byte entries + footer.
+fn e01_error2(ranges: &[(u32, u32)]) -> Vec<u8> {
+    let mut e = vec![0u8; 520 + ranges.len() * 8 + 4];
+    e[0..4].copy_from_slice(&(ranges.len() as u32).to_le_bytes());
+    let h = ewf::adler32(&e[..516]);
+    e[516..520].copy_from_slice(&h.to_le_bytes());
+    for (i, &(start, count)) in ranges.iter().enumerate() {
+        e[520 + i * 8..524 + i * 8].copy_from_slice(&start.to_le_bytes());
+        e[524 + i * 8..528 + i * 8].copy_from_slice(&count.to_le_bytes());
+    }
+    let n = e.len();
+    let f = ewf::adler32(&e[520..n - 4]);
+    e[n - 4..].copy_from_slice(&f.to_le_bytes());
+    e
+}
+
+/// Deterministic pseudo-content so compressed chunks exercise real deflate.
+fn e01_media(n: usize) -> Vec<u8> {
+    (0..n)
+        .map(|i| ((i * 31 + (i / 7) * 13 + 5) & 0xff) as u8)
+        .collect()
+}
+
+/// Knobs for `build_e01`.
+#[derive(Default)]
+struct E01Opts {
+    header_text: Option<String>,
+    /// Chunk index whose zlib stream is corrupted (byte flip mid-stream).
+    corrupt_zlib_chunk: Option<usize>,
+    /// Emit `table2` but no `table`.
+    drop_table: bool,
+    /// Truncate the emitted `table` to the first N entries.
+    table_entries: Option<usize>,
+    /// Volume `chunk_count` override (defaults to actual chunk count).
+    declare_chunk_count: Option<u32>,
+    /// Terminal section name ("done" or "next").
+    terminal: Option<&'static str>,
+    error2: Vec<(u32, u32)>,
+    md5: Option<[u8; 16]>,
+    sha1: Option<[u8; 20]>,
+    /// Split chunks across two `sectors`+`table`/`table2` groups.
+    two_table_groups: bool,
+    /// Chunk index whose table entry points past EOF.
+    bad_entry_index: Option<usize>,
+    /// Drop the `volume` section entirely.
+    drop_volume: bool,
+}
+
+/// Build a complete single-segment E01 holding `media`, compressed per
+/// `flags[i]` (true = zlib, false = raw + Adler-32 trailer).
+fn build_e01(media: &[u8], flags: &[bool], opts: E01Opts) -> Vec<u8> {
+    let n_chunks = flags.len();
+    assert_eq!(media.len().div_ceil(E01_CS), n_chunks);
+    let mut w = E01::new();
+
+    if let Some(text) = &opts.header_text {
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(text.as_bytes(), 6);
+        w.section("header", &z);
+    }
+    if !opts.drop_volume {
+        let chunk_count = opts.declare_chunk_count.unwrap_or(n_chunks as u32);
+        let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+        w.section("volume", &e01_volume(chunk_count, sectors));
+    }
+
+    // Pack chunk payloads; remember each chunk's offset within its
+    // `sectors` section data so table entries can be absolute.
+    let groups: Vec<(usize, usize)> = if opts.two_table_groups && n_chunks > 1 {
+        vec![(0, n_chunks / 2), (n_chunks / 2, n_chunks)]
+    } else {
+        vec![(0, n_chunks)]
+    };
+    let mut entries: Vec<u32> = Vec::with_capacity(n_chunks);
+    for (first, last) in groups {
+        let mut payloads = Vec::new();
+        let mut rel_offsets = Vec::new();
+        for i in first..last {
+            let data = &media[i * E01_CS..media.len().min((i + 1) * E01_CS)];
+            rel_offsets.push(payloads.len());
+            if flags[i] {
+                let mut z = miniz_oxide::deflate::compress_to_vec_zlib(data, 6);
+                if opts.corrupt_zlib_chunk == Some(i) {
+                    let mid = z.len() / 2;
+                    z[mid] ^= 0xFF;
+                }
+                payloads.extend_from_slice(&z);
+            } else {
+                payloads.extend_from_slice(data);
+                payloads.extend_from_slice(&ewf::adler32(data).to_le_bytes());
+            }
+        }
+        let desc = w.section("sectors", &payloads);
+        for (k, rel) in rel_offsets.iter().enumerate() {
+            let i = first + k;
+            let mut e = (desc + 76 + rel) as u32;
+            if opts.bad_entry_index == Some(i) {
+                e = 0x7fff_ff00; // beyond EOF → missing chunk
+            }
+            if flags[i] {
+                e |= 0x8000_0000;
+            }
+            entries.push(e);
+        }
+        // `table_entries` truncates only the last group's table.
+        let emit: &[u32] = match (opts.table_entries, last == n_chunks) {
+            (Some(n), true) => &entries[first..entries.len().min(first + n)],
+            _ => &entries[first..last],
+        };
+        let t = e01_table(emit);
+        if !opts.drop_table {
+            w.section("table", &t);
+        }
+        w.section("table2", &t);
+    }
+
+    if !opts.error2.is_empty() {
+        w.section("error2", &e01_error2(&opts.error2));
+    }
+    if let Some(md5) = &opts.md5 {
+        w.section("hash", &e01_hash(md5));
+        let sha1 = opts.sha1.unwrap_or([0u8; 20]);
+        w.section("digest", &e01_digest(md5, &sha1));
+    }
+    w.section(opts.terminal.unwrap_or("done"), &[]);
+    w.finish()
+}
+
+#[test]
+fn ewf_roundtrip_compressed_chunks() {
+    // 2 full chunks + 3 whole sectors (media is sector-granular, like a
+    // real acquisition — the logical size is a multiple of 512).
+    let media = e01_media(2 * E01_CS + 3 * 512);
+    let flags = [true, true, true];
+    let img = build_e01(
+        &media,
+        &flags,
+        E01Opts {
+            header_text: Some("1\nmain\na\te\tSUTRAM-EXAMINER\n".to_string()),
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.len(), media.len() as u64);
+    // whole-image round trip
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+    // read across a chunk boundary
+    let off = E01_CS - 50;
+    assert_eq!(e.read_slice(off as u64, 150).unwrap(), media[off..off + 150]);
+    // tail & EOF clamping
+    assert_eq!(
+        e.read_slice(media.len() as u64 - 10, 100).unwrap(),
+        media[media.len() - 10..]
+    );
+    assert!(e.read_slice(media.len() as u64, 8).unwrap().is_empty());
+    // metadata
+    let info = e.info();
+    assert_eq!(info.chunk_size, E01_CS as u64);
+    assert_eq!(info.bytes_per_sector, E01_BPS);
+    assert_eq!(info.sectors_per_chunk, E01_SPC);
+    assert_eq!(info.chunk_count, 3);
+    assert_eq!(info.media_type, 0x01);
+    assert_eq!(info.compression_level, 1);
+    assert_eq!(info.error_granularity, 64);
+    assert!(info.set_identifier.is_some());
+    assert!(!info.multi_segment);
+    assert!(info
+        .acquisition_header
+        .as_deref()
+        .unwrap()
+        .contains("SUTRAM-EXAMINER"));
+}
+
+#[test]
+fn ewf_mixed_compressed_and_raw_chunks() {
+    let media = e01_media(3 * E01_CS);
+    let flags = [true, false, true]; // middle chunk stored raw
+    let img = build_e01(&media, &flags, E01Opts::default());
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+    // raw chunk content specifically
+    assert_eq!(
+        e.read_slice(E01_CS as u64, E01_CS).unwrap(),
+        media[E01_CS..2 * E01_CS]
+    );
+    assert!(e.warnings().is_empty(), "unexpected warnings: {:?}", e.warnings());
+}
+
+#[test]
+fn ewf_stored_hashes_exposed() {
+    let media = e01_media(E01_CS);
+    let md5 = [0x5Au8; 16];
+    let sha1 = [0x11u8; 20];
+    let img = build_e01(
+        &media,
+        &[true],
+        E01Opts {
+            md5: Some(md5),
+            sha1: Some(sha1),
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    let h = e.acquisition_hash().unwrap();
+    assert_eq!(h.md5, Some(md5));
+    assert_eq!(h.sha1, Some(sha1));
+    assert_eq!(h.md5_hex().as_deref(), Some("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"));
+    assert!(h.sha1_hex().unwrap().starts_with("1111"));
+}
+
+#[test]
+fn ewf_error2_ranges_read_zero() {
+    let media = e01_media(2 * E01_CS);
+    // sectors 10..12 → bytes [10*512, 12*512) inside chunk 0
+    let img = build_e01(
+        &media,
+        &[true, true],
+        E01Opts {
+            error2: vec![(10, 2)],
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.error_ranges(), &[(10 * 512, 12 * 512)]);
+    let mut expected = media.clone();
+    expected[10 * 512..12 * 512].fill(0);
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), expected);
+}
+
+#[test]
+fn ewf_next_section_detects_multi_segment() {
+    let media = e01_media(E01_CS);
+    let img = build_e01(
+        &media,
+        &[true],
+        E01Opts {
+            terminal: Some("next"),
+            ..Default::default()
+        },
+    );
+    let res = ewf::EwfSource::open(vec![vec_src(img)]);
+    match res {
+        Err(Error::Unsupported { msg }) => assert!(msg.contains(".E02")),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("expected Unsupported, got an opened image"),
+    }
+}
+
+#[test]
+fn ewf_table2_mirror_fallback() {
+    let media = e01_media(2 * E01_CS);
+    let img = build_e01(
+        &media,
+        &[true, true],
+        E01Opts {
+            drop_table: true,
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+    assert!(e.warnings().iter().any(|w| w.contains("table2")));
+}
+
+#[test]
+fn ewf_short_table_zero_fills_tail() {
+    // Volume declares 3 chunks but the table only lists 2 — documented
+    // leniency: the tail chunk reads as zeros and a warning is recorded.
+    let media = e01_media(3 * E01_CS);
+    let img = build_e01(
+        &media,
+        &[true, true, true],
+        E01Opts {
+            table_entries: Some(2),
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.len(), media.len() as u64);
+    assert!(e.warnings().iter().any(|w| w.contains("tail chunks")));
+    let out = e.read_slice(0, media.len()).unwrap();
+    assert_eq!(&out[..2 * E01_CS], &media[..2 * E01_CS]);
+    assert!(out[2 * E01_CS..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn ewf_extra_table_entries_ignored() {
+    // Table lists 3 entries but volume declares 2 chunks: extras ignored,
+    // image size clamps to the declared capacity.
+    let media = e01_media(3 * E01_CS);
+    let img = build_e01(
+        &media,
+        &[true, true, true],
+        E01Opts {
+            declare_chunk_count: Some(2),
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.len(), 2 * E01_CS as u64);
+    assert!(e.warnings().iter().any(|w| w.contains("extras ignored") || w.contains("clamped")));
+    assert_eq!(e.read_slice(0, e.len() as usize).unwrap(), media[..2 * E01_CS]);
+}
+
+#[test]
+fn ewf_corrupt_zlib_chunk_io_errors() {
+    let media = e01_media(3 * E01_CS);
+    let img = build_e01(
+        &media,
+        &[true, true, true],
+        E01Opts {
+            corrupt_zlib_chunk: Some(1),
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    // good chunks still read
+    assert_eq!(e.read_slice(0, E01_CS).unwrap(), media[..E01_CS]);
+    // the corrupt chunk reports InvalidData rather than fabricating zeros
+    let mut buf = vec![0u8; E01_CS];
+    let err = e.read_at(E01_CS as u64, &mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    // and a read spanning it also fails after delivering nothing
+    assert!(e.read_slice(E01_CS as u64, E01_CS).is_err());
+}
+
+#[test]
+fn ewf_out_of_range_entry_zero_fills() {
+    let media = e01_media(2 * E01_CS);
+    let img = build_e01(
+        &media,
+        &[true, true],
+        E01Opts {
+            bad_entry_index: Some(1),
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert!(e.warnings().iter().any(|w| w.contains("outside the segment")));
+    let out = e.read_slice(0, media.len()).unwrap();
+    assert_eq!(&out[..E01_CS], &media[..E01_CS]);
+    assert!(out[E01_CS..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn ewf_two_table_groups_accumulate() {
+    // EnCase splits chunk maps into repeated sectors+table+table2 groups
+    // (≤16375 entries each); entries append across groups.
+    let media = e01_media(4 * E01_CS);
+    let img = build_e01(
+        &media,
+        &[true, false, true, true],
+        E01Opts {
+            two_table_groups: true,
+            ..Default::default()
+        },
+    );
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+}
+
+#[test]
+fn ewf_truncated_trailer_still_reads() {
+    // Segment cut inside the terminal `done` descriptor: the chunk table
+    // survived, so all media reads fine; a warning records the damage.
+    let media = e01_media(2 * E01_CS);
+    let mut img = build_e01(&media, &[true, true], E01Opts::default());
+    let cut = img.len() - 40; // inside the last descriptor
+    img.truncate(cut);
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+    assert!(!e.warnings().is_empty());
+}
+
+#[test]
+fn ewf_truncated_past_table_degrades_to_zeros() {
+    // Catastrophic truncation: the trailing `table`/`table2` sections are
+    // gone. Open still succeeds (lenient) and every chunk reads as zeros
+    // with warnings — never a panic, never fabricated non-zero data.
+    let media = e01_media(2 * E01_CS);
+    let mut img = build_e01(&media, &[true, true], E01Opts::default());
+    let cut = img.len() - 400; // through the table sections
+    img.truncate(cut);
+    let e = ewf::EwfSource::open(vec![vec_src(img)]).unwrap();
+    assert!(!e.warnings().is_empty());
+    let out = e.read_slice(0, media.len()).unwrap();
+    assert!(out.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn ewf_no_volume_is_corrupt() {
+    let media = e01_media(E01_CS);
+    let img = build_e01(
+        &media,
+        &[true],
+        E01Opts {
+            drop_volume: true,
+            ..Default::default()
+        },
+    );
+    let res = ewf::EwfSource::open(vec![vec_src(img)]);
+    assert!(matches!(res, Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn ewf_segment_number_two_unsupported() {
+    let media = e01_media(E01_CS);
+    let mut img = build_e01(&media, &[true], E01Opts::default());
+    img[9..11].copy_from_slice(&2u16.to_le_bytes()); // segment 2
+    let res = ewf::EwfSource::open(vec![vec_src(img)]);
+    assert!(matches!(res, Err(Error::Unsupported { .. })));
 }
