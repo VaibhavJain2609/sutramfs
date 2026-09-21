@@ -111,7 +111,7 @@ pub fn read_to_end_bounded(mut r: impl Read, max: u64) -> Result<Vec<u8>> {
 /// Field-for-field mirror of `sutram_fs::FsTimestamp`: `value` is
 /// nanoseconds since the Unix epoch (UTC), `None` when the on-disk field
 /// is unset/zero or unrepresentable — parsers must not fabricate times.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactTimestamp {
     /// Nanoseconds since the Unix epoch (UTC).
     pub value: Option<i64>,
