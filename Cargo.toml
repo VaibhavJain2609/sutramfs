@@ -1,0 +1,18 @@
+[package]
+name = "sutram-analyze"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Forensic analysis layer for SUTRAM-FS: content hashing, entropy, MACB timelines, suspicion scoring, keyword search"
+keywords = ["forensics", "dfir", "filesystem", "timeline", "hashing"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io         = { path = "../sutram-io",         version = "0.1" }
+sutram-fs         = { path = "../sutram-fs",         version = "0.1" }
+sutram-magic      = { path = "../sutram-magic",      version = "0.1" }
+sutram-reputation = { path = "../sutram-reputation", version = "0.1" }
+
+[dev-dependencies]
+sutram-fat = { path = "../sutram-fat" }
