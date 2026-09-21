@@ -674,3 +674,57 @@ fn detect_low_confidence_without_signature() {
         DetectConfidence::Low
     );
 }
+
+#[test]
+fn attr_list_rejects_foreign_and_stale_records() {
+    // Record 45's $ATTRIBUTE_LIST references record 46 (a base record —
+    // not an extension of 45) and record 47 (stale sequence in the file
+    // reference). Neither may be merged: doing so would graft another
+    // file's extents onto BADLIST.BIN.
+    let entries = all_entries();
+    let e = find(&entries, "BADLIST.BIN");
+    assert!(!e.is_deleted());
+    // The decoy (cluster 84) and stale (cluster 85) extents must not appear.
+    for (off, _) in &e.allocated_ranges {
+        assert_ne!(*off, common::clus_off(84) as u64);
+        assert_ne!(*off, common::clus_off(85) as u64);
+    }
+    // Resident data reads back only its own bytes.
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"badlist-data");
+    // The rejection is surfaced as an attribute-parse note.
+    let note = e.meta.get("note").expect("attr-list rejection note");
+    assert!(note.contains("extension record 50"), "note: {note}");
+    // The decoy is a live file in its own right.
+    let d = find(&entries, "DECOY.DAT");
+    let mut buf = Vec::new();
+    mount().read_file(d).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"decoy-bytes");
+}
+
+#[test]
+fn deleted_sparse_file_credits_holes() {
+    // DELSPRSE.BIN: 2 surviving clusters + 3 sparse + 2 surviving — the
+    // sparse hole is recoverable as zeros, so the file is Intact, not
+    // PartiallyOverwritten.
+    let entries = all_entries();
+    let e = find(&entries, "DELSPRSE.BIN");
+    match e.status {
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact,
+        } => {}
+        ref s => panic!("expected Deleted{{Intact}}, got {s:?}"),
+    }
+    assert_eq!(e.meta["sparse"], "true");
+    // The two surviving real extents are listed for provenance.
+    assert_eq!(e.allocated_ranges.len(), 2);
+    assert_eq!(
+        e.allocated_ranges[0].0,
+        common::clus_off(86) as u64
+    );
+    assert_eq!(
+        e.allocated_ranges[1].0,
+        common::clus_off(88) as u64
+    );
+}

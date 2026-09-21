@@ -28,6 +28,8 @@
 //! | 64       | COMPRESS.BIN LZNT1 unit                               |
 //! | 70–71,72–73 | ATTRLIST.BIN split extents                       |
 //! | 80       | root dir INDX block (live + slack + dangling entries)  |
+//! | 84,85    | DECOY.DAT (live), stale ext-record data                |
+//! | 86–87,88–89 | DELSPRSE.BIN surviving runs (sparse hole between) |
 //! | 96–111   | RAWCMP.BIN unit 0 stored raw (unit 1 is fully sparse)   |
 //! | 120–123  | GAPDATA.BIN extent (VCN gap before it)                  |
 
@@ -1288,6 +1290,92 @@ pub fn build_ntfs() -> Vec<u8> {
         ],
     );
 
+    // ---- records 49–51: BADLIST.BIN — a corrupt $ATTRIBUTE_LIST ---------------------------------
+    // The list references record 50 (a *base* record — not an extension of
+    // 49) and record 51 (an extension whose reference sequence is stale).
+    // Neither may be merged into record 49's attribute set.
+    file_record(
+        &mut img,
+        49,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "BADLIST.BIN", 1, 0x20, 12, [t; 4]), 1),
+            attr_resident(
+                T_ALIST,
+                "",
+                &alist_body(&[
+                    (T_DATA, "", 0, 49, 3),                 // base record's own $DATA
+                    (T_DATA, "", 2, 50, 1),                 // record 50: a base record, not ours
+                    (T_DATA, "", 4, 51 | (9u64 << 48), 2),  // stale sequence reference
+                ]),
+                2,
+            ),
+            attr_resident(T_DATA, "", b"badlist-data", 3),
+        ],
+    );
+    file_record(
+        &mut img,
+        50,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0, // base record — must NOT merge into record 49
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "DECOY.DAT", 1, 0x20, 11, [t; 4]), 1),
+            attr_nonresident(T_DATA, "", &[(1, Some(84))], 0, CSZ as u64, 11, 11, 0, 0, 2),
+        ],
+    );
+    put(&mut img, 84, b"decoy-bytes");
+    file_record(
+        &mut img,
+        51,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        49, // base record ref — but the attr-list reference claims seq 9
+        &[attr_nonresident(T_DATA, "", &[(1, Some(85))], 4, CSZ as u64, 12, 12, 0, 0, 1)],
+    );
+    put(&mut img, 85, b"stale-bytes!");
+
+    // ---- record 48: DELSPRSE.BIN — deleted sparse file ------------------------------------------
+    // Real clusters 86-87 and 88-89 survive (free in $BITMAP); the 3-cluster
+    // hole between them is recoverable as zeros → fully Intact.
+    file_record(
+        &mut img,
+        48,
+        b"FILE",
+        1,
+        0, // deleted
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "DELSPRSE.BIN", 1, 0x20, 7 * CSZ as u64, [t; 4]), 1),
+            attr_nonresident(
+                T_DATA,
+                "",
+                &[(2, Some(86)), (3, None), (2, Some(88))],
+                0,
+                7 * CSZ as u64,
+                7 * CSZ as u64,
+                7 * CSZ as u64,
+                AFLAG_SPARSE,
+                0,
+                2,
+            ),
+        ],
+    );
+    put(&mut img, 86, b"DELSP-HEAD_____");
+    put(&mut img, 88, b"DELSP-TAIL_____");
+
     // ---- record 70: FILE fragment in MFT slack ----------------------------------------------
     // (MFT allocated = 20 clusters → records 0..79; used = 16 clusters → 0..63)
     file_record(
@@ -1355,7 +1443,7 @@ pub fn build_ntfs() -> Vec<u8> {
         let used = matches!(
             c,
             0..=3 | 4..=23 | 30..=33 | 40..=47 | 52..=53 | 60..=64 | 70..=73 | 80
-                | 96..=111 | 120..=123
+                | 84..=85 | 96..=111 | 120..=123
         );
         bitmap_set(&mut img, c, used);
     }

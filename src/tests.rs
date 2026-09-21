@@ -369,3 +369,52 @@ fn lznt1_offset_bits_slide() {
     assert_eq!(&out[..16], b"ABCDEFGHIJKLMNOP");
     assert_eq!(&out[16..22], b"ABCDEF");
 }
+
+#[test]
+fn hostile_runlist_readers_never_panic() {
+    // VCN/LCN values whose byte offsets overflow u64 must not panic the
+    // sparse/compressed readers (saturating arithmetic).
+    use crate::attr::DataRun;
+    use crate::fs::{CompressedReader, SparseReader, Stream};
+    use std::io::Read;
+    use std::sync::Arc;
+    use sutram_io::ByteSource;
+
+    let src: Arc<dyn ByteSource> = Arc::new(vec![0u8; 4096]);
+    let mk = |compressed: bool| Stream {
+        name: None,
+        resident: None,
+        runs: vec![
+            DataRun {
+                vcn: u64::MAX - 8,
+                len: 4,
+                lcn: Some(0x0020_0000_0000_0000), // lcn*4096 overflows u64
+            },
+            DataRun {
+                vcn: 0,
+                len: 16,
+                lcn: Some(i64::MAX as u64), // saturates too
+            },
+            DataRun {
+                vcn: 16,
+                len: 4,
+                lcn: None,
+            },
+        ],
+        real_size: 16 * 4096,
+        alloc_size: 16 * 4096,
+        init_size: 0,
+        compressed,
+        sparse: true,
+        encrypted: false,
+        comp_shift: 4,
+        attr_offsets: vec![],
+    };
+    // Sparse: must not panic — yields zeros/errors, never a crash.
+    let mut r = SparseReader::new(src.clone(), mk(false), 4096);
+    let mut buf = [0u8; 8192];
+    let _ = r.read(&mut buf);
+    // Compressed: unit read with a saturating LCN offset must not panic.
+    let mut r = CompressedReader::new(src, mk(true), 4096);
+    let _ = r.read(&mut buf);
+}

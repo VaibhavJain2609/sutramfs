@@ -193,7 +193,10 @@ impl NtfsFs {
                     if let Some((off, len)) = a.resident {
                         mft_bitmap = src.read_slice(off, len as usize).ok();
                     } else if a.non_resident {
-                        mft_bitmap = Self::read_stream_bytes(&src, &a.runs, csz, a.real_size).ok();
+                        // Record bitmap ≈ records/8 bytes — cap the read.
+                        mft_bitmap =
+                            Self::read_stream_bytes(&src, &a.runs, csz, a.real_size.min(64 << 20))
+                                .ok();
                     }
                 }
                 _ => {}
@@ -415,8 +418,15 @@ impl NtfsFs {
                 if let Some((off, len)) = a.resident {
                     self.src.read_slice(off, len as usize).ok()
                 } else if a.non_resident {
-                    Self::read_stream_bytes(&self.src, &a.runs, self.bs.cluster_size, a.real_size)
-                        .ok()
+                    // Cap: an attribute list is small metadata; a hostile
+                    // real_size must not become an allocation bomb.
+                    Self::read_stream_bytes(
+                        &self.src,
+                        &a.runs,
+                        self.bs.cluster_size,
+                        a.real_size.min(1 << 20),
+                    )
+                    .ok()
                 } else {
                     None
                 }
@@ -439,6 +449,33 @@ impl NtfsFs {
                 visited.insert(target);
                 match self.parse_record(target) {
                     Ok(ext_rec) => {
+                        // Verify the extension record really belongs to
+                        // this base record: its base-file-reference must
+                        // point back here, and the reference's sequence
+                        // (when nonzero) must match the slot's. A stale or
+                        // corrupt $ATTRIBUTE_LIST otherwise grafts another
+                        // file's extents onto this one — a live-data
+                        // misfire.
+                        if attr::file_ref_rec(ext_rec.base_ref) != rec_no {
+                            if attr_error.is_none() {
+                                attr_error = Some(format!(
+                                    "extension record {target} does not reference \
+                                     base record {rec_no} (ignored)"
+                                ));
+                            }
+                            continue;
+                        }
+                        let ref_seq = (e.record_ref >> 48) as u16;
+                        if ref_seq != 0 && ref_seq != ext_rec.sequence {
+                            if attr_error.is_none() {
+                                attr_error = Some(format!(
+                                    "extension record {target} sequence {:#06x} != \
+                                     reference {ref_seq:#06x} (stale slot, ignored)",
+                                    ext_rec.sequence
+                                ));
+                            }
+                            continue;
+                        }
                         ext_records.push(target);
                         let (eattrs, eerr) = Self::collect_attrs(&ext_rec);
                         for a in eattrs {
@@ -906,13 +943,15 @@ pub(crate) struct SparseReader {
 }
 
 impl SparseReader {
-    fn new(src: Arc<dyn ByteSource>, stream: Stream, csz: u64) -> Self {
+    pub(crate) fn new(src: Arc<dyn ByteSource>, stream: Stream, csz: u64) -> Self {
         let mut map = Vec::with_capacity(stream.runs.len());
         for r in &stream.runs {
+            // Saturating: a hostile runlist may carry VCN/LCN values whose
+            // byte offsets overflow u64 — never panic on untrusted input.
             map.push((
-                r.vcn * csz,
-                r.lcn.map(|l| l * csz),
-                r.len * csz,
+                r.vcn.saturating_mul(csz),
+                r.lcn.map(|l| l.saturating_mul(csz)),
+                r.len.saturating_mul(csz),
             ));
         }
         SparseReader {
@@ -930,15 +969,17 @@ impl Read for SparseReader {
             return Ok(0);
         }
         // Locate the extent covering `pos` (runs are VCN-sorted).
+        // Comparisons use subtraction — saturated `foff`/`len` values from
+        // hostile runlists would overflow `foff + len`.
         for &(foff, doff, len) in &self.map {
-            if self.pos >= foff && self.pos < foff + len {
+            if self.pos >= foff && self.pos - foff < len {
                 let want = (buf.len() as u64)
-                    .min(foff + len - self.pos)
+                    .min(len - (self.pos - foff))
                     .min(self.size - self.pos) as usize;
                 let n = match doff {
                     Some(d) => self
                         .src
-                        .read_at(d + (self.pos - foff), &mut buf[..want])?,
+                        .read_at(d.saturating_add(self.pos - foff), &mut buf[..want])?,
                     None => {
                         buf[..want].fill(0);
                         want
@@ -985,7 +1026,7 @@ pub(crate) struct CompressedReader {
 }
 
 impl CompressedReader {
-    fn new(src: Arc<dyn ByteSource>, stream: Stream, csz: u64) -> Self {
+    pub(crate) fn new(src: Arc<dyn ByteSource>, stream: Stream, csz: u64) -> Self {
         let unit_clusters = if stream.comp_shift > 0 && stream.comp_shift < 32 {
             1u64 << stream.comp_shift
         } else {
@@ -1026,8 +1067,9 @@ impl CompressedReader {
                 Some(lcn) => {
                     let skip = unit_vcn.saturating_sub(r.vcn);
                     let take = (r.len - skip).min(unit_end - (r.vcn + skip));
-                    let off = (lcn + skip) * self.csz;
-                    let want = (take * self.csz) as usize;
+                    // Saturating: hostile LCN/VCN values must not panic.
+                    let off = lcn.saturating_add(skip).saturating_mul(self.csz);
+                    let want = take.saturating_mul(self.csz) as usize;
                     let b = self.src.read_slice(off, want)?;
                     stored.extend_from_slice(&b);
                     if b.len() < want {

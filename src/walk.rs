@@ -143,6 +143,9 @@ impl<'m> Walk<'m> {
             ts.modified = Some(attr::filetime_ts(s.modified));
             ts.accessed = Some(attr::filetime_ts(s.accessed));
             ts.changed = Some(attr::filetime_ts(s.mft_changed));
+            // The DOS attribute flags live in $SI (RO/hidden/system/etc.)
+            // — the FILE record's own flags are a different field.
+            meta.insert("attributes".into(), format!("{:#06x}", s.file_attributes));
             meta.insert("si_created".into(), ns_or_unset(s.created));
             meta.insert("si_modified".into(), ns_or_unset(s.modified));
             meta.insert("si_mft_changed".into(), ns_or_unset(s.mft_changed));
@@ -278,14 +281,32 @@ impl<'m> Walk<'m> {
                     .min(self.fs.src.len().saturating_sub(off)),
             ));
         }
-        let surviving_clusters: u64 = surviving.iter().map(|&(_, _, l)| l).sum();
+        // Clusters in-window that survive = surviving extents ∩ [0,eof).
+        let surviving_in_window: u64 = surviving
+            .iter()
+            .map(|&(vcn, _, len)| eof_vcn.saturating_sub(vcn).min(len))
+            .sum();
+        // Sparse holes inside the window are trivially recoverable — they
+        // read as zeros. Credit them so a deleted sparse file is not
+        // under-reported as partially overwritten.
+        let sparse_in_window: u64 = s
+            .runs
+            .iter()
+            .filter(|r| r.lcn.is_none())
+            .map(|r| eof_vcn.saturating_sub(r.vcn).min(r.len))
+            .sum();
         // $BITMAP cross-check: extents still marked allocated suggest the
         // deletion never fully committed (or $BITMAP itself is stale).
+        // Bounded per extent — hostile runlists can declare astronomic
+        // lengths, and this is an advisory note, not the verdict.
         let marked: u64 = surviving
             .iter()
+            .take(4096)
             .map(|&(_, l, len)| {
-                (0..len)
-                    .filter(|&c| self.fs.cluster_allocated(l + c) == Some(true))
+                (0..len.min(4096))
+                    .filter(|&c| {
+                        self.fs.cluster_allocated(l.saturating_add(c)) == Some(true)
+                    })
                     .count() as u64
             })
             .sum();
@@ -294,13 +315,20 @@ impl<'m> Walk<'m> {
                 "{marked} surviving cluster(s) still marked allocated in $BITMAP"
             ));
         }
-        let state = if surviving_bytes == 0 && s.real_size > 0 {
-            RecoveryState::Unrecoverable
-        } else if surviving_clusters >= expected && allocated >= expected {
+        // Recoverable bytes = surviving in-window bytes + sparse zeros,
+        // capped at the logical size.
+        let recoverable_bytes = surviving_bytes
+            .saturating_add(sparse_in_window.saturating_mul(csz))
+            .min(s.real_size);
+        let state = if expected == 0 {
             RecoveryState::Intact
+        } else if surviving_in_window + sparse_in_window >= expected {
+            RecoveryState::Intact
+        } else if recoverable_bytes == 0 {
+            RecoveryState::Unrecoverable
         } else {
             RecoveryState::PartiallyOverwritten {
-                recovered_bytes: surviving_bytes.min(s.real_size),
+                recovered_bytes: recoverable_bytes,
                 total_bytes: s.real_size,
             }
         };
@@ -339,7 +367,10 @@ impl<'m> Walk<'m> {
 
         let mut meta = self.base_meta(&pf, 0);
         let timestamps = self.timestamps_meta(&pf, &fns, &mut meta);
-        meta.insert("attributes".into(), format!("{:#06x}", rec.flags));
+        if !meta.contains_key("attributes") {
+            // No $SI decoded — fall back to the record flags.
+            meta.insert("attributes".into(), format!("{:#06x}", rec.flags));
+        }
         if let Some(f) = best {
             meta.insert("fn_namespace".into(), f.namespace.to_string());
             meta.insert("fn_real_size".into(), f.real_size.to_string());
@@ -415,7 +446,21 @@ impl<'m> Walk<'m> {
             } else {
                 "MFT record with in-use flag clear"
             };
-            meta.insert("deleted_marker".into(), "mft_inactive".into());
+            // The deletion *evidence* differs per case — an in-use flag
+            // still set in slack means the MFT shrank around a once-live
+            // record; BAAD means chkdsk/torn-write marking.
+            let marker = if fragment {
+                if rec.in_use() {
+                    "mft_slack_inuse"
+                } else {
+                    "mft_slack"
+                }
+            } else if &rec.signature == b"BAAD" {
+                "baad_record"
+            } else {
+                "mft_inactive"
+            };
+            meta.insert("deleted_marker".into(), marker.into());
             meta.insert("recovery_note_0".into(), note.into());
             if fragment {
                 meta.insert("mft_slack".into(), "true".into());
@@ -501,10 +546,11 @@ impl<'m> Walk<'m> {
             meta: primary_meta,
             magic: None,
         };
-        if !deleted && !fragment {
-            if let Some(s) = unnamed {
-                decorate_stream_meta(&mut entry.meta, s, self.fs.bs.cluster_size);
-            }
+        // Sparse/compressed/encrypted flags are honest evidence for
+        // deleted entries too — and they keep `magic_for` from verdicting
+        // on undecodable content.
+        if let Some(s) = unnamed {
+            decorate_stream_meta(&mut entry.meta, s, self.fs.bs.cluster_size);
         }
         entry.magic = self.fs.magic_for(&entry);
         self.queue.push_back(Ok(entry));
@@ -551,10 +597,8 @@ impl<'m> Walk<'m> {
                     meta: m,
                     magic: None,
                 };
-                if !deleted && !fragment {
-                    if let Some(s) = unnamed {
-                        decorate_stream_meta(&mut e.meta, s, self.fs.bs.cluster_size);
-                    }
+                if let Some(s) = unnamed {
+                    decorate_stream_meta(&mut e.meta, s, self.fs.bs.cluster_size);
                 }
                 e.magic = self.fs.magic_for(&e);
                 self.queue.push_back(Ok(e));
@@ -594,9 +638,7 @@ impl<'m> Walk<'m> {
                 meta: m,
                 magic: None,
             };
-            if !deleted && !fragment {
-                decorate_stream_meta(&mut e.meta, s, self.fs.bs.cluster_size);
-            }
+            decorate_stream_meta(&mut e.meta, s, self.fs.bs.cluster_size);
             e.magic = self.fs.magic_for(&e);
             self.queue.push_back(Ok(e));
         }
