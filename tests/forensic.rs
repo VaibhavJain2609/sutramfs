@@ -114,6 +114,130 @@ fn info_reports_volume() {
     assert_eq!(info.meta["journaled"], "true");
     assert_eq!(info.meta["journal_magic"], "0x4a4e4c78");
     assert!(info.meta.contains_key("journal_replay")); // TODO documented
+    // Journal buffer parsed: header + 2 live transactions + 1 stale +
+    // 4 journaled block copies.
+    assert_eq!(info.meta["journal_start"], "0x200");
+    assert_eq!(info.meta["journal_end"], "0x880");
+    assert_eq!(info.meta["journal_endian"], "big");
+    assert_eq!(info.meta["journal_transactions"], "2");
+    assert_eq!(info.meta["journal_stale_transactions"], "1");
+    assert_eq!(info.meta["journal_block_copies"], "4");
+    assert_eq!(info.meta["journal_parse_errors"], "0");
+}
+
+#[test]
+fn journal_entries_surface_transactions() {
+    let fs = mount();
+    let entries: Vec<FsEntry> = fs
+        .journal_entries()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("journal parse should not error on the corpus");
+    // 3 transactions + 4 block copies (header is meta-only).
+    assert_eq!(
+        entries.len(),
+        7,
+        "{:?}",
+        entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+    );
+
+    let tx0 = find(&entries, "tx_0");
+    assert_eq!(tx0.path, "/$JOURNAL/tx_0");
+    assert_eq!(tx0.meta["journal"], "hfs+");
+    assert_eq!(tx0.meta["num_blocks"], "2");
+    assert_eq!(tx0.meta["checksum_ok"], "true");
+    assert_eq!(tx0.meta["live"], "true");
+
+    // Each journaled copy reads back its payload via allocated_ranges.
+    let c = find(&entries, "sector_100");
+    assert_eq!(c.path, "/$JOURNAL/tx_0/sector_100");
+    assert_eq!(c.meta["hfs_journal_tx"], "0");
+    assert_eq!(c.meta["target_sector"], "100");
+    assert_eq!(c.meta["target_offset"], "0xc800"); // 100 × 512
+    assert_eq!(
+        c.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    );
+    assert_eq!(c.allocated_ranges.len(), 1);
+    let mut buf = Vec::new();
+    fs.read_file(c).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"JOURNALED-SECTOR-100"));
+
+    // The stale transaction is flagged as overwritten history.
+    let stale = find(&entries, "tx_2");
+    assert_eq!(stale.meta["live"], "false");
+    assert_eq!(stale.meta["checksum_ok"], "true");
+    assert!(stale.meta["note"].contains("stale"));
+    let s400 = find(&entries, "sector_400");
+    assert_eq!(s400.meta["hfs_journal_tx"], "2");
+
+    // Journal evidence must not leak into the normal walk.
+    let walked = all_entries();
+    assert!(!walked.iter().any(|e| e.path.starts_with("/$JOURNAL/")));
+}
+
+#[test]
+fn journal_events_typed_stream() {
+    use sutram_hfs::{HfsFs, JournalEventKind};
+    let fs = HfsFs::mount(image(), MountOptions::default()).unwrap();
+    let events = fs.journal_events().collect::<Result<Vec<_>, _>>().unwrap();
+    // header + 2 live tx (2+1 copies) + 1 stale tx (1 copy) = 8 events.
+    assert_eq!(events.len(), 8);
+    let JournalEventKind::Header { start, end, .. } = events[0].kind else {
+        panic!("first event should be the journal header: {:?}", events[0])
+    };
+    assert_eq!((start, end), (512, 2176));
+    let JournalEventKind::Transaction { live, num_blocks, .. } = &events[1].kind else {
+        panic!("event 1 should be a transaction: {:?}", events[1].kind)
+    };
+    assert!(*live && *num_blocks == 2);
+    let JournalEventKind::BlockCopy { copy, .. } = &events[2].kind else {
+        panic!("event 2 should be a block copy: {:?}", events[2].kind)
+    };
+    assert_eq!(copy.target_sector, 100);
+    assert_eq!(copy.bytes, 512);
+    let JournalEventKind::Transaction { live, .. } = &events[6].kind else {
+        panic!("event 6 should be the stale transaction: {:?}", events[6].kind)
+    };
+    assert!(!*live);
+}
+
+#[test]
+fn journal_corruption_lenient_and_strict() {
+    // Corrupt the live chain: overwrite tx1's block_list_header magic
+    // fields so its num_blocks is implausible — the chain reports the
+    // break, then the sweep still finds the stale list.
+    let mut img = common::build_hfsplus();
+    let jb = common::block_off(common::JOURNAL_BLOCK);
+    img[jb + 1600 + 2..jb + 1600 + 4].copy_from_slice(&0x00FFu16.to_be_bytes());
+    let fs = HfsParser.mount(Arc::new(img.clone())).unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert!(items.iter().any(|i| i.is_err()));
+    // Stale transaction still recovered via the checksum sweep.
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok().map(|e| e.name.clone()))
+        .collect();
+    assert!(names.contains(&"tx_1".to_string()), "{names:?}");
+
+    // Strict: the corrupt header is terminal.
+    let fs = HfsParser
+        .mount_with(Arc::new(img), &MountOptions::strict())
+        .unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert!(items.last().unwrap().is_err());
+}
+
+#[test]
+fn journal_bad_magic_is_error_not_panic() {
+    let mut img = common::build_hfsplus();
+    let jb = common::block_off(common::JOURNAL_BLOCK);
+    img[jb] = 0; // break 'JNLx'
+    let fs = HfsParser.mount(Arc::new(img)).unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].is_err());
 }
 
 #[test]

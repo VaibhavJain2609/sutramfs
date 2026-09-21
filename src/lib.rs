@@ -31,8 +31,13 @@
 //!   to live files are reported lost.
 //! * **Timestamps** — the five HFS+ u32 dates (create/contentMod/attrMod/
 //!   access/backup) decoded as `hfs+-u32-1904-local`; raw values preserved.
-//! * **Journal awareness** — `journalInfoBlock` → JIB + journal buffer
-//!   magic in `FsInfo::meta`; transaction replay is a documented TODO.
+//! * **Journal forensics** — `journalInfoBlock` locates the journal
+//!   buffer; its `journal_header` + `block_list_header` chain is parsed
+//!   into [`JournalEvent`]s (`HfsFs::journal_events()`), emitted as
+//!   `/$JOURNAL/` pseudo-entries via `journal_entries()` — each journaled
+//!   block copy keeps its payload readable and its destination sector in
+//!   meta. Live-chain and stale overwritten transactions are both
+//!   surfaced; replay is a documented TODO.
 //! * **Provenance** — `disk_offset` = the catalog record's absolute offset;
 //!   `allocated_ranges` = absolute extent byte ranges.
 //! * Lenient by default: corrupt nodes/records yield `Err(FsError)` items;
@@ -45,10 +50,14 @@ mod btree;
 mod catalog;
 mod extents;
 mod fs;
+mod journal;
 mod vh;
 mod walk;
 
 pub use fs::{HfsFs, HfsParser};
+pub use journal::{
+    journal_checksum, JournalEvent, JournalEventKind, JournalHeader,
+};
 
 #[cfg(test)]
 mod tests;

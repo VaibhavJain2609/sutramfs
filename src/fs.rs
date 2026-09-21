@@ -7,8 +7,8 @@ use std::io::Read;
 use std::sync::Arc;
 
 use sutram_fs::{
-    DetectConfidence, EntryKind, FileSystem, FsEntry, FsError, FsInfo, FsParser, MountOptions,
-    RecoveryState, Result,
+    DetectConfidence, EntryKind, FileSystem, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser,
+    MountOptions, RecoveryState, Result, Timestamps,
 };
 use sutram_io::le;
 use sutram_io::ByteSource;
@@ -17,6 +17,7 @@ use crate::attrs::{self, AttrData};
 use crate::btree::{self, Btree, Node};
 use crate::catalog::{self, CatRecord, RecRef};
 use crate::extents::{self, ExtKey};
+use crate::journal::{self, JournalEvent, JournalEventKind};
 use crate::vh::{self, Extent, ForkData, JournalInfo, VolumeHeader};
 use crate::walk::Walk;
 
@@ -134,7 +135,10 @@ pub struct HfsFs {
 }
 
 impl HfsFs {
-    pub(crate) fn mount(src: Arc<dyn ByteSource>, opts: MountOptions) -> Result<Self> {
+    /// Mount the volume directly — the concrete handle exposes journal
+    /// forensics ([`Self::journal_events`]) beyond the `dyn FileSystem`
+    /// surface.
+    pub fn mount(src: Arc<dyn ByteSource>, opts: MountOptions) -> Result<Self> {
         let vh = VolumeHeader::parse(src.as_ref())?;
         let mut fs = HfsFs {
             src,
@@ -963,6 +967,110 @@ impl HfsFs {
         }
         Some(sutram_magic::check_entry(&e.name, &header))
     }
+
+    // ---- journal forensics ---------------------------------------------
+
+    /// Stream the parsed journal buffer as [`JournalEvent`]s: the
+    /// `journal_header`, each `block_list_header` transaction on the
+    /// live `next`-linked chain between `start` and `end`, every
+    /// journaled block copy it carries (target sector + journaled
+    /// payload offset), and stale checksum-valid lists recovered from
+    /// the buffer's overwritten region. The journal is **parsed, never
+    /// replayed**. Empty when the volume is not journaled.
+    pub fn journal_events(&self) -> Box<dyn Iterator<Item = Result<JournalEvent>> + Send + '_> {
+        let Some(j) = &self.journal else {
+            return Box::new(std::iter::empty());
+        };
+        match journal::open(&self.src, j.buffer_offset, j.buffer_size) {
+            Ok((buf, hdr)) => Box::new(journal::JournalScan::new(
+                buf,
+                j.buffer_offset,
+                hdr,
+                self.opts.strict,
+            )),
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
+    }
+
+    /// Render one journal event as a forensic `FsEntry`. `journal_base`
+    /// is the absolute offset of the journal buffer on the source.
+    fn journal_entry(&self, ev: &JournalEvent, journal_base: u64) -> Option<FsEntry> {
+        let mut meta = HashMap::new();
+        meta.insert("journal".into(), "hfs+".into());
+        let (name, path, status, ranges, size) = match &ev.kind {
+            JournalEventKind::Transaction {
+                index,
+                num_blocks,
+                bytes_used,
+                checksum_ok,
+                live,
+            } => {
+                meta.insert("hfs_journal_tx".into(), index.to_string());
+                meta.insert("num_blocks".into(), num_blocks.to_string());
+                meta.insert("bytes_used".into(), bytes_used.to_string());
+                meta.insert("checksum_ok".into(), checksum_ok.to_string());
+                meta.insert("live".into(), live.to_string());
+                meta.insert(
+                    "note".into(),
+                    if *live {
+                        "live journal transaction (block_list_header)".into()
+                    } else {
+                        "stale journal transaction — overwritten history".into()
+                    },
+                );
+                (
+                    format!("tx_{index}"),
+                    format!("/$JOURNAL/tx_{index}"),
+                    FsEntryStatus::Deleted {
+                        recovery: RecoveryState::Unknown,
+                    },
+                    Vec::new(),
+                    0,
+                )
+            }
+            JournalEventKind::BlockCopy {
+                tx_index,
+                copy,
+                live,
+            } => {
+                meta.insert("hfs_journal_tx".into(), tx_index.to_string());
+                meta.insert("target_sector".into(), copy.target_sector.to_string());
+                meta.insert(
+                    "target_offset".into(),
+                    format!("{:#x}", copy.target_offset),
+                );
+                meta.insert("live".into(), live.to_string());
+                meta.insert(
+                    "note".into(),
+                    "journaled copy — prior state of the destination block".into(),
+                );
+                let ranges = vec![(journal_base + copy.data_offset, copy.bytes)];
+                (
+                    format!("sector_{}", copy.target_sector),
+                    format!("/$JOURNAL/tx_{tx_index}/sector_{}", copy.target_sector),
+                    FsEntryStatus::Deleted {
+                        recovery: RecoveryState::Intact,
+                    },
+                    ranges,
+                    copy.bytes,
+                )
+            }
+            _ => return None, // the header is metadata, not an artefact
+        };
+        Some(FsEntry {
+            path,
+            name,
+            entry_id: ev.jnl_offset,
+            kind: EntryKind::Other,
+            size,
+            disk_offset: ev.disk_offset,
+            allocated_ranges: ranges,
+            timestamps: Timestamps::default(),
+            status,
+            meta,
+            magic: None,
+        })
+    }
 }
 
 /// Render a big-endian u32 FourCC as ASCII (hex if unprintable).
@@ -1076,6 +1184,50 @@ impl FileSystem for HfsFs {
                 "journal_replay".into(),
                 "TODO: journal contents parsed but transactions not replayed".into(),
             );
+            // Journal buffer contents: header + transaction counts.
+            let mut header_fields = false;
+            let mut live_tx = 0u64;
+            let mut stale_tx = 0u64;
+            let mut copies = 0u64;
+            let mut errs = 0u64;
+            for item in self.journal_events() {
+                match item {
+                    Ok(ev) => match ev.kind {
+                        JournalEventKind::Header {
+                            start,
+                            end,
+                            size,
+                            jhdr_size,
+                            swapped,
+                        } => {
+                            header_fields = true;
+                            meta.insert("journal_start".into(), format!("{start:#x}"));
+                            meta.insert("journal_end".into(), format!("{end:#x}"));
+                            meta.insert("journal_buffer_len".into(), format!("{size:#x}"));
+                            meta.insert("journal_jhdr_size".into(), jhdr_size.to_string());
+                            meta.insert(
+                                "journal_endian".into(),
+                                if swapped { "little" } else { "big" }.into(),
+                            );
+                        }
+                        JournalEventKind::Transaction { live, .. } => {
+                            if live {
+                                live_tx += 1;
+                            } else {
+                                stale_tx += 1;
+                            }
+                        }
+                        JournalEventKind::BlockCopy { .. } => copies += 1,
+                    },
+                    Err(_) => errs += 1,
+                }
+            }
+            if header_fields {
+                meta.insert("journal_transactions".into(), live_tx.to_string());
+                meta.insert("journal_stale_transactions".into(), stale_tx.to_string());
+                meta.insert("journal_block_copies".into(), copies.to_string());
+                meta.insert("journal_parse_errors".into(), errs.to_string());
+            }
         }
         FsInfo {
             fs_type: if vh.signature == vh::SIG_HFSX {
@@ -1095,6 +1247,25 @@ impl FileSystem for HfsFs {
 
     fn source(&self) -> Arc<dyn ByteSource> {
         self.src.clone()
+    }
+
+    /// Journal artefacts as pseudo-entries: each transaction under
+    /// `/$JOURNAL/tx_<i>` and each journaled block copy under
+    /// `tx_<i>/sector_<s>` with the copy's payload readable through
+    /// `allocated_ranges`.
+    fn journal_entries(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        let base = self
+            .journal
+            .as_ref()
+            .map(|j| j.buffer_offset)
+            .unwrap_or(0);
+        Box::new(
+            self.journal_events()
+                .filter_map(move |item| match item {
+                    Err(e) => Some(Err(e)),
+                    Ok(ev) => self.journal_entry(&ev, base).map(Ok),
+                }),
+        )
     }
 
     fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {

@@ -626,17 +626,78 @@ pub fn build_hfsplus() -> Vec<u8> {
     img[rb + 32..rb + 32 + rz.len()].copy_from_slice(&rz);
 
     // ---- journal ---------------------------------------------------------
-    // JournalInfoBlock at block 40: flags, device_sig[8], offset, size.
+    // JournalInfoBlock at block 40 → journal buffer at block 41 (4096 B).
     let jib = block_off(JIB_BLOCK);
     w32(&mut img, jib, 0x1); // flags: journaling enabled
     w64(&mut img, jib + 36, block_off(JOURNAL_BLOCK) as u64);
     w64(&mut img, jib + 44, BLOCK as u64);
-    let jb = block_off(JOURNAL_BLOCK);
-    w32(&mut img, jb, 0x4A4E4C78); // 'JNLx'
-    w32(&mut img, jb + 4, 0x67656C64); // 'geld' little-endian flag
+    write_journal(&mut img);
 
     img
 }
+
+// ---- journal buffer -------------------------------------------------------
+
+/// One `block_list_header` + `block_info` entries + journaled data,
+/// all fields big-endian (the "JNLx" magic declares the order).
+/// `infos` = `(bnum_sectors, bytes, next)`.
+fn block_list(max_blocks: u16, infos: &[(u64, u64, u64)]) -> Vec<u8> {
+    let blhdr_size = 16 + max_blocks as usize * 24;
+    let data_len: usize = infos.iter().map(|i| i.1 as usize).sum();
+    let mut l = vec![0u8; blhdr_size + data_len];
+    w16(&mut l, 0, max_blocks);
+    w16(&mut l, 2, infos.len() as u16);
+    w32(&mut l, 4, (blhdr_size + data_len) as u32); // bytes_used
+    let mut boff = 16usize;
+    for &(bnum, bytes, next) in infos {
+        w64(&mut l, boff, bnum);
+        w64(&mut l, boff + 8, bytes);
+        w64(&mut l, boff + 16, next);
+        boff += 24;
+    }
+    // XNU checksum over the binfo array.
+    let cksum = sutram_hfs::journal_checksum(&l[16..16 + infos.len() * 24]);
+    w32(&mut l, 8, cksum);
+    l
+}
+
+/// Write the journal buffer at `JOURNAL_BLOCK` (4096 B, big-endian):
+///
+/// ```text
+///   0 journal_header (jhdr_size 512 → data region starts at 512)
+/// 512 tx0: sectors 100,200 (data 576/1088), next → 1600
+/// 1600 tx1: sector 300 (data 1664), next 0 → wrap to start; end=2176
+/// 2304 stale tx: sector 400 — overwritten but checksum-valid history
+/// ```
+fn write_journal(img: &mut [u8]) {
+    let jb = block_off(JOURNAL_BLOCK);
+    w32(img, jb, 0x4A4E4C78); // magic 'JNLx' → big-endian fields
+    w32(img, jb + 4, 0x12345678); // endian flag
+    w64(img, jb + 8, 512); // start
+    w64(img, jb + 16, 2176); // end
+    w64(img, jb + 24, 4096); // size
+    w32(img, jb + 32, 64); // blhdr_size (16 + 2×24)
+    w32(img, jb + 36, 0); // checksum (header field, unused)
+    w32(img, jb + 40, 512); // jhdr_size
+
+    let mut tx0 = block_list(2, &[(100, 512, 0), (200, 512, 1600)]);
+    let p1 = b"JOURNALED-SECTOR-100-DATA";
+    tx0[64..64 + p1.len()].copy_from_slice(p1);
+    let p2 = b"JOURNALED-SECTOR-200-DATA";
+    tx0[576..576 + p2.len()].copy_from_slice(p2);
+    img[jb + 512..jb + 512 + tx0.len()].copy_from_slice(&tx0);
+
+    let mut tx1 = block_list(2, &[(300, 512, 0)]);
+    let p3 = b"JOURNALED-SECTOR-300-DATA";
+    tx1[64..64 + p3.len()].copy_from_slice(p3);
+    img[jb + 1600..jb + 1600 + tx1.len()].copy_from_slice(&tx1);
+
+    let mut tx2 = block_list(2, &[(400, 512, 0)]);
+    let p4 = b"JOURNALED-SECTOR-400-DATA";
+    tx2[64..64 + p4.len()].copy_from_slice(p4);
+    img[jb + 2304..jb + 2304 + tx2.len()].copy_from_slice(&tx2);
+}
+
 
 /// Wrap the HFS+ corpus in an HFS "BD" wrapper: the embedded volume starts
 /// at allocation block 2 of the wrapper (`drAlBlSt`=0, `xdrStABNt`=2,

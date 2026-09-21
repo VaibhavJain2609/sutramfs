@@ -67,10 +67,19 @@ Pure HFS is detected but not mounted (`FsError::Unsupported`).
   access, backup) decode as `hfs+-u32-1904-local` (seconds since
   1904-01-01, 1 s granularity); raw values are preserved and HFS+'s
   local-time-zone convention is documented in meta.
-- **Journal awareness** — `journalInfoBlock` locates the JIB and journal
-  buffer; `journal_flags`/`journal_offset`/`journal_size`/`journal_magic`
-  land in `FsInfo::meta`. Transaction replay is **not** implemented —
-  `meta["journal_replay"]` says so.
+- **Journal forensics** — `journalInfoBlock` locates the journal buffer;
+  its `journal_header` (JNLx, endianness declared by the magic's byte
+  order) and the `block_list_header` transaction chain are parsed as
+  evidence. `HfsFs::journal_events()` yields the typed stream;
+  `journal_entries()` emits `/$JOURNAL/tx_<i>` pseudo-entries with one
+  `sector_<n>` child per journaled block copy — each copy's payload is
+  readable through `allocated_ranges` and its destination sector
+  recorded in meta. The live `next`-linked chain (`start`→`end`) is
+  walked first, then the buffer is swept for checksum-valid **stale**
+  transactions — overwritten history is flagged `live=false`.
+  `FsInfo::meta` counts `journal_transactions`,
+  `journal_stale_transactions`, `journal_block_copies`. Transactions are
+  **parsed, never replayed** — `meta["journal_replay"]` says so.
 - **Magic verdicts** — each file's first ≤ 4 KiB is checked by
   `sutram-magic`; `FsEntry.magic` carries the `MagicVerdict`
   (masquerade detection, e.g. `.doc` containing `MZ` → `Severity::High`).
@@ -137,8 +146,13 @@ deleted entry returns only recoverable bytes.
 - **Pure HFS** (`BD` without an embedded HFS+ volume) is detected but
   mount returns `Unsupported` — the catalog format differs enough that
   it is out of scope for this crate.
-- **Journal replay is not implemented** — JIB/buffer metadata is
-  reported; transactions pending at acquisition are not applied.
+- **Journal replay is not implemented** — `journal_header` and the
+  `block_list_header` chain are parsed as evidence (transactions and
+  journaled block copies stream via `journal_events()`/`journal_entries()`),
+  but pending transactions are not applied to filesystem state. The
+  buffer scan is capped at 64 MiB and the transaction chain at 8192
+  iterations; the XNU checksum is verified over the `block_info` array
+  and reported as `checksum_ok` (advisory, not a gate).
 - **Compression** — decmpfs types 1/3/4/7/8/9/10 decompress (zlib and
   LZVN, inline and resource-fork table); LZFSE (11/12) and LZBITMAP
   (13/14) surface `compression_note` = `unsupported`.
