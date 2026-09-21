@@ -91,6 +91,7 @@ impl<'m> Walk<'m> {
     }
 
     /// Shared FsEntry construction from an inode.
+    #[allow(clippy::too_many_arguments)]
     fn base_entry(
         &mut self,
         inode: &Inode,
@@ -240,11 +241,11 @@ impl<'m> Walk<'m> {
         }
         let ranges = match self.fs.map(&inode) {
             Ok(crate::extent::BlockMap::Runs(runs)) => self.fs.run_ranges(&runs),
-            Ok(crate::extent::BlockMap::Inline { len }) => {
-                // Inline data lives inside the inode — point provenance at
-                // the payload region (i_block + 4-byte length field).
-                let avail = (len as u64).min(inode.size).min(56);
-                vec![(inode.disk_offset + 0x2C, avail)]
+            Ok(crate::extent::BlockMap::Inline { .. })
+            | Ok(crate::extent::BlockMap::InlineDir) => {
+                // Inline data lives inside the inode — point provenance
+                // at the i_block payload (+ system.data spillover).
+                self.fs.inline_ranges(&inode)
             }
             Ok(crate::extent::BlockMap::Empty) => Vec::new(),
             Err(e) => {
@@ -427,7 +428,7 @@ impl<'m> Walk<'m> {
                 notes.push("on the orphan inode list (s_last_orphan chain)".into());
             }
             let (state, ranges) = if inode.is_dir() || inode.is_symlink() {
-                (RecoveryState::Intact, self.fs.runs_of(&inode).map(|r| self.fs.run_ranges(&r)).unwrap_or_default())
+                (RecoveryState::Intact, self.fs.entry_ranges(&inode))
             } else {
                 match self.fs.runs_of(&inode) {
                     Ok(r) => (RecoveryState::Intact, self.fs.run_ranges(&r)),
@@ -642,11 +643,7 @@ impl Iterator for Walk<'_> {
                                 };
                                 if path == "/" {
                                     // Emit the root inode itself.
-                                    let ranges = self
-                                        .fs
-                                        .runs_of(&inode)
-                                        .map(|r| self.fs.run_ranges(&r))
-                                        .unwrap_or_default();
+                                    let ranges = self.fs.entry_ranges(&inode);
                                     let e = self.base_entry(
                                         &inode,
                                         "/".into(),

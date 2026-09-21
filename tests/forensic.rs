@@ -175,18 +175,30 @@ fn inline_data_file_reads() {
     let e = find(&entries, "tiny");
     assert_eq!(e.meta["inline_data"], "true");
     assert_eq!(e.meta["mapping"], "inline");
-    // Provenance points inside the inode itself.
-    assert_eq!(e.allocated_ranges.len(), 1);
-    let (off, len) = e.allocated_ranges[0];
-    assert_eq!(off, common::inode_off(30) as u64 + 0x2C);
-    assert_eq!(len, 10);
+    // Provenance points inside the inode itself: the 60-byte i_block
+    // payload plus the 15-byte "system.data" xattr spillover.
+    assert_eq!(e.allocated_ranges.len(), 2);
+    assert_eq!(
+        e.allocated_ranges[0],
+        (common::inode_off(30) as u64 + 0x28, 60)
+    );
+    assert_eq!(
+        e.allocated_ranges[1],
+        (common::inode_off(30) as u64 + 241, 15)
+    );
     let mut buf = Vec::new();
     mount()
         .read_file(e)
         .unwrap()
         .read_to_end(&mut buf)
         .unwrap();
-    assert_eq!(buf, b"TINYINLINE");
+    let mut want = Vec::new();
+    for i in 0..60 {
+        want.push(b'A' + (i % 26) as u8);
+    }
+    want.extend_from_slice(b"SPILLOVER-TAIL!");
+    assert_eq!(buf, want);
+    assert_eq!(e.size, 75);
 }
 
 #[test]
@@ -227,8 +239,8 @@ fn slack_carve_recovers_deleted_name() {
             recovery: RecoveryState::Intact
         }
     ));
-    // carved dirent offset: root dir block 40, "x" at pos 248, slack at 260.
-    assert_eq!(e.disk_offset, common::dirent_off(40, 260) as u64);
+    // carved dirent offset: root dir block 40, slack after "x" (pos 308).
+    assert_eq!(e.disk_offset, common::dirent_off(40, 320) as u64);
     // deleted-time populated.
     let d = e.timestamps.deleted.as_ref().unwrap();
     assert_eq!(d.value, Some(1_705_320_300_000_000_000));
@@ -501,4 +513,195 @@ fn two_groups_backup_superblock() {
 fn mount_rejects_garbage() {
     let src: Arc<dyn ByteSource> = Arc::new(vec![0u8; 8192]);
     assert!(Ext4Parser.mount(src).is_err());
+}
+
+#[test]
+fn inline_dir_walks() {
+    let entries = all_entries();
+    let dir = find(&entries, "inlinedir");
+    assert_eq!(dir.kind, EntryKind::Directory);
+    assert_eq!(dir.meta["mapping"], "inline");
+    assert_eq!(dir.meta["inline_data"], "true");
+    // Dirents decoded from i_block[4..60].
+    let inner = entries
+        .iter()
+        .find(|e| e.path == "/inlinedir/inner.txt")
+        .expect("/inlinedir/inner.txt missing");
+    let mut buf = Vec::new();
+    mount()
+        .read_file(inner)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf, b"INNR");
+}
+
+#[test]
+fn sparse_file_reads_zeros_then_data() {
+    let entries = all_entries();
+    let e = find(&entries, "sparse.bin");
+    assert_eq!(e.size, 3072);
+    let mut buf = Vec::new();
+    mount()
+        .read_file(e)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf.len(), 3072);
+    assert!(buf[..2048].iter().all(|&b| b == 0), "hole must read as zeros");
+    assert_eq!(&buf[2048..2060], b"SPARSE-DATA!");
+}
+
+#[test]
+fn phantom_dirent_flags_unallocated_inode() {
+    let entries = all_entries();
+    let e = find(&entries, "phantom.txt");
+    assert_eq!(e.status, FsEntryStatus::Live);
+    assert_eq!(e.meta["inode_unallocated"], "true");
+}
+
+#[test]
+fn carved_dirent_into_reused_inode() {
+    let entries = all_entries();
+    let e = find(&entries, "stale.lnk");
+    assert_eq!(e.meta["carved_dirent"], "true");
+    assert_eq!(e.meta["inode_reused"], "true");
+    assert!(e.meta["recovery_note_1"].contains("reallocated"));
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unrecoverable
+        }
+    ));
+}
+
+#[test]
+fn carved_dirent_into_zeroed_inode() {
+    let entries = all_entries();
+    let e = find(&entries, "zeroed.de");
+    assert_eq!(e.meta["carved_dirent"], "true");
+    assert!(matches!(e.status, FsEntryStatus::Deleted { .. }));
+}
+
+#[test]
+fn deleted_inline_inode_recovers_from_iblock() {
+    let entries = all_entries();
+    let e = entries
+        .iter()
+        .find(|e| e.meta.get("inode").map(|s| s == "35").unwrap_or(false))
+        .expect("ino 35 artefact missing");
+    assert_eq!(e.meta["orphan"], "true");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    ));
+    let mut buf = Vec::new();
+    mount()
+        .read_file(e)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf, b"GONE-INLINE-DATA-123");
+}
+
+#[test]
+fn orphan_dir_artefact() {
+    let entries = all_entries();
+    let e = entries
+        .iter()
+        .find(|e| e.meta.get("inode").map(|s| s == "36").unwrap_or(false))
+        .expect("ino 36 artefact missing");
+    assert_eq!(e.kind, EntryKind::Directory);
+    assert_eq!(e.meta["orphan"], "true");
+    assert_eq!(e.allocated_ranges.len(), 1);
+}
+
+#[test]
+fn carve_region_finds_pk() {
+    let fs = mount();
+    let hits: Vec<_> = fs
+        .carve_region(
+            common::blk_off(51) as u64 - 512,
+            2048,
+            common::BLK as u64,
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(hits
+        .iter()
+        .any(|h| h.offset == common::blk_off(51) as u64 && h.kind == MagicType::Zip));
+}
+
+#[test]
+fn carve_region_rejects_zero_align() {
+    let fs = mount();
+    assert!(fs.carve_region(0, 4096, 0).is_err());
+}
+
+#[test]
+fn read_file_rejects_directories() {
+    let entries = all_entries();
+    let dir = find(&entries, "subdir");
+    assert!(mount().read_file(dir).is_err());
+}
+
+#[test]
+fn carved_metadata_only_entry_reads_empty() {
+    // "zeroed.de" carved dirent has entry_id pointing at a zeroed inode
+    // slot — read_file falls back to the (empty) recorded ranges.
+    let entries = all_entries();
+    let e = find(&entries, "zeroed.de");
+    let mut buf = Vec::new();
+    mount()
+        .read_file(e)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn unallocated_ranges_tolerate_bitmap_failure() {
+    let mut img = common::build_ext4();
+    // Point group 0's block bitmap beyond the image → bitmap read fails;
+    // unallocated_ranges must treat the group as fully allocated.
+    let gdt = common::blk_off(common::GDT_BLK);
+    common::w32(&mut img, gdt, 4096); // bg_block_bitmap_lo → block 4096
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = Ext4Parser.mount(src).unwrap();
+    assert!(fs.unallocated_ranges().is_empty());
+}
+
+#[test]
+fn truncated_image_walks_without_panic() {
+    // Image cut mid-inode-table — reads fail, walk emits errors, no panic.
+    let img = common::build_ext4();
+    let src: Arc<dyn ByteSource> = Arc::new(img[..8 * 1024].to_vec());
+    let fs = Ext4Parser.mount(src);
+    // Mount itself may fail (GDT/inode table unreadable) — both are fine;
+    // the contract is only "no panic".
+    if let Ok(fs) = fs {
+        let _: Vec<_> = fs.walk().collect();
+    }
+}
+
+#[test]
+fn deleted_entry_partial_ranges_cap_read() {
+    // old.log (ino 15): block 0 reallocated (lost), block 1 free —
+    // read_file must yield only the surviving extent (the full freed
+    // block, incl. tail slack), never the live file's block.
+    let entries = all_entries();
+    let e = find(&entries, "ino_15");
+    let mut buf = Vec::new();
+    mount()
+        .read_file(e)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf.len(), 1024);
+    assert!(buf.starts_with(b"OLD LOG TAIL SURVIVES HERE"));
+    assert!(!buf.windows(7).any(|w| w == b"NEWFILE"));
 }

@@ -356,14 +356,14 @@ pub fn build_ext4() -> Vec<u8> {
     w32(&mut img, 1024 + 0xE0, 8); // s_journal_inum
 
     // ---- allocated data blocks ----------------------------------------
-    for b in [30u32, 31, 32, 33, 40, 41, 42, 44, 45, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61] {
+    for b in [30u32, 31, 32, 33, 40, 41, 42, 44, 45, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64] {
         set_block(&mut img, b);
     }
     // Allocated inodes (beyond reserved 1..=8).
-    for i in [11u32, 12, 14, 16, 17, 18, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31] {
+    for i in [11u32, 12, 14, 16, 17, 18, 20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33, 36] {
         set_inode_bit(&mut img, i);
     }
-    // Inodes 13, 15, 19, 24 stay FREE (deleted).
+    // Inodes 13, 15, 19, 24, 34, 35 stay FREE (deleted/stale).
 
     // ---- inodes ---------------------------------------------------------
     let t = 1_705_314_620u32;
@@ -410,13 +410,54 @@ pub fn build_ext4() -> Vec<u8> {
     put_inode(&mut img, 28, 0o100644, 5, 1, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 57)]), 0, t, 0, None, 0);
     // ino 29: x → 60
     put_inode(&mut img, 29, 0o100644, 4, 1, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 60)]), 0, t, 0, None, 0);
-    // ino 30: tiny — inline data (i_block[0..4]=len, payload follows).
+    // ino 30: tiny — inline data: i_block[0..60] holds the first 60 file
+    // bytes (no length prefix); the tail spills into the "system.data"
+    // ibody xattr, per the kernel inline-data layout.
     let mut inl = [0u8; 60];
-    w32(&mut inl, 0, 10);
-    inl[4..14].copy_from_slice(b"TINYINLINE");
-    put_inode(&mut img, 30, 0o100644, 10, 1, 0, EXT4_INLINE_DATA_FL, inl, 0, t, 0, None, 0);
+    for (i, b) in inl.iter_mut().enumerate() {
+        *b = b'A' + (i % 26) as u8; // "ABCDEFGHIJKLMNOPQRSTUVWXYZABCD…" ×60
+    }
+    put_inode(&mut img, 30, 0o100644, 75, 1, 0, EXT4_INLINE_DATA_FL, inl, 0, t, 0, None, 0);
+    // ibody xattr region (extra_isize=32 → region at +160): one
+    // system.data entry, value = last 15 bytes at inode offset 241.
+    let o = inode_off(30) + 160;
+    w32(&mut img, o, 0xEA02_0000);
+    img[o + 4] = 11; // e_name_len
+    img[o + 5] = 7; // e_name_index = system
+    w16(&mut img, o + 6, 241); // e_value_offs (inode-relative)
+    w32(&mut img, o + 12, 15); // e_value_size
+    img[o + 20..o + 31].copy_from_slice(b"system.data");
+    // e_value_offs is relative to the inode start, not the xattr region.
+    img[inode_off(30) + 241..inode_off(30) + 256].copy_from_slice(b"SPILLOVER-TAIL!");
     // ino 31: slowlink — slow symlink, target stored in block 61.
     put_inode(&mut img, 31, 0o120777, 10, 1, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 61)]), 0, t, 0, None, 0);
+    // ino 32: inlinedir — inline-data directory: i_block[0..4] is the
+    // parent inode number, dirent records live in i_block[4..60].
+    let mut idir = [0u8; 60];
+    w32(&mut idir, 0, 2); // parent inode ("/")
+    let mut ip = 4usize;
+    let mut ide = |ino: u32, rec: usize, name: &[u8], ft: u8| {
+        w32(&mut idir, ip, ino);
+        w16(&mut idir, ip + 4, rec as u16);
+        idir[ip + 6] = name.len() as u8;
+        idir[ip + 7] = ft;
+        idir[ip + 8..ip + 8 + name.len()].copy_from_slice(name);
+        ip += rec;
+    };
+    ide(32, 12, b".", FT_DIR);
+    ide(2, 12, b"..", FT_DIR);
+    ide(14, 32, b"inner.txt", FT_REG);
+    put_inode(&mut img, 32, 0o40755, 56, 2, 0, EXT4_INLINE_DATA_FL, idir, 0, t, 0, None, 0);
+    // ino 33: sparse.bin — hole at logical blocks 0-1, data at block 62.
+    put_inode(&mut img, 33, 0o100644, 3072, 1, 2, EXT4_EXTENTS_FL, extent_root(&[(2, 1, 62)]), 0, t, 0, None, 0);
+    // ino 34: phantom.txt — live dirent but inode bit clear (stale inode).
+    put_inode(&mut img, 34, 0o100644, 7, 1, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 63)]), 0, t, 0, None, 0);
+    // ino 35: gone-inline — DELETED inline-data file (unallocated inode).
+    let mut ginl = [0u8; 60];
+    ginl[..20].copy_from_slice(b"GONE-INLINE-DATA-123");
+    put_inode(&mut img, 35, 0o100644, 20, 0, 0, EXT4_INLINE_DATA_FL, ginl, 1_705_320_400, t, 0, None, 0);
+    // ino 36: allocated, unreferenced DIR → orphan artefact with extents.
+    put_inode(&mut img, 36, 0o40755, 1024, 2, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 64)]), 0, t, 0, None, 0);
 
     // ---- directory blocks -------------------------------------------------
     // Root dir (block 40): entries + slack containing deleted "notes.txt".
@@ -441,12 +482,19 @@ pub fn build_ext4() -> Vec<u8> {
     de(&mut img, 28, "café.txt".as_bytes(), FT_REG);
     de(&mut img, 30, b"tiny", FT_REG);
     de(&mut img, 31, b"slowlink", FT_SYMLINK);
+    de(&mut img, 32, b"inlinedir", FT_DIR);
+    de(&mut img, 33, b"sparse.bin", FT_REG);
+    de(&mut img, 34, b"phantom.txt", FT_REG);
     // Final live entry "x": rec_len covers the rest of the block. Inside
     // its slack sits the deleted "notes.txt" dirent (ino 24).
     let x_pos = pos;
     put_dirent(&mut img, 40, x_pos, 29, (1024 - x_pos) as u16, b"x", FT_REG);
     // Deleted dirent at x_pos + 12 (min rec_len for "x").
     put_dirent(&mut img, 40, x_pos + 12, 24, 24, b"notes.txt", FT_REG);
+    // Stale dirent pointing at an *allocated* inode (reused slot) and one
+    // pointing at a zeroed inode slot — exercise both carved-outcome arms.
+    put_dirent(&mut img, 40, x_pos + 36, 21, 20, b"stale.lnk", FT_REG);
+    put_dirent(&mut img, 40, x_pos + 56, 40, 20, b"zeroed.de", FT_REG);
 
     // Subdir (block 42): ".", "..", "inner.txt" (rec_len to block end),
     // then a deleted dirent with ino=0 (cleared-on-delete) in its slack.
@@ -487,6 +535,8 @@ pub fn build_ext4() -> Vec<u8> {
     put_data(&mut img, 58, b"ORPHAN-LIST-DATA!");
     put_data(&mut img, 60, b"XDAT");
     put_data(&mut img, 61, b"/hello.txt");
+    put_data(&mut img, 62, b"SPARSE-DATA!");
+    put_data(&mut img, 63, b"PHANTOM");
 
     write_journal_sb(&mut img);
     write_xattrs(&mut img);

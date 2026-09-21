@@ -35,13 +35,19 @@ pub(crate) struct BlockRun {
 pub(crate) enum BlockMap {
     /// Block-mapped (extents or legacy indirect).
     Runs(Vec<BlockRun>),
-    /// `EXT4_INLINE_DATA_FL`: `i_block[0..4]` is the inline length; the
-    /// in-inode payload follows. (Spillover via the `system.data` xattr is
-    /// a documented TODO — see README.)
+    /// `EXT4_INLINE_DATA_FL` regular file: the first `min(i_size, 60)`
+    /// data bytes live in `i_block` itself (no length prefix — the
+    /// 4-byte header applies to inline *directories*); any spillover is
+    /// the `system.data` ibody xattr value.
     Inline {
-        /// Bytes of inline data inside `i_block` (≤ 56).
+        /// Bytes of inline data inside `i_block` (≤ 60).
         len: u32,
     },
+    /// `EXT4_INLINE_DATA_FL` directory: `i_block[0..4]` is the parent
+    /// inode number and `i_block[4..60]` holds `ext4_dir_entry` records.
+    /// (Larger inline dirs spill into the `system.data` xattr, treated
+    /// by the kernel as a separate dirent block — see README.)
+    InlineDir,
     /// Nothing mapped (empty file, fast symlink, …).
     Empty,
 }
@@ -54,11 +60,15 @@ pub(crate) fn map_inode(
     blocks_count: u64,
 ) -> Result<BlockMap> {
     if inode.has_inline_data() {
-        let len = le::u32(&inode.block60, 0).unwrap_or(0);
-        // The in-inode inline payload can occupy at most i_block minus the
-        // 4-byte length field; spillover lives in the system.data xattr.
-        return Ok(BlockMap::Inline {
-            len: len.min(56),
+        // Regular file: raw data starts at i_block[0]; no length prefix.
+        // Directory: i_block[0..4] is the parent inode number, dirents
+        // follow at i_block[4..60] (kernel ext4 inlinedata doc).
+        return Ok(if inode.is_dir() {
+            BlockMap::InlineDir
+        } else {
+            BlockMap::Inline {
+                len: inode.size.min(60) as u32,
+            }
         });
     }
     if inode.has_extents() {
@@ -199,13 +209,17 @@ fn walk_indirect(
         logical += 1;
     }
     // Indirect pointers at depth 1..3.
-    let per_block = (block_size / 4) as u64;
+    let per_block = block_size / 4;
     let mut visited = HashSet::new();
     // Total data blocks cannot exceed the volume's block count.
     let cap = blocks_count.min(1 << 22);
     for level in 1..=3u8 {
         let root_ptr = ptrs(11 + level as usize) as u64;
         if root_ptr == 0 {
+            // A NULL indirect pointer is a hole covering per_block^level
+            // logical slots — skipping it without advancing would map
+            // every later block at the wrong logical offset.
+            logical += per_block.pow(level as u32);
             continue;
         }
         walk_indirect_level(

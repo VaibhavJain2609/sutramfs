@@ -33,6 +33,8 @@ pub(crate) const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
 
 /// `h_magic` of an xattr block / in-inode xattr region.
 const XATTR_MAGIC: u32 = 0xEA02_0000;
+/// `e_name_index` for the `system.*` namespace (`system.data` etc.).
+pub(crate) const XATTR_IDX_SYSTEM: u8 = 7;
 
 /// A decoded inode. `raw` is retained (≤ `s_inode_size`, bounded) so xattr
 /// tails and inline data can be decoded lazily without re-reading the disk.
@@ -101,9 +103,11 @@ impl Inode {
         let size_lo = le::u32(raw, 0x04).unwrap_or(0) as u64;
         let size_hi = le::u32(raw, 0x6C).unwrap_or(0) as u64;
         let size = if is_reg { size_lo | (size_hi << 32) } else { size_lo };
-        let crtime = if has_field(0x94) {
+        // i_crtime occupies 0x90..0x94 (present iff extra_isize ≥ 0x14);
+        // i_crtime_extra occupies 0x94..0x98 (iff ≥ 0x18).
+        let crtime = if has_field(0x98) {
             Some((le::u32(raw, 0x90).unwrap_or(0), le::u32(raw, 0x94).unwrap_or(0)))
-        } else if has_field(0x90) {
+        } else if has_field(0x94) {
             Some((le::u32(raw, 0x90).unwrap_or(0), 0))
         } else {
             None
@@ -209,6 +213,53 @@ impl Inode {
             return Vec::new();
         }
         parse_xattr_entries(&self.raw, start + 4, self.raw.len())
+    }
+
+    /// Locate the value of an ibody xattr by `(name_index, name)`.
+    ///
+    /// Returns `(value_offset, value_len)` — `e_value_offs` is relative
+    /// to the start of the inode for ibody xattrs. `None` when absent,
+    /// when the value lives in another inode (`e_value_inum`
+    /// indirection), or when the value bounds escape the inode.
+    pub(crate) fn ibody_xattr_value(&self, index: u8, name: &str) -> Option<(u64, u64)> {
+        let start = (MIN_INODE_SIZE + self.extra_isize as usize + 3) & !3;
+        if start + 4 > self.raw.len() {
+            return None;
+        }
+        if le::u32(&self.raw, start) != Some(XATTR_MAGIC) {
+            return None;
+        }
+        let mut off = start + 4;
+        const MAX_XATTRS: usize = 128;
+        for _ in 0..MAX_XATTRS {
+            if off + 16 > self.raw.len() {
+                break;
+            }
+            let name_len = le::u8(&self.raw, off).unwrap_or(0) as usize;
+            if name_len == 0 {
+                break;
+            }
+            let name_off = off + 16;
+            if name_off + name_len > self.raw.len() {
+                break;
+            }
+            if le::u8(&self.raw, off + 1) == Some(index)
+                && &self.raw[name_off..name_off + name_len] == name.as_bytes()
+            {
+                if le::u32(&self.raw, off + 4).unwrap_or(0) != 0 {
+                    return None; // e_value_inum — value in another inode
+                }
+                let voffs = le::u16(&self.raw, off + 2).unwrap_or(0) as u64;
+                let vsize = le::u32(&self.raw, off + 8).unwrap_or(0) as u64;
+                let end = voffs.checked_add(vsize)?;
+                if end > self.raw.len() as u64 {
+                    return None;
+                }
+                return Some((voffs, vsize));
+            }
+            off = (name_off + name_len + 3) & !3;
+        }
+        None
     }
 }
 

@@ -26,6 +26,10 @@ use crate::walk::Walk;
 /// emits an error record instead of allocating.
 pub(crate) const MAX_DIR_BYTES: u64 = 32 << 20;
 
+/// (logical offset, absolute disk offset, length) segments inside a
+/// directory-data buffer — dirent provenance.
+pub(crate) type DirMap = Vec<(u64, u64, u64)>;
+
 /// The parser entry point — stateless, cheap to construct.
 ///
 /// ```
@@ -278,13 +282,68 @@ impl Ext4Fs {
 
     // -- directories -------------------------------------------------------
 
+    /// Absolute byte ranges holding an inline-data inode's contents:
+    /// the `i_block` payload (`[0..min(size,60)]` for files, dirents in
+    /// `[4..60]` for directories) plus the `system.data` xattr spillover
+    /// when the logical size overflows i_block.
+    pub(crate) fn inline_ranges(&self, inode: &Inode) -> Vec<(u64, u64)> {
+        let mut v = Vec::new();
+        let spill_need = if inode.is_dir() {
+            v.push((inode.disk_offset + 0x2C, 56));
+            // For inline directories the xattr region is a second dirent
+            // block; its size is whatever the xattr holds.
+            inode.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data")
+        } else {
+            let head = inode.size.min(60);
+            if head > 0 {
+                v.push((inode.disk_offset + 0x28, head));
+            }
+            if inode.size > 60 {
+                inode.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data")
+            } else {
+                None
+            }
+        };
+        if let Some((off, len)) = spill_need {
+            let take = if inode.is_dir() {
+                len
+            } else {
+                (inode.size - 60).min(len)
+            };
+            if take > 0 {
+                v.push((inode.disk_offset + off, take));
+            }
+        }
+        v
+    }
+
+    /// All byte ranges backing an inode's contents (block-mapped or
+    /// inline) — used for `allocated_ranges` provenance.
+    pub(crate) fn entry_ranges(&self, inode: &Inode) -> Vec<(u64, u64)> {
+        match self.map(inode) {
+            Ok(BlockMap::Runs(r)) => self.run_ranges(&r),
+            Ok(BlockMap::Inline { .. }) | Ok(BlockMap::InlineDir) => {
+                self.inline_ranges(inode)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Read a directory's data (bounded by `MAX_DIR_BYTES`) plus a
     /// logical→disk offset map for dirent provenance.
-    pub(crate) fn read_dir(&self, inode: &Inode) -> Result<(Vec<u8>, Vec<(u64, u64, u64)>)> {
+    pub(crate) fn read_dir(&self, inode: &Inode) -> Result<(Vec<u8>, DirMap)> {
         let cap = inode.size.min(MAX_DIR_BYTES);
         match self.map(inode)? {
             BlockMap::Inline { len } => {
-                let l = (len as usize).min(inode.raw.len().saturating_sub(0x2C));
+                // Inline-data file (files aren't normally read as dirs,
+                // but keep the path honest for corrupt mode bits).
+                let l = (len as usize).min(inode.raw.len().saturating_sub(0x28));
+                let data = inode.raw[0x28..0x28 + l].to_vec();
+                Ok((data, vec![(0, inode.disk_offset + 0x28, l as u64)]))
+            }
+            BlockMap::InlineDir => {
+                // i_block[0..4] = parent ino; dirents live in [4..60].
+                let l = 56usize.min(inode.raw.len().saturating_sub(0x2C));
                 let data = inode.raw[0x2C..0x2C + l].to_vec();
                 Ok((data, vec![(0, inode.disk_offset + 0x2C, l as u64)]))
             }
@@ -296,6 +355,21 @@ impl Ext4Fs {
                 for r in runs {
                     if logical >= cap {
                         break;
+                    }
+                    // Pad sparse holes so buffer offsets track file-
+                    // logical offsets (a sparse dir would otherwise
+                    // slide later dirents into the wrong positions).
+                    let hole = r
+                        .logical
+                        .saturating_mul(self.sb.block_size)
+                        .saturating_sub(logical);
+                    if hole > 0 {
+                        let pad = hole.min(cap - logical);
+                        data.resize(data.len() + pad as usize, 0);
+                        logical += pad;
+                        if logical >= cap {
+                            break;
+                        }
                     }
                     let want = (r.len * self.sb.block_size).min(cap - logical);
                     let chunk = self
@@ -419,25 +493,36 @@ impl Ext4Fs {
             }
         };
         match map {
-            BlockMap::Inline { len } => {
+            BlockMap::Inline { .. } | BlockMap::InlineDir => {
                 notes.push("inline data survives inside the inode".into());
-                let avail = (len as u64).min(inode.size);
+                let ranges = self.inline_ranges(inode);
+                if inode.size > 60
+                    && inode.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data").is_none()
+                {
+                    notes.push(
+                        "system.data xattr missing — inline spillover lost".into(),
+                    );
+                }
+                let avail: u64 = ranges.iter().map(|(_, l)| *l).sum();
                 let state = if avail >= inode.size {
                     RecoveryState::Intact
+                } else if avail == 0 {
+                    RecoveryState::Unrecoverable
                 } else {
                     RecoveryState::PartiallyOverwritten {
                         recovered_bytes: avail,
                         total_bytes: inode.size,
                     }
                 };
-                return (state, vec![(inode.disk_offset + 0x2C, avail)], notes);
+                (state, ranges, notes)
             }
             BlockMap::Empty => {
                 if inode.size == 0 {
-                    return (RecoveryState::Intact, Vec::new(), notes);
+                    (RecoveryState::Intact, Vec::new(), notes)
+                } else {
+                    notes.push("no block map survives (i_block zeroed)".into());
+                    (RecoveryState::Unrecoverable, Vec::new(), notes)
                 }
-                notes.push("no block map survives (i_block zeroed)".into());
-                return (RecoveryState::Unrecoverable, Vec::new(), notes);
             }
             BlockMap::Runs(runs) => {
                 let expected = self.expected_blocks(inode);
@@ -660,12 +745,11 @@ impl FileSystem for Ext4Fs {
         let deleted = entry.is_deleted();
         match self.read_inode(entry.entry_id as u32) {
             Ok(inode) => match self.map(&inode) {
-                Ok(BlockMap::Inline { len }) => {
-                    let avail = (len as u64).min(inode.size).min(56);
+                Ok(BlockMap::Inline { .. }) | Ok(BlockMap::InlineDir) => {
                     Ok(Box::new(FlatReader::new(
                         self.src.clone(),
-                        vec![(inode.disk_offset + 0x2C, avail)],
-                        avail,
+                        self.inline_ranges(&inode),
+                        inode.size,
                     )))
                 }
                 Ok(BlockMap::Runs(runs)) if !deleted => Ok(Box::new(InodeReader::new(

@@ -55,10 +55,10 @@ pub(crate) struct JournalInfo {
 }
 
 impl JournalInfo {
-    /// Parse the first `s_maxlen` bytes at `off` — needs only the first
-    /// block for the header fields.
+    /// Parse the journal superblock at `off`. `s_nr_users` lives at 0x40,
+    /// so the probe window must cover at least 0x44 bytes.
     pub fn parse(src: &dyn ByteSource, off: u64) -> Option<JournalInfo> {
-        let b = src.read_slice(off, 64).ok()?;
+        let b = src.read_slice(off, 128).ok()?;
         if b.len() < 64 {
             return None;
         }

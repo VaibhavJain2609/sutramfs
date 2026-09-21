@@ -38,7 +38,12 @@ pub(crate) struct GroupDesc {
 impl GroupDesc {
     /// Decode one descriptor from `buf` at `off` (relative), honouring the
     /// 64-bit high halves when `has_64bit` is set.
-    fn parse(buf: &[u8], off: usize, has_64bit: bool, disk_offset: u64) -> Option<Self> {
+    pub(crate) fn parse(
+        buf: &[u8],
+        off: usize,
+        has_64bit: bool,
+        disk_offset: u64,
+    ) -> Option<Self> {
         let get16 = |o: usize| le::u16(buf, off + o).unwrap_or(0) as u32;
         let get32 = |o: usize| le::u32(buf, off + o).unwrap_or(0) as u64;
         let mut d = GroupDesc {
@@ -59,7 +64,8 @@ impl GroupDesc {
             d.free_blocks |= get16(0x2C) << 16;
             d.free_inodes |= get16(0x2E) << 16;
             d.used_dirs |= get16(0x30) << 16;
-            d.itable_unused |= get16(0x36) << 16;
+            // bg_itable_unused_hi @0x32 (0x34 is bg_exclude_bitmap_hi).
+            d.itable_unused |= get16(0x32) << 16;
         }
         Some(d)
     }
