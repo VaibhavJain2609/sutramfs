@@ -9,6 +9,16 @@
 //! produced it, so a court can ask "which bytes produced this" and get an
 //! answer.
 //!
+//! ## Parsers
+//!
+//! | Module       | Artifact                                | Entry point                 |
+//! |--------------|-----------------------------------------|-----------------------------|
+//! | [`lnk`]      | Windows `.lnk` shortcut (MS-SHLLINK)    | [`lnk::LnkFile`]            |
+//! | [`reg`]      | Windows registry hive (`regf`)          | [`reg::Hive`]               |
+//! | [`recycle`]  | Windows `$I*` recycle-bin metadata      | [`recycle::RecycledItem`]   |
+//! | [`plist`]    | Apple binary property list (`bplist00`) | [`plist::Plist`]            |
+//! | [`prefetch`] | Windows Prefetch (`SCCA`/`MAM`)         | [`prefetch::Prefetch`]      |
+//!
 //! ## Error contract
 //!
 //! All parsers share [`Error`]/[`Result`], mirroring the sutram error
@@ -23,6 +33,7 @@
 pub mod common;
 pub mod lnk;
 pub mod plist;
+pub mod prefetch;
 pub mod recycle;
 pub mod reg;
 
