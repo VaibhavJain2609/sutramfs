@@ -612,7 +612,10 @@ impl NtfsFs {
                 if a.type_code != attr::T_DATA || a.name.is_some() {
                     continue;
                 }
-                let cap = (self.bs.total_clusters / 8 + 4096) as usize;
+                // Cap at 512 MiB: the bitmap needs ClusterCount/8 bytes,
+                // but a hostile BPB/real_size must not become an
+                // allocation bomb (sparse runs zero-fill without reads).
+                let cap = ((self.bs.total_clusters / 8 + 4096).min(512 << 20)) as usize;
                 let bytes = if let Some((off, len)) = a.resident {
                     self.src.read_slice(off, (len as usize).min(cap)).ok()
                 } else if a.non_resident {
