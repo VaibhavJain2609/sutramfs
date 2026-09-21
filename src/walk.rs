@@ -743,7 +743,11 @@ impl<'m> Walk<'m> {
         // $INDEX_ALLOCATION: non-resident INDX blocks.
         let csz = self.fs.bs.cluster_size;
         let irec = self.fs.bs.index_record_size as usize;
-        for a in pf
+        // Hard cap: a hostile runlist can declare astronomic run lengths —
+        // real directory indexes are a handful of records.
+        const MAX_INDX_BLOCKS: usize = 8192;
+        let mut blocks = 0usize;
+        'alloc: for a in pf
             .attrs
             .iter()
             .filter(|a| a.type_code == attr::T_INDEX_ALLOCATION)
@@ -753,6 +757,10 @@ impl<'m> Walk<'m> {
                 let mut off = lcn.saturating_mul(csz);
                 let end = off.saturating_add(r.len.saturating_mul(csz));
                 while end.saturating_sub(off) >= irec as u64 {
+                    if blocks >= MAX_INDX_BLOCKS {
+                        break 'alloc;
+                    }
+                    blocks += 1;
                     let raw = match self.fs.src.read_slice(off, irec) {
                         Ok(b) => b,
                         Err(e) => {

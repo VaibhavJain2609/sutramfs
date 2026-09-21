@@ -791,8 +791,15 @@ impl FileSystem for NtfsFs {
             meta.insert("usn_journal_present".into(), "true".into());
         }
         let free = self.bitmap.as_ref().map(|bm| {
+            // Bound the scan: a hostile BPB can declare astronomic cluster
+            // counts — never iterate past bits the bitmap/image has.
+            let limit = self
+                .bs
+                .total_clusters
+                .min(self.src.len() / self.bs.cluster_size + 2)
+                .min(bm.len() as u64 * 8);
             let mut free = 0u64;
-            for c in 0..self.bs.total_clusters {
+            for c in 0..limit {
                 let b = bm.get((c / 8) as usize).copied().unwrap_or(0xFF);
                 if b & (1 << (c % 8)) == 0 {
                     free += 1;
@@ -867,8 +874,16 @@ impl FileSystem for NtfsFs {
         };
         let csz = self.bs.cluster_size;
         let src_len = self.src.len();
+        // Bound the scan: hostile BPB geometry can declare astronomic
+        // cluster counts — bits beyond the bitmap/image are uninteresting
+        // anyway (clusters past the image can't be carved).
+        let limit = self
+            .bs
+            .total_clusters
+            .min(src_len / csz + 2)
+            .min(bm.len() as u64 * 8);
         let mut run_start: Option<u64> = None;
-        for c in 0..self.bs.total_clusters {
+        for c in 0..limit {
             let allocated = bm
                 .get((c / 8) as usize)
                 .map(|b| b & (1 << (c % 8)) != 0)
@@ -876,8 +891,8 @@ impl FileSystem for NtfsFs {
             match (allocated, run_start) {
                 (false, None) => run_start = Some(c),
                 (true, Some(s)) => {
-                    let off = s * csz;
-                    let end = (c * csz).min(src_len);
+                    let off = s.saturating_mul(csz);
+                    let end = (c.saturating_mul(csz)).min(src_len);
                     if end > off {
                         out.push((off, end - off));
                     }
@@ -887,8 +902,8 @@ impl FileSystem for NtfsFs {
             }
         }
         if let Some(s) = run_start {
-            let off = s * csz;
-            let end = (self.bs.total_clusters * csz).min(src_len);
+            let off = s.saturating_mul(csz);
+            let end = limit.saturating_mul(csz).min(src_len);
             if end > off {
                 out.push((off, end - off));
             }

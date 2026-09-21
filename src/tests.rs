@@ -69,6 +69,9 @@ fn filetime_decode() {
     assert_eq!(t.raw_encoding, "ntfs-filetime");
     // zero FILETIME → unset, never fabricated
     assert_eq!(filetime_ts(0).value, None);
+    // ≥2^63 FILETIME → unset (would wrap to a fabricated pre-epoch value)
+    assert_eq!(filetime_ts(u64::MAX).value, None);
+    assert_eq!(filetime_ts(i64::MAX as u64).value, None); // ×100 overflows
 }
 
 #[test]

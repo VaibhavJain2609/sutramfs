@@ -43,8 +43,11 @@ pub(crate) fn filetime_ts(raw: u64) -> FsTimestamp {
     let value = if raw == 0 {
         None
     } else {
-        (raw as i64)
-            .checked_sub(FILETIME_EPOCH_DIFF)
+        // try_from: FILETIMEs ≥ 2^63 are implausible — casting would wrap
+        // negative and fabricate a pre-epoch instant. Decode as unset.
+        i64::try_from(raw)
+            .ok()
+            .and_then(|t| t.checked_sub(FILETIME_EPOCH_DIFF))
             .and_then(|t| t.checked_mul(100))
     };
     FsTimestamp {
