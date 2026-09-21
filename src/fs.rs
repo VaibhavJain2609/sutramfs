@@ -135,7 +135,14 @@ impl ExFatFs {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut c = start;
-        while out.len() < max && self.valid_cluster(c) && seen.insert(c) {
+        // Clusters whose first byte is not in the image can never be read —
+        // bound the walk by what exists, not just the declared count.
+        let present_limit = self.bs.present_clusters + 2;
+        while out.len() < max
+            && self.valid_cluster(c)
+            && (c as u64) < present_limit
+            && seen.insert(c)
+        {
             let v = self.fat_entry(c)?;
             if v == BAD_CLUSTER {
                 break;
@@ -228,11 +235,13 @@ impl ExFatFs {
             let got = chunk.len() as u64;
             return Ok((chunk, vec![(0, off, got)]));
         }
-        // FAT-chained directory: cap at the declared length when known.
+        // FAT-chained directory: cap at the declared length when known,
+        // else at MAX_DIR_BYTES — a hostile FAT chain must not turn one
+        // directory read into a whole-image allocation.
         let cap = if loc.len > 0 {
             (loc.len.div_ceil(csz)).min(MAX_DIR_BYTES / csz) as usize
         } else {
-            usize::MAX
+            (MAX_DIR_BYTES / csz) as usize
         };
         let clusters = self.chain(loc.first_cluster, cap)?;
         if clusters.is_empty() {
@@ -549,14 +558,14 @@ impl ExFatFs {
     /// Count free clusters from the bitmap (bounded scan).
     fn count_free(&self) -> Option<u64> {
         let bm = self.bitmap.as_ref()?;
+        // Bound the scan: a hostile boot sector can declare ~2^32 clusters
+        // on a tiny image — never iterate past bits the bitmap/image has.
+        let limit = (self.bs.cluster_count as u64)
+            .min(self.bs.present_clusters)
+            .min(bm.len() as u64 * 8);
         let mut free = 0u64;
-        for c in 2..self.bs.cluster_count + 2 {
-            let idx = (c - 2) as usize;
-            if bm
-                .get(idx / 8)
-                .map(|b| (b >> (idx % 8)) & 1 == 0)
-                .unwrap_or(false)
-            {
+        for idx in 0..limit as usize {
+            if bm[idx / 8] & (1 << (idx % 8)) == 0 {
                 free += 1;
             }
         }
@@ -602,7 +611,10 @@ impl FileSystem for ExFatFs {
         meta.insert("media".into(), format!("{:#04x}", self.bs.drive_select));
         meta.insert(
             "percent_in_use".into(),
-            self.bs.percent_in_use.to_string(),
+            match self.bs.percent_in_use {
+                0xFF => "unavailable".into(),
+                p => p.to_string(),
+            },
         );
         meta.insert(
             "fs_revision".into(),
@@ -671,7 +683,10 @@ impl FileSystem for ExFatFs {
     fn unallocated_ranges(&self) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         let mut run_start: Option<u32> = None;
-        for c in 2..self.bs.cluster_count + 2 {
+        // Bound the scan by clusters actually present in the image — a
+        // hostile ClusterCount (~2^32) on a small image must not hang.
+        let limit = (self.bs.cluster_count as u64).min(self.bs.present_clusters);
+        for c in 2..(limit as u32) + 2 {
             let free = self.bitmap_bit(c).map(|b| !b).unwrap_or(false);
             match (free, run_start) {
                 (true, None) => run_start = Some(c),
@@ -687,7 +702,7 @@ impl FileSystem for ExFatFs {
             }
         }
         if let Some(s) = run_start {
-            let last = self.bs.cluster_count + 1;
+            let last = (limit as u32) + 1;
             if let (Some((off, _)), Some((eoff, elen))) =
                 (self.cluster_range(s), self.cluster_range(last))
             {

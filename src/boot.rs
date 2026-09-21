@@ -202,7 +202,9 @@ impl BootSector {
             volume_flags: le::u16(&b, 0x6A).unwrap_or(0),
             num_fats,
             drive_select: b[0x6F],
-            percent_in_use: b[0x70].min(100),
+            // Spec: 0–100 = estimate, 0xFF = "not available". Do NOT
+            // clamp — 0xFF→100 would fabricate a full disk.
+            percent_in_use: b[0x70],
             bytes_per_sector: bps,
             sectors_per_cluster: spc,
             cluster_size,

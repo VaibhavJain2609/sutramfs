@@ -655,3 +655,32 @@ fn detect_handles_degenerate_inputs() {
     let c = ExFatParser.detect(&img.as_slice());
     assert!(c < DetectConfidence::Certain);
 }
+
+#[test]
+fn percent_in_use_unavailable_reported() {
+    // 0xFF means "not available" per spec — must not be clamped to 100.
+    let mut img = common::build_exfat();
+    img[0x70] = 0xFF;
+    img[12 * common::BPS + 0x70] = 0xFF; // backup copy (not checksummed field)
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    assert_eq!(fs.info().meta["percent_in_use"], "unavailable");
+}
+
+#[test]
+fn directory_length_cap_holds() {
+    // DIR1's stream DataLength inflated to absurdity — the read must be
+    // capped, not balloon into a whole-image allocation.
+    let mut img = common::build_exfat();
+    // DIR1 set starts at root slot 6; stream secondary at slot 7,
+    // DataLength at +24.
+    let off = common::doff(&common::ROOT_CLUSTERS, 7);
+    img[off + 24..off + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    let e = find(&entries, "INNER.TXT");
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"TEST");
+}

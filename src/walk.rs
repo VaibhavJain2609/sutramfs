@@ -304,7 +304,9 @@ impl<'m> Walk<'m> {
         let dir_loc = DirLoc {
             first_cluster: fc,
             contiguous: set.no_fat_chain,
-            len: set.data_len,
+            // max(): a damaged set may carry a small DataLength with a
+            // larger ValidDataLength — under-sizing would clip the scan.
+            len: set.data_len.max(set.valid_len),
         };
         let is_dir = set.is_dir();
 
