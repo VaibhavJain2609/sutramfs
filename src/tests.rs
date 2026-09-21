@@ -294,6 +294,7 @@ fn w16(b: &mut [u8], off: usize, v: u16) {
 fn w32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
+#[allow(dead_code)]
 fn w8(b: &mut [u8], off: usize, v: u8) {
     b[off] = v;
 }
@@ -557,7 +558,7 @@ fn read_chunk_tree_and_dev_items() {
         7,
     );
     let mut map = ident_map();
-    let errs = read_chunk_tree(&img, 0x9000, &mut map, 4096);
+    let _errs = read_chunk_tree(&img, 0x9000, &mut map, 4096);
     // Bogus child maps (identity) but is garbage → header parse may fail or
     // yields zero items; either way traversal completes.
     // The chunk item registered logical 0x80000 → stripe offset 0x4000.
@@ -631,8 +632,9 @@ fn treewalk_csum_mismatch_flagged() {
 fn index_fs_tree_extref_xattr_orphan() {
     use crate::index::index_fs_tree;
     let mut extref = Vec::new();
-    extref.extend_from_slice(&0u64.to_le_bytes()); // index
+    // btrfs_inode_extref: parent_objectid@0, index@8, name_len@16, name@18
     extref.extend_from_slice(&256u64.to_le_bytes()); // parent
+    extref.extend_from_slice(&0u64.to_le_bytes()); // index
     extref.extend_from_slice(&8u16.to_le_bytes()); // name_len
     extref.extend_from_slice(b"linkname");
     let mut xattr = Vec::new();
@@ -1010,8 +1012,7 @@ fn fs_helpers() {
     // clone_err preserves variants.
     let e = clone_err(&sutram_fs::FsError::NotFound { path: "/x".into() });
     assert!(matches!(e, sutram_fs::FsError::NotFound { .. }));
-    let e = clone_err(&sutram_fs::FsError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other, "disk")));
+    let e = clone_err(&sutram_fs::FsError::Io(std::io::Error::other("disk")));
     assert!(matches!(e, sutram_fs::FsError::Corrupt { .. }));
     // unique_inode packs subvol<<48 | ino.
     assert_eq!(unique_inode(0x1234, 0x5678), 0x1234_0000_0000_5678);

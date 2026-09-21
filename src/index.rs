@@ -308,12 +308,13 @@ pub fn index_fs_tree(
                 }
             }
             ty::INODE_EXTREF => {
-                // body: repeated (index u64, parent u64, name_len u16, name)
-                // — btrfs_inode_extref is an 18-byte header, not 20.
+                // body: repeated btrfs_inode_extref records —
+                // parent_objectid u64 @0, index u64 @8, name_len u16 @16,
+                // name @18 (18-byte header).
                 let mut pos = 0usize;
                 while pos + 18 <= it.data.len() {
                     let (parent, name_len) = match (
-                        le::u64(it.data, pos + 8),
+                        le::u64(it.data, pos),
                         le::u16(it.data, pos + 16),
                     ) {
                         (Some(p), Some(n)) => (p, n as usize),
@@ -512,7 +513,7 @@ impl ExtentIndex {
         let mut out = Vec::new();
         // The record containing/starting before `start`:
         if let Some((_, r)) = self.recs.range(..=start).next_back() {
-            if r.logical + r.len > start {
+            if r.logical.saturating_add(r.len) > start {
                 out.push(r);
             }
         }

@@ -790,7 +790,8 @@ impl DevItem {
             devid: le::u64(data, 0)?,
             total_bytes: le::u64(data, 8)?,
             bytes_used: le::u64(data, 16)?,
-            sector_size: le::u32(data, 40)?,
+            // io_align@24, io_width@28, sector_size@32, type@36
+            sector_size: le::u32(data, 32)?,
         })
     }
 }

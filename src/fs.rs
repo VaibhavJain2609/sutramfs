@@ -922,7 +922,7 @@ impl BtrfsFs {
                 surviving.push((cursor, rec.logical.min(end) - cursor));
             }
             let o_start = cursor.max(rec.logical);
-            let o_end = end.min(rec.logical + rec.len);
+            let o_end = end.min(rec.logical.saturating_add(rec.len));
             if o_end <= o_start {
                 continue;
             }
@@ -1095,19 +1095,20 @@ impl BtrfsFs {
     fn unallocated_logical(&self) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         for (cl, clen) in self.map.covered_ranges() {
-            let cend = cl + clen;
+            let cend = cl.saturating_add(clen);
             // An extent record may start before the chunk and overlap it.
             let mut cursor = cl;
             if let Some((_, r)) = self.extent_index.recs.range(..=cl).next_back() {
-                if r.logical + r.len > cl {
-                    cursor = cl.max(r.logical + r.len);
+                let rend = r.logical.saturating_add(r.len);
+                if rend > cl {
+                    cursor = cl.max(rend);
                 }
             }
             for (_, r) in self.extent_index.recs.range(cl..cend) {
                 if r.logical > cursor {
                     out.push((cursor, r.logical.min(cend) - cursor));
                 }
-                cursor = cursor.max(r.logical + r.len);
+                cursor = cursor.max(r.logical.saturating_add(r.len));
                 if cursor >= cend {
                     break;
                 }
@@ -1177,8 +1178,14 @@ pub(crate) fn intersect_ranges(a: Vec<(u64, u64)>, b: Vec<(u64, u64)>) -> Vec<(u
     sorted_b.sort_unstable();
     let (mut i, mut j) = (0, 0);
     while i < sorted_a.len() && j < sorted_b.len() {
-        let (as_, ae) = (sorted_a[i].0, sorted_a[i].0 + sorted_a[i].1);
-        let (bs, be) = (sorted_b[j].0, sorted_b[j].0 + sorted_b[j].1);
+        let (as_, ae) = (
+            sorted_a[i].0,
+            sorted_a[i].0.saturating_add(sorted_a[i].1),
+        );
+        let (bs, be) = (
+            sorted_b[j].0,
+            sorted_b[j].0.saturating_add(sorted_b[j].1),
+        );
         let (s, e) = (as_.max(bs), ae.min(be));
         if e > s {
             out.push((s, e - s));

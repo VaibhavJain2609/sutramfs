@@ -105,7 +105,7 @@ impl ChunkMap {
             .binary_search_by(|e| {
                 if logical < e.logical {
                     std::cmp::Ordering::Greater
-                } else if logical >= e.logical + e.length {
+                } else if logical >= e.logical.saturating_add(e.length) {
                     std::cmp::Ordering::Less
                 } else {
                     std::cmp::Ordering::Equal
@@ -146,7 +146,7 @@ impl ChunkMap {
                     // but only up to the next chunk's start (a gap must
                     // not swallow mapped regions beyond it).
                     let skip = match self.lookup(pos) {
-                        Some(c) => c.logical + c.length - pos,
+                        Some(c) => c.logical.saturating_add(c.length) - pos,
                         None => self
                             .chunks
                             .iter()
@@ -161,7 +161,7 @@ impl ChunkMap {
                 }
             };
             // Max contiguous run inside this chunk & stripe band.
-            let in_chunk = c.logical + c.length - pos;
+            let in_chunk = c.logical.saturating_add(c.length) - pos;
             let off = pos - c.logical;
             if !c.striped() {
                 let run = in_chunk.min(left);
@@ -296,7 +296,11 @@ pub fn read_chunk_tree(
                     continue;
                 }
                 let ds = HEADER_SIZE + item.offset as usize;
-                if let Some(chunk) = Chunk::parse(&block, ds) {
+                // Confine the parse to the declared item body — a corrupt
+                // num_stripes must not bleed into neighbouring items.
+                if let Some(chunk) = le::get(&block, ds, item.size as usize)
+                    .and_then(|body| Chunk::parse(body, 0))
+                {
                     map.add(chunk_entry(item.key.offset, &chunk));
                 }
             }
