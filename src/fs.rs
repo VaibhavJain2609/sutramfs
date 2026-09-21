@@ -35,7 +35,7 @@ use crate::walk::{PlanItem, Walk};
 
 /// Structural clone of an [`FsError`] (the `Io` variant degrades to
 /// `Corrupt` with the message preserved — `io::Error` isn't cloneable).
-fn clone_err(e: &FsError) -> FsError {
+pub(crate) fn clone_err(e: &FsError) -> FsError {
     match e {
         FsError::Corrupt { offset, msg } => FsError::Corrupt {
             offset: *offset,
@@ -85,6 +85,9 @@ impl FsParser for BtrfsParser {
     }
 }
 
+/// Physical `(offset, len)` range list — used throughout recovery paths.
+pub(crate) type Ranges = Vec<(u64, u64)>;
+
 /// Recovery verdict for one deleted inode: per-extent surviving ranges.
 #[derive(Debug, Clone)]
 pub(crate) struct Recovery {
@@ -124,8 +127,8 @@ pub struct BtrfsFs {
     extent_index: ExtentIndex,
     /// Free logical ranges from the free-space tree (when present).
     free_tree_ranges: Vec<(u64, u64)>,
-    /// `(subvol, ino, extent logical)` referenced by *live* trees.
-    live_refs: HashSet<(u64, u64, u64)>,
+    /// `(subvol, extent logical)` extents referenced by *live* trees.
+    live_refs: HashSet<(u64, u64)>,
     /// The walk plan — entry locations in emission order, interleaved with
     /// deferred error records.
     plan: Vec<PlanItem>,
@@ -263,10 +266,10 @@ impl BtrfsFs {
         // -- live extent reference set ------------------------------------
         let mut live_refs = HashSet::new();
         for tree in &trees {
-            for (ino, rec) in &tree.inodes {
+            for rec in tree.inodes.values() {
                 for ex in &rec.extents {
                     if ex.logical != 0 {
-                        live_refs.insert((tree.objectid, *ino, ex.logical));
+                        live_refs.insert((tree.objectid, ex.logical));
                     }
                 }
             }
@@ -893,12 +896,9 @@ impl BtrfsFs {
         ino: u64,
         ex: &index::Extent,
         notes: &mut Vec<String>,
-    ) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
-        match ex.ty {
-            ondisk::extent_ty::INLINE => {
-                return (ex.phys_ranges.clone(), vec![(ex.logical, ex.num_bytes)]);
-            }
-            _ => {}
+    ) -> (Ranges, Ranges) {
+        if ex.ty == ondisk::extent_ty::INLINE {
+            return (ex.phys_ranges.clone(), vec![(ex.logical, ex.num_bytes)]);
         }
         if ex.is_hole() {
             return (Vec::new(), vec![(0, ex.num_bytes)]); // zeros always "survive"
@@ -978,17 +978,16 @@ impl BtrfsFs {
         if index::rec_references(rec, subvol, ino) {
             return true;
         }
-        // A live inode references the same logical extent → shared content
-        // (BTRFS never writes shared extents in place).
-        if self.live_refs.contains(&(subvol, ino, rec.logical)) {
-            return true;
-        }
         // Extent record predates or equals our extent's generation → it is
-        // the same allocation (a reallocated slot carries a newer item).
+        // the same allocation (a reallocated slot carries a newer item, so
+        // a *later* record generation means our bytes were overwritten —
+        // regardless of who references the slot now).
         if rec.generation <= ex.generation {
-            if index::rec_references_other(rec, subvol, ino) {
+            if index::rec_references_other(rec, subvol, ino)
+                || self.live_refs.contains(&(subvol, rec.logical))
+            {
                 notes.push(format!(
-                    "extent {:#x} shared via backref — content presumed identical",
+                    "extent {:#x} shared (backref/live inode) — content presumed identical",
                     rec.logical
                 ));
             }
@@ -1132,7 +1131,7 @@ pub fn unique_inode(subvol: u64, ino: u64) -> u64 {
 }
 
 /// Did the inode change between generations? (`transid` or extent layout).
-fn same_version(live: &InodeRec, old: Option<&InodeRec>) -> bool {
+pub(crate) fn same_version(live: &InodeRec, old: Option<&InodeRec>) -> bool {
     let Some(old) = old else { return false };
     match (&live.item, &old.item) {
         (Some(l), Some(o)) => {
@@ -1156,7 +1155,7 @@ fn same_version(live: &InodeRec, old: Option<&InodeRec>) -> bool {
             })
 }
 
-fn inode_timestamps(item: Option<&crate::ondisk::InodeItem>) -> sutram_fs::Timestamps {
+pub(crate) fn inode_timestamps(item: Option<&crate::ondisk::InodeItem>) -> sutram_fs::Timestamps {
     let Some(i) = item else {
         return Default::default();
     };
@@ -1170,7 +1169,7 @@ fn inode_timestamps(item: Option<&crate::ondisk::InodeItem>) -> sutram_fs::Times
 }
 
 /// Intersect two sorted range lists.
-fn intersect_ranges(a: Vec<(u64, u64)>, b: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+pub(crate) fn intersect_ranges(a: Vec<(u64, u64)>, b: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut sorted_a = a;
     let mut sorted_b = b;
@@ -1367,7 +1366,7 @@ fn format_uuid(b: &[u8; 16]) -> String {
 
 /// Parse `/etc/passwd` or `/etc/group` content → `id → name`.
 /// Format: `name:passwd:id:…` (fields 0 and 2).
-fn parse_id_file(data: &[u8]) -> Vec<(u64, String)> {
+pub(crate) fn parse_id_file(data: &[u8]) -> Vec<(u64, String)> {
     let text = String::from_utf8_lossy(data);
     let mut out = Vec::new();
     for line in text.lines() {

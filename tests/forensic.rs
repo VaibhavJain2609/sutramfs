@@ -116,11 +116,8 @@ fn truncated_image_does_not_panic() {
     let vol = common::build_image();
     let short: Arc<dyn ByteSource> = Arc::new(vol[..0x11000].to_vec());
     // Mount may fail (no chunks) or succeed with error records — never panic.
-    match BtrfsParser.mount(short) {
-        Ok(fs) => {
-            let _ = fs.walk().collect::<Vec<_>>();
-        }
-        Err(_) => {}
+    if let Ok(fs) = BtrfsParser.mount(short) {
+        let _ = fs.walk().collect::<Vec<_>>();
     }
 }
 
@@ -436,4 +433,42 @@ fn walk_is_bounded_stream() {
     let mut it = fs.walk();
     let first = it.next().unwrap().unwrap();
     assert_eq!(first.path, "/");
+}
+
+#[test]
+fn mount_fails_with_no_chunks() {
+    // Valid superblock but an empty sys_chunk_array and an unreadable
+    // chunk tree → "no usable chunks".
+    let mut img = vec![0u8; 0x20000];
+    let vol = common::build_image();
+    // Copy the superblock but zero out the sys_chunk_array + its size.
+    img[common::SB..common::SB + 4096].copy_from_slice(&vol[common::SB..common::SB + 4096]);
+    common::w32(&mut img, common::SB + 0xA0, 0); // sys_chunk_array_size = 0
+    img[common::SB + 0x32B..common::SB + 0x32B + 2048].fill(0);
+    // Re-checksum the superblock so it still parses.
+    let csum = crc32fast::hash(&img[common::SB + 32..common::SB + 4096]);
+    img[common::SB..common::SB + 4].copy_from_slice(&csum.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(BtrfsParser.mount(src).is_err());
+}
+
+#[test]
+fn strict_mount_fails_on_dead_root_tree() {
+    let mut img = common::build_image();
+    // Zero the root tree leaf → root index comes back empty.
+    img[common::ROOT_TREE as usize..common::ROOT_TREE as usize + common::NODE].fill(0);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let opts = MountOptions::strict();
+    assert!(BtrfsParser.mount_with(src, &opts).is_err());
+}
+
+#[test]
+fn read_file_rejects_dir_and_bad_id() {
+    let entries = all_entries();
+    let dir = entries.iter().find(|e| e.path == "/subdir").unwrap();
+    assert!(mount().read_file(dir).is_err());
+    // An entry_id that was never produced → invalid input.
+    let mut ghost = entries.iter().find(|e| e.path == "/hello.txt").unwrap().clone();
+    ghost.entry_id = 999_999;
+    assert!(mount().read_file(&ghost).is_err());
 }

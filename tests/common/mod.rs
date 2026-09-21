@@ -39,7 +39,7 @@
 
 // ---- geometry -------------------------------------------------------------
 pub const NODE: usize = 4096;
-pub const IMG_SIZE: usize = 0x1000_000; // 16 MiB
+pub const IMG_SIZE: usize = 0x100_0000; // 16 MiB
 pub const SB: usize = 0x10000;
 pub const GEN_CUR: u64 = 7;
 pub const GEN_OLD: u64 = 5;
@@ -69,6 +69,8 @@ pub const D_SECOND: u64 = 0x509000; // second.txt
 pub const D_SNAP: u64 = 0x50a000; // snap.txt
 pub const D_PASSWD: u64 = 0x50b000; // /etc/passwd
 pub const D_GROUP: u64 = 0x50c000; // /etc/group
+pub const D_SHARED: u64 = 0x50d000; // deleted file whose extent is still allocated
+pub const D_WEIRD: u64 = 0x50e000; // live file, unsupported compression algo
 /// A byte range with no extent item and no data — must be unallocated.
 pub const FREE_AREA: u64 = 0x600000;
 
@@ -350,7 +352,7 @@ pub fn build_image() -> Vec<u8> {
 
         // backup root[0] at 0xB2B: gen-5 tree_root + fs_root
         let b0 = s + 0xB2B;
-        w64(&mut img, b0 + 0, OLD_ROOT_TREE); // tree_root
+        w64(&mut img, b0, OLD_ROOT_TREE); // tree_root
         w64(&mut img, b0 + 8, GEN_OLD); // tree_root_gen
         w64(&mut img, b0 + 16, CHUNK_TREE); // chunk_root
         w64(&mut img, b0 + 24, GEN_OLD);
@@ -443,6 +445,7 @@ pub fn build_image() -> Vec<u8> {
             (256, T_DIR_ITEM, 106, dir_item(266, "masq.doc", 1, &[])),
             (256, T_DIR_ITEM, 107, dir_item(267, "second.txt", 1, &[])),
             (256, T_DIR_ITEM, 108, dir_item(268, "etc", 2, &[])),
+            (256, T_DIR_ITEM, 109, dir_item(274, "weird.bin", 1, &[])),
             (256, T_DIR_INDEX, 2, dir_item(257, "hello.txt", 1, &[])),
             // hello.txt — live file
             (257, T_INODE_ITEM, 0, inode_item(2, GEN_CUR, 12, file_mode, 1, 1000, 1000)),
@@ -507,6 +510,12 @@ pub fn build_image() -> Vec<u8> {
             (271, T_EXTENT_DATA, 0, extent_regular(GEN_CUR, 4096, 0, D_GROUP, 4096, 0, 24)),
             // ORPHAN_ITEM: objectid -48, offset = orphan inode 259
             (OBJID_ORPHAN, T_ORPHAN, 259, Vec::new()),
+            // ORPHAN_ITEM for an inode with no record → name-only stub.
+            (OBJID_ORPHAN, T_ORPHAN, 273, Vec::new()),
+            (274, T_INODE_ITEM, 0, inode_item(14, GEN_CUR, 40, file_mode, 1, 0, 0)),
+            (274, T_INODE_REF, 256, inode_ref(0, "weird.bin")),
+            // compression=4: unknown codec → unsupported flag + raw fallback
+            (274, T_EXTENT_DATA, 0, extent_regular(GEN_CUR, 40, 4, D_WEIRD, 40, 0, 40)),
         ],
     );
 
@@ -523,6 +532,7 @@ pub fn build_image() -> Vec<u8> {
             (256, T_DIR_ITEM, 110, dir_item(258, "secret.txt", 1, &[])),
             (256, T_DIR_ITEM, 111, dir_item(260, "old.log", 1, &[])),
             (256, T_DIR_ITEM, 112, dir_item(270, "ghost.tmp", 1, &[])),
+            (256, T_DIR_ITEM, 113, dir_item(272, "shared.dat", 1, &[])),
             // old hello.txt — same inode, different transid/extent → prior ver
             (257, T_INODE_ITEM, 0, inode_item(2, GEN_OLD, 7, file_mode, 1, 1000, 1000)),
             (257, T_INODE_REF, 256, inode_ref(0, "hello.txt")),
@@ -536,6 +546,11 @@ pub fn build_image() -> Vec<u8> {
             (260, T_INODE_REF, 256, inode_ref(0, "old.log")),
             (260, T_EXTENT_DATA, 0, extent_regular(GEN_OLD, 4096, 0, D_NEWFILE, 4096, 0, 4096)),
             (260, T_EXTENT_DATA, 4096, extent_regular(GEN_OLD, 4096, 0, D_OLDLOG_B, 4096, 0, 4096)),
+            // shared.dat (ino 272): extent still allocated (backref to a
+            // different inode — reflink/share) → bytes survive.
+            (272, T_INODE_ITEM, 0, inode_item(5, GEN_OLD, 13, file_mode, 1, 0, 0)),
+            (272, T_INODE_REF, 256, inode_ref(0, "shared.dat")),
+            (272, T_EXTENT_DATA, 0, extent_regular(GEN_OLD, 4096, 0, D_SHARED, 4096, 0, 13)),
             // ghost.tmp (ino 270): dangling dir item — no inode item exists
         ],
     );
@@ -595,6 +610,10 @@ pub fn build_image() -> Vec<u8> {
             (D_PASSWD, T_EXTENT_DATA_REF, 0x9abc, extent_data_ref(OBJID_FS_TREE, 269, 0)),
             (D_GROUP, T_EXTENT_ITEM, 4096, extent_item(GEN_CUR, data_flags)),
             (D_GROUP, T_EXTENT_DATA_REF, 0xabcd, extent_data_ref(OBJID_FS_TREE, 271, 0)),
+            (D_SHARED, T_EXTENT_ITEM, 4096, extent_item(GEN_OLD, data_flags)),
+            (D_SHARED, T_EXTENT_DATA_REF, 0xbcde, extent_data_ref(OBJID_FS_TREE, 999, 0)),
+            (D_WEIRD, T_EXTENT_ITEM, 4096, extent_item(GEN_CUR, data_flags)),
+            (D_WEIRD, T_EXTENT_DATA_REF, 0xcdef, extent_data_ref(OBJID_FS_TREE, 274, 0)),
         ],
     );
 
@@ -617,6 +636,8 @@ pub fn build_image() -> Vec<u8> {
     let pw = b"root:x:0:0:root:/root:/bin/bash\nadmin:x:1000:1000:A,,,:/home/admin:/bin/sh\n";
     put(&mut img, D_PASSWD, pw);
     put(&mut img, D_GROUP, b"root:x:0:\nadmin:x:1000:\n");
+    put(&mut img, D_SHARED, b"SHARED-DATA-!");
+    put(&mut img, D_WEIRD, b"\xFA\xFBweird-compressed-blob-not-really");
 
     img
 }

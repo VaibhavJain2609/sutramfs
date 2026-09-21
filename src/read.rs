@@ -207,10 +207,7 @@ impl Read for ExtentReader {
         if self.seg_idx >= self.segs.len() {
             return Ok(0);
         }
-        let (len, file_off) = {
-            let s = &self.segs[self.seg_idx];
-            (s.len, s.file_off)
-        };
+        let len = self.segs[self.seg_idx].len;
         match &self.segs[self.seg_idx].prod {
             Prod::Zeros => {
                 let n = (len - self.seg_pos).min(buf.len() as u64).min(self.remaining) as usize;
@@ -311,7 +308,7 @@ impl Read for ExtentReader {
                 Ok(n)
             }
         }
-        .map(|n| {
+        .inspect(|_| {
             if self.seg_pos >= len {
                 self.seg_idx += 1;
                 self.seg_pos = 0;
@@ -321,8 +318,6 @@ impl Read for ExtentReader {
                 self.blob_pos = 0;
                 self.blob_done = false;
             }
-            let _ = file_off;
-            n
         })
     }
 }

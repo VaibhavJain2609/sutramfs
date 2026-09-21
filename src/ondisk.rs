@@ -298,7 +298,7 @@ impl Timespec {
     /// stored-but-epoch… which is indistinguishable; follow the forensic
     /// rule "never fabricate": emit `value: None` only when both fields are
     /// zero (BTRFS leaves otime zeroed when unknown).
-    pub fn to_fs(&self) -> FsTimestamp {
+    pub fn to_fs(self) -> FsTimestamp {
         let value = if self.sec == 0 && self.nsec == 0 {
             None
         } else {

@@ -309,16 +309,17 @@ pub fn index_fs_tree(
             }
             ty::INODE_EXTREF => {
                 // body: repeated (index u64, parent u64, name_len u16, name)
+                // — btrfs_inode_extref is an 18-byte header, not 20.
                 let mut pos = 0usize;
-                while pos + 20 <= it.data.len() {
+                while pos + 18 <= it.data.len() {
                     let (parent, name_len) = match (
                         le::u64(it.data, pos + 8),
-                        le::u16(it.data, pos + 18),
+                        le::u16(it.data, pos + 16),
                     ) {
                         (Some(p), Some(n)) => (p, n as usize),
                         _ => break,
                     };
-                    let name = match le::get(it.data, pos + 20, name_len) {
+                    let name = match le::get(it.data, pos + 18, name_len) {
                         Some(n) => n,
                         None => break,
                     };
@@ -327,7 +328,7 @@ pub fn index_fs_tree(
                         name: name_str(name),
                         phys: it.item_phys + pos as u64,
                     });
-                    pos += 20 + name_len;
+                    pos += 18 + name_len;
                 }
             }
             ty::DIR_ITEM | ty::DIR_INDEX | ty::XATTR_ITEM => {
@@ -365,13 +366,11 @@ pub fn index_fs_tree(
                     tree.inodes.entry(ino).or_default().extents.push(ex);
                 }
             }
-            ty::ORPHAN_ITEM => {
-                // Orphan items live under objectid BTRFS_ORPHAN_OBJECTID;
-                // key.offset = the orphaned inode.
-                if it.key.objectid == objid::ORPHAN {
-                    tree.orphans.insert(it.key.offset);
-                    tree.inodes.entry(it.key.offset).or_default().orphan = true;
-                }
+            // Orphan items live under objectid BTRFS_ORPHAN_OBJECTID;
+            // key.offset = the orphaned inode.
+            ty::ORPHAN_ITEM if it.key.objectid == objid::ORPHAN => {
+                tree.orphans.insert(it.key.offset);
+                tree.inodes.entry(it.key.offset).or_default().orphan = true;
             }
             _ => {}
         }
@@ -573,17 +572,18 @@ pub fn index_extent_tree(
                     // Inline backrefs follow the 24-byte fixed part: each is
                     // a u8 type tag + fixed-size payload.
                     let mut pos = 24usize;
-                    while pos + 1 <= it.data.len() {
+                    while pos < it.data.len() {
                         let rt = it.data[pos];
                         pos += 1;
                         match rt {
                             ty::TREE_BLOCK_REF => {
-                                rec.refs.push(ExtentRef::TreeBlock {
-                                    // inline tree-block ref payload is the
-                                    // *root* objectid? It carries no data;
-                                    // owner comes from the key context.
-                                    root: 0,
-                                });
+                                // Inline payload = u64 referencing root
+                                // (btrfs_extent_inline_ref_size: full
+                                // extent_inline_ref = type(1)+offset(8)).
+                                if let Some(r) = le::u64(it.data, pos) {
+                                    rec.refs.push(ExtentRef::TreeBlock { root: r });
+                                }
+                                pos += 8;
                             }
                             ty::SHARED_BLOCK_REF => {
                                 if let Some(p) = le::u64(it.data, pos) {
@@ -602,10 +602,11 @@ pub fn index_extent_tree(
                                 pos += 28;
                             }
                             ty::SHARED_DATA_REF => {
+                                // Payload = parent bytenr(8) + count(4).
                                 if let Some(p) = le::u64(it.data, pos) {
                                     rec.refs.push(ExtentRef::SharedData { parent: p });
                                 }
-                                pos += 8;
+                                pos += 12;
                             }
                             ty::EXTENT_OWNER_REF => {
                                 if let Some(r) = le::u64(it.data, pos) {

@@ -123,7 +123,7 @@ fn decompress_lzo(input: &[u8], expected: usize) -> Result<Vec<u8>> {
         let want = expected - out.len();
         // Page-sized output buffer per sub-block (kernel uses PAGE_SIZE,
         // typically 4 KiB; we cap generously for 16K/64K-page images).
-        let page_cap = want.min(1 << 17).max(4096);
+        let page_cap = want.clamp(4096, 1 << 17);
         let mut page = vec![0u8; page_cap];
         match lzokay::decompress::decompress(sub, &mut page) {
             Ok(n) => {

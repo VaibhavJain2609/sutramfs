@@ -21,11 +21,40 @@ pub struct ChunkEntry {
     pub ty: u64,
     /// Stripe length for striped profiles.
     pub stripe_len: u64,
+    /// Mirror width of each stripe group (RAID10: typically 2; 0/1 for
+    /// plain RAID0/DUP/RAID1*).
+    pub sub_stripes: u16,
     /// Physical offsets of each stripe (device-relative; single-device
     /// images carry one device at offset 0 of the source).
     pub stripe_offsets: Vec<u64>,
     /// Parity RAID (5/6) — translation not reconstructed.
     pub parity: bool,
+}
+
+impl ChunkEntry {
+    /// Only RAID0/RAID10 actually stripe the data; DUP and RAID1* place
+    /// byte-identical copies on every stripe, so reads always use stripe 0.
+    fn striped(&self) -> bool {
+        self.stripe_offsets.len() > 1
+            && self.stripe_len > 0
+            && self.ty & (block_group::RAID0 | block_group::RAID10) != 0
+    }
+
+    /// `(stripe index, offset into that stripe)` for a logical chunk offset.
+    /// RAID10 stripes rotate across stripe *groups* of `sub_stripes`
+    /// mirrored copies — the primary copy of group `g` sits at index
+    /// `g * sub_stripes`.
+    pub(crate) fn stripe_map(&self, off: u64) -> (usize, u64) {
+        if !self.striped() {
+            return (0, off);
+        }
+        let s = self.stripe_len;
+        let sub = (self.sub_stripes as u64).max(1);
+        let groups = (self.stripe_offsets.len() as u64 / sub).max(1);
+        let band = off / s;
+        let idx = ((band % groups) * sub) as usize;
+        (idx, band / groups * s + off % s)
+    }
 }
 
 /// The `ChunkMap`: sorted logical ranges → physical addresses.
@@ -44,6 +73,7 @@ impl ChunkMap {
             length,
             ty: 0,
             stripe_len: 0,
+            sub_stripes: 0,
             stripe_offsets: vec![physical_offset],
             parity: false,
         });
@@ -95,18 +125,8 @@ impl ChunkMap {
             return None;
         }
         let off = logical - c.logical;
-        let n = c.stripe_offsets.len() as u64;
-        if n == 1 || c.stripe_len == 0 {
-            return Some(c.stripe_offsets[0].saturating_add(off));
-        }
-        // RAID0/RAID10 striping: stripes of `stripe_len` bytes rotate over
-        // the stripe set.
-        let s = c.stripe_len;
-        let band = off / s; // which stripe-width band
-        let stripe_idx = (band % n) as usize;
-        let within = off % s;
-        let stripe_base = c.stripe_offsets[stripe_idx];
-        Some(stripe_base.saturating_add(band / n * s).saturating_add(within))
+        let (stripe_idx, stripe_off) = c.stripe_map(off);
+        Some(c.stripe_offsets[stripe_idx].saturating_add(stripe_off))
     }
 
     /// Translate a logical byte range to physical `(offset, len)` pieces.
@@ -122,12 +142,19 @@ impl ChunkMap {
             let c = match self.lookup(pos) {
                 Some(c) if !c.parity && !c.stripe_offsets.is_empty() => c,
                 _ => {
-                    // Unmapped/parity hole — report nothing for the gap;
-                    // caller treats missing coverage as unreadable.
-                    let skip = self
-                        .lookup(pos)
-                        .map(|c| c.logical + c.length - pos)
-                        .unwrap_or(left);
+                    // Unmapped/parity hole — report nothing for the gap,
+                    // but only up to the next chunk's start (a gap must
+                    // not swallow mapped regions beyond it).
+                    let skip = match self.lookup(pos) {
+                        Some(c) => c.logical + c.length - pos,
+                        None => self
+                            .chunks
+                            .iter()
+                            .filter(|c| c.logical > pos)
+                            .map(|c| c.logical - pos)
+                            .min()
+                            .unwrap_or(left),
+                    };
                     pos = pos.saturating_add(skip);
                     left = left.saturating_sub(skip);
                     continue;
@@ -136,30 +163,23 @@ impl ChunkMap {
             // Max contiguous run inside this chunk & stripe band.
             let in_chunk = c.logical + c.length - pos;
             let off = pos - c.logical;
-            let n = c.stripe_offsets.len() as u64;
-            let run = if n == 1 || c.stripe_len == 0 {
-                in_chunk.min(left)
-            } else {
-                let s = c.stripe_len;
-                let band = off / s;
-                let within = off % s;
-                let band_left = s - within;
-                // Stay within this stripe band so the mapping stays linear.
-                let nr = band_left.min(in_chunk).min(left);
-                let phys = c.stripe_offsets[(band % n) as usize]
-                    .saturating_add(band / n * s)
-                    .saturating_add(within);
-                out.push((phys, nr));
-                pos += nr;
-                left -= nr;
+            if !c.striped() {
+                let run = in_chunk.min(left);
+                let (idx, so) = c.stripe_map(off);
+                out.push((c.stripe_offsets[idx].saturating_add(so), run));
+                pos += run;
+                left -= run;
                 continue;
-            };
-            match self.logical_to_physical(pos) {
-                Some(phys) => out.push((phys, run)),
-                None => {}
             }
-            pos += run;
-            left -= run;
+            // Striped: stay within this stripe band so the mapping stays
+            // linear.
+            let s = c.stripe_len;
+            let band_left = s - off % s;
+            let nr = band_left.min(in_chunk).min(left);
+            let (idx, so) = c.stripe_map(off);
+            out.push((c.stripe_offsets[idx].saturating_add(so), nr));
+            pos += nr;
+            left -= nr;
         }
         out
     }
@@ -213,6 +233,7 @@ fn chunk_entry(logical: u64, chunk: &Chunk) -> ChunkEntry {
         length: chunk.length,
         ty: chunk.ty,
         stripe_len: chunk.stripe_len,
+        sub_stripes: chunk.sub_stripes,
         stripe_offsets: chunk.stripes.iter().map(|s| s.offset).collect(),
         parity: !block_group::translatable(chunk.ty),
     }
@@ -330,7 +351,7 @@ pub fn dev_items(
                 if item.key.ty == ty::DEV_ITEM {
                     let ds = HEADER_SIZE + item.offset as usize;
                     if let Some(d) = le::get(&block, ds, item.size as usize)
-                        .and_then(|d| DevItem::parse(d))
+                        .and_then(DevItem::parse)
                     {
                         out.push(d);
                     }
