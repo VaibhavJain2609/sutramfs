@@ -134,7 +134,13 @@ pub fn xblob(xtype: u8, data: &[u8]) -> Vec<u8> {
 }
 
 /// `j_inode_val_t`.
-pub fn inode_val(parent: u64, private_id: u64, mode: u16, nlinks: u32, xfields: &[Vec<u8>]) -> Vec<u8> {
+pub fn inode_val(
+    parent: u64,
+    private_id: u64,
+    mode: u16,
+    nlinks: u32,
+    xfields: &[Vec<u8>],
+) -> Vec<u8> {
     let mut v = vec![0u8; 92];
     w64(&mut v, 0, parent);
     w64(&mut v, 8, private_id);
@@ -166,7 +172,7 @@ pub fn inode_val(parent: u64, private_id: u64, mode: u16, nlinks: u32, xfields: 
         let sz = u16::from_le_bytes([xf[6], xf[7]]) as usize;
         let data = &xf[8..8 + sz];
         let pad = ((rel + 7) & !7) - rel;
-        blob.extend(std::iter::repeat(0).take(pad));
+        blob.extend(std::iter::repeat_n(0, pad));
         blob.extend_from_slice(data);
         rel += pad + sz;
     }
@@ -199,7 +205,13 @@ pub fn drec_kv(parent: u64, name: &str, file_id: u64, ftype: u16, hash: u32) -> 
 }
 
 /// `j_file_extent_key_t` + `j_file_extent_val_t`.
-pub fn extent_kv(private_id: u64, logical: u64, len: u64, phys: u64, crypto: u64) -> (Vec<u8>, Vec<u8>) {
+pub fn extent_kv(
+    private_id: u64,
+    logical: u64,
+    len: u64,
+    phys: u64,
+    crypto: u64,
+) -> (Vec<u8>, Vec<u8>) {
     let mut k = Vec::new();
     k.extend_from_slice(&jhdr(private_id, JT_FILE_EXTENT).to_le_bytes());
     k.extend_from_slice(&logical.to_le_bytes());
@@ -221,6 +233,21 @@ pub fn xattr_kv(oid: u64, name: &str, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     v.extend_from_slice(&0x0002u16.to_le_bytes()); // XATTR_DATA_EMBEDDED
     v.extend_from_slice(&(data.len() as u16).to_le_bytes());
     v.extend_from_slice(data);
+    (k, v)
+}
+
+/// `j_xattr_key_t` + streamed `j_xattr_val_t` (XATTR_DATA_STREAM).
+pub fn xattr_stream_kv(oid: u64, name: &str, stream_oid: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut k = Vec::new();
+    k.extend_from_slice(&jhdr(oid, JT_XATTR).to_le_bytes());
+    k.extend_from_slice(&((name.len() + 1) as u16).to_le_bytes());
+    k.extend_from_slice(name.as_bytes());
+    k.push(0);
+    let mut v = Vec::new();
+    v.extend_from_slice(&0x0001u16.to_le_bytes()); // XATTR_DATA_STREAM
+    v.extend_from_slice(&48u16.to_le_bytes()); // j_xattr_dstream_t len
+    v.extend_from_slice(&stream_oid.to_le_bytes());
+    v.extend_from_slice(&[0u8; 40]); // j_dstream_t
     (k, v)
 }
 
@@ -250,10 +277,7 @@ pub fn dir_stats_kv(oid: u64, children: u64, size: u64) -> (Vec<u8>, Vec<u8>) {
     let mut v = vec![0u8; 32];
     w64(&mut v, 0, children);
     w64(&mut v, 8, size);
-    (
-        jhdr(oid, JT_DIR_STATS).to_le_bytes().to_vec(),
-        v,
-    )
+    (jhdr(oid, JT_DIR_STATS).to_le_bytes().to_vec(), v)
 }
 
 /// `j_snap_name_key_t` + `j_snap_name_val_t`.
@@ -289,7 +313,14 @@ pub const BT_PHYS: u32 = 0x10;
 
 /// Serialize a leaf/root node carrying `entries` (already key-sorted).
 /// `fixed`: Some((klen,vlen)) → kvoff_t table + FIXED_KV flag.
-pub fn btree_leaf(oid: u64, xid: u64, subtype: u32, entries: &[(Vec<u8>, Vec<u8>)], fixed: Option<(u16, u16)>, bt_flags: u32) -> Vec<u8> {
+pub fn btree_leaf(
+    oid: u64,
+    xid: u64,
+    subtype: u32,
+    entries: &[(Vec<u8>, Vec<u8>)],
+    fixed: Option<(u16, u16)>,
+    bt_flags: u32,
+) -> Vec<u8> {
     let mut b = vec![0u8; BS];
     let fixed_kv = fixed.is_some();
     let flags = 0x0001u16 | 0x0002 | if fixed_kv { 0x0004 } else { 0 };
@@ -395,6 +426,8 @@ pub fn nxsb(xid: u64, fs_oids: &[u64]) -> Vec<u8> {
     w32(&mut b, 140, 1); // xp_desc_len
     w64(&mut b, 152, O_SPACEMAN);
     w64(&mut b, 160, O_CMAP);
+    w64(&mut b, 1296, 50); // nx_keybag_base → claims blocks 50..52
+    w64(&mut b, 1304, 2); // nx_keybag_blocks
     w32(&mut b, 180, fs_oids.len() as u32);
     for (i, o) in fs_oids.iter().enumerate() {
         w64(&mut b, 184 + i * 8, *o);
@@ -404,7 +437,14 @@ pub fn nxsb(xid: u64, fs_oids: &[u64]) -> Vec<u8> {
 }
 
 /// `apfs_superblock_t` block.
-pub fn apsb(oid: u64, xid: u64, omap_paddr: u64, root_tree_oid: u64, snap_tree_paddr: u64, encrypted: bool) -> Vec<u8> {
+pub fn apsb(
+    oid: u64,
+    xid: u64,
+    omap_paddr: u64,
+    root_tree_oid: u64,
+    snap_tree_paddr: u64,
+    encrypted: bool,
+) -> Vec<u8> {
     let mut b = vec![0u8; BS];
     obj_hdr(&mut b, oid, xid, T_FS, 0);
     b[32..36].copy_from_slice(b"APSB");
@@ -450,7 +490,6 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
     // ---- fs-tree records --------------------------------------------------
     // Shared in both generations.
     let root_inode = inode_val(1, ROOT_DIR, 0o040755, 3, &[]);
-    let docs_inode = inode_val(ROOT_DIR, 300, 0o040755, 1, &[]);
     let photo_inode = inode_val(
         ROOT_DIR,
         200,
@@ -459,11 +498,36 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         &[xblob(8, &xf_dstream(8192, 8192, 0))],
     );
 
+    // docs carries every inode xfield the decoder interprets.
+    let docs_inode = inode_val(
+        ROOT_DIR,
+        300,
+        0o040755,
+        1,
+        &[
+            xblob(1, &0x55u64.to_le_bytes()),         // snap_xid
+            xblob(3, &77u32.to_le_bytes()),           // document_id
+            xblob(5, &9999u64.to_le_bytes()),         // prev_fsize
+            xblob(7, &[0xABu8; 32]),                  // finder_info
+            xblob(13, &128u64.to_le_bytes()),         // sparse_bytes
+            xblob(14, &0x0102_0304u64.to_le_bytes()), // rdev
+        ],
+    );
+
     // Generation B (live, xid 2).
     let mut gen_b: Vec<(Vec<u8>, Vec<u8>)> = vec![
-        (jhdr(ROOT_DIR, JT_INODE).to_le_bytes().to_vec(), root_inode.clone()),
-        (jhdr(300, JT_INODE).to_le_bytes().to_vec(), docs_inode.clone()),
-        (jhdr(200, JT_INODE).to_le_bytes().to_vec(), photo_inode.clone()),
+        (
+            jhdr(ROOT_DIR, JT_INODE).to_le_bytes().to_vec(),
+            root_inode.clone(),
+        ),
+        (
+            jhdr(300, JT_INODE).to_le_bytes().to_vec(),
+            docs_inode.clone(),
+        ),
+        (
+            jhdr(200, JT_INODE).to_le_bytes().to_vec(),
+            photo_inode.clone(),
+        ),
         drec_kv(ROOT_DIR, "docs", 300, 0x4, 0x1234),
         drec_kv(ROOT_DIR, "photo.png", 200, 0x8, 0x5678),
         drec_kv(300, "inner.txt", 200, 0x8, 0x9abc), // second name for oid 200
@@ -471,10 +535,83 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         extent_kv(200, 0, BS as u64, 30, 0),
         extent_kv(200, BS as u64, BS as u64, 32, 0),
         xattr_kv(200, "com.apple.quarantine", &[1, 2, 3, 4]),
+        // Streamed (non-embedded) xattr on photo.png.
+        xattr_stream_kv(200, "com.apple.ResourceFork", 0xBEEF),
         // photo.png's hardlink via sibling link + sibling map.
         sibling_link_kv(200, 500, 300, "alias.png"),
         sibling_map_kv(500, 200),
         snap_name_kv("test-snap", 1),
+        // sparse.bin: extents at logical 0 (block 33) and 8192 (block 34),
+        // logical hole 4096..8192 must read as zeros.
+        (
+            jhdr(400, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(
+                ROOT_DIR,
+                400,
+                0o100644,
+                1,
+                &[xblob(8, &xf_dstream(12288, 8192, 0))],
+            ),
+        ),
+        drec_kv(ROOT_DIR, "sparse.bin", 400, 0x8, 0x7777),
+        extent_kv(400, 0, BS as u64, 33, 0),
+        extent_kv(400, 2 * BS as u64, BS as u64, 34, 0x99),
+        // tiny.txt: 100 bytes in one 4K extent → slack.
+        (
+            jhdr(401, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(
+                ROOT_DIR,
+                401,
+                0o100644,
+                1,
+                &[xblob(8, &xf_dstream(100, 4096, 0))],
+            ),
+        ),
+        drec_kv(ROOT_DIR, "tiny.txt", 401, 0x8, 0xaaaa),
+        extent_kv(401, 0, BS as u64, 35, 0),
+        // link: symlink with embedded com.apple.fs.symlink xattr.
+        (
+            jhdr(402, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(ROOT_DIR, 402, 0o120777, 1, &[]),
+        ),
+        drec_kv(ROOT_DIR, "link", 402, 0xa, 0xbbbb),
+        xattr_kv(402, "com.apple.fs.symlink", b"docs/target\0"),
+        // Crypto-state record → extent_encrypted meta on oid 200.
+        (jhdr(200, 0x7).to_le_bytes().to_vec(), Vec::new()),
+        // Physical extent record (jtype 0x2): claims block 36.
+        (jhdr(36, 0x2).to_le_bytes().to_vec(), {
+            let mut v = vec![0u8; 20];
+            w64(&mut v, 0, BS as u64); // len_and_kind
+            v
+        }),
+        // Unknown jtype (dstream-id 0x6) → unhandled_jrec_types meta.
+        (jhdr(999, 0x6).to_le_bytes().to_vec(), vec![1u8; 4]),
+        // Orphan inode: no directory record → /$ORPHANED/ bucket.
+        (
+            jhdr(403, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(ROOT_DIR, 403, 0o100644, 1, &[]),
+        ),
+        // Broken parent chain: parent oid 999 has no inode/drec.
+        drec_kv(999, "stray.txt", 403, 0x8, 0xcccc),
+        // Truly orphaned inode (no drec at all).
+        (
+            jhdr(404, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(
+                ROOT_DIR,
+                404,
+                0o100644,
+                1,
+                &[xblob(8, &xf_dstream(50, 0, 0))],
+            ),
+        ),
+        // Second hardlink whose sibling_map entry is missing.
+        sibling_link_kv(200, 501, 300, "alias2.png"),
+        // Third hardlink whose sibling_map resolves to the wrong oid.
+        sibling_link_kv(200, 502, 300, "alias3.png"),
+        sibling_map_kv(502, 999),
+        // Fourth hardlink with a broken parent chain.
+        sibling_link_kv(200, 503, 999, "alias4.png"),
+        sibling_map_kv(503, 200),
     ];
     gen_b.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -488,9 +625,18 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         &[xblob(8, &xf_dstream(8192, 8192, 0))],
     );
     let mut gen_a: Vec<(Vec<u8>, Vec<u8>)> = vec![
-        (jhdr(ROOT_DIR, JT_INODE).to_le_bytes().to_vec(), root_inode.clone()),
-        (jhdr(300, JT_INODE).to_le_bytes().to_vec(), docs_inode.clone()),
-        (jhdr(200, JT_INODE).to_le_bytes().to_vec(), photo_inode.clone()),
+        (
+            jhdr(ROOT_DIR, JT_INODE).to_le_bytes().to_vec(),
+            root_inode.clone(),
+        ),
+        (
+            jhdr(300, JT_INODE).to_le_bytes().to_vec(),
+            docs_inode.clone(),
+        ),
+        (
+            jhdr(200, JT_INODE).to_le_bytes().to_vec(),
+            photo_inode.clone(),
+        ),
         (jhdr(100, JT_INODE).to_le_bytes().to_vec(), old_inode),
         drec_kv(ROOT_DIR, "docs", 300, 0x4, 0x1234),
         drec_kv(ROOT_DIR, "photo.png", 200, 0x8, 0x5678),
@@ -500,6 +646,33 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         extent_kv(200, BS as u64, BS as u64, 32, 0),
         extent_kv(100, 0, BS as u64, 31, 0),
         extent_kv(100, BS as u64, BS as u64, 32, 0),
+        // lost.txt: deleted AND its parent chain is broken in the old
+        // generation → orphan-path fallback in deleted emission.
+        (
+            jhdr(500, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(
+                ROOT_DIR,
+                500,
+                0o100644,
+                1,
+                &[xblob(8, &xf_dstream(4096, 4096, 0))],
+            ),
+        ),
+        drec_kv(999, "lost.txt", 500, 0x8, 0xdddd),
+        extent_kv(500, 0, BS as u64, 37, 0),
+        // empty.bin: deleted inode with a size but no extents →
+        // Unrecoverable recovery state.
+        (
+            jhdr(501, JT_INODE).to_le_bytes().to_vec(),
+            inode_val(
+                ROOT_DIR,
+                501,
+                0o100644,
+                1,
+                &[xblob(8, &xf_dstream(100, 0, 0))],
+            ),
+        ),
+        drec_kv(ROOT_DIR, "empty.bin", 501, 0x8, 0xeeee),
     ];
     gen_a.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -568,7 +741,7 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
             22,
             2,
             T_SNAPMETA,
-            &[snap_meta_kv(1, 23, "test-snap")],
+            &[snap_meta_kv(1, 23, "test-snap"), snap_meta_kv(5, 23, "")],
             None,
             BT_PHYS,
         ),
@@ -598,6 +771,12 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
     let mut old0 = vec![0u8; BS];
     old0[..12].copy_from_slice(b"deleted-data");
     img.insert(31, old0);
+    let mut sp0 = vec![0u8; BS];
+    sp0[..8].copy_from_slice(b"SPARSE-1");
+    img.insert(33, sp0);
+    let mut sp1 = vec![0u8; BS];
+    sp1[..8].copy_from_slice(b"SPARSE-2");
+    img.insert(34, sp1);
 
     // ---- assemble ----------------------------------------------------------
     let mut out = vec![0u8; (BLOCKS as usize) * BS];

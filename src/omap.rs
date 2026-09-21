@@ -111,12 +111,16 @@ impl OmapIndex {
     }
 
     /// Resolve `oid` at transaction bound `max_xid`: the entry with the
-    /// largest `ok_xid <= max_xid` that isn't flagged `OMAP_VAL_DELETED`.
+    /// largest `ok_xid <= max_xid` decides. If that entry is flagged
+    /// `OMAP_VAL_DELETED` the object was absent at that transaction —
+    /// falling back to an older mapping would resurrect a stale paddr
+    /// whose block may have been reallocated.
     pub(crate) fn lookup(&self, oid: u64, max_xid: u64) -> Option<OmapEntry> {
         let v = self.by_oid.get(&oid)?;
-        v.iter()
-            .rev()
-            .find(|e| e.xid <= max_xid && e.flags & OMAP_VAL_DELETED == 0)
-            .copied()
+        let e = v.iter().rev().find(|e| e.xid <= max_xid)?;
+        if e.flags & OMAP_VAL_DELETED != 0 {
+            return None;
+        }
+        Some(*e)
     }
 }

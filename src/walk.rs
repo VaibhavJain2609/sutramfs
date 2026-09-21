@@ -9,9 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use sutram_fs::util;
-use sutram_fs::{
-    EntryKind, FsEntry, FsEntryStatus, FsTimestamp, Result, Timestamps,
-};
+use sutram_fs::{EntryKind, FsEntry, FsEntryStatus, FsTimestamp, Result, Timestamps};
 
 use crate::fs::ApfsFs;
 use crate::jrec::{self, ExtentRec, InodeVal};
@@ -106,7 +104,10 @@ impl<'m> Walk<'m> {
         if fs.opts.include_orphans {
             for (&oid, &(off, _)) in &fs.view.recs.inodes {
                 if oid != jrec::ROOT_DIR_INODE && !linked.contains(&oid) {
-                    plans.push(Plan::Orphan { oid, record_off: off });
+                    plans.push(Plan::Orphan {
+                        oid,
+                        record_off: off,
+                    });
                 }
             }
         }
@@ -168,7 +169,10 @@ impl<'m> Walk<'m> {
         let mut extents: Vec<ExtentRec> = Vec::new();
         let mut meta = HashMap::from([
             ("inode".into(), format!("{oid:#x}")),
-            ("fs_tree_root".into(), format!("{:#x}", self.fs.view.root_paddr)),
+            (
+                "fs_tree_root".into(),
+                format!("{:#x}", self.fs.view.root_paddr),
+            ),
             ("checkpoint_xid".into(), self.fs.checkpoint_xid.to_string()),
             ("volume_uuid".into(), apsb.uuid.clone()),
         ]);
@@ -193,7 +197,7 @@ impl<'m> Walk<'m> {
                 size = iv.dstream.map(|d| d.size).unwrap_or_else(|| {
                     extents
                         .iter()
-                        .map(|e| e.logical_addr + e.len)
+                        .map(|e| e.logical_addr.saturating_add(e.len))
                         .max()
                         .unwrap_or(0)
                 });
@@ -208,10 +212,7 @@ impl<'m> Walk<'m> {
                     },
                     iv.nchildren_or_nlink.to_string(),
                 );
-                meta.insert(
-                    "internal_flags".into(),
-                    format!("{:#x}", iv.internal_flags),
-                );
+                meta.insert("internal_flags".into(), format!("{:#x}", iv.internal_flags));
                 meta.insert("bsd_flags".into(), format!("{:#x}", iv.bsd_flags));
                 meta.insert("private_id".into(), format!("{:#x}", iv.private_id));
                 meta.insert("parent_id".into(), format!("{:#x}", iv.parent_id));
@@ -227,18 +228,12 @@ impl<'m> Walk<'m> {
                     meta.insert("apfs_private".into(), "true".into());
                 }
                 if let Some(d) = iv.dstream {
-                    meta.insert(
-                        "dstream_alloced_size".into(),
-                        d.alloced_size.to_string(),
-                    );
+                    meta.insert("dstream_alloced_size".into(), d.alloced_size.to_string());
                     meta.insert(
                         "dstream_bytes_written".into(),
                         d.total_bytes_written.to_string(),
                     );
-                    meta.insert(
-                        "dstream_bytes_read".into(),
-                        d.total_bytes_read.to_string(),
-                    );
+                    meta.insert("dstream_bytes_read".into(), d.total_bytes_read.to_string());
                     if d.default_crypto_id != 0 {
                         meta.insert(
                             "default_crypto_id".into(),
@@ -291,14 +286,17 @@ impl<'m> Walk<'m> {
         let mut ranges = Vec::with_capacity(extents.len());
         let mut any_crypto = self.fs.view.recs.crypto_oids.contains(&oid);
         for (i, ex) in extents.iter().enumerate() {
-            ranges.push((ex.phys_block * bs, ex.len));
+            ranges.push((ex.phys_block.saturating_mul(bs), ex.len));
             meta.insert(format!("extent_{i}_record_off"), format!("{:#x}", ex.off));
             if ex.flags != 0 {
                 meta.insert(format!("extent_{i}_flags"), format!("{:#x}", ex.flags));
             }
             if ex.crypto_id != 0 {
                 any_crypto = true;
-                meta.insert(format!("extent_{i}_crypto_id"), format!("{:#x}", ex.crypto_id));
+                meta.insert(
+                    format!("extent_{i}_crypto_id"),
+                    format!("{:#x}", ex.crypto_id),
+                );
             }
         }
         if any_crypto {
@@ -404,12 +402,11 @@ impl<'m> Walk<'m> {
         let size = iv.dstream.map(|s| s.size).unwrap_or_else(|| {
             d.extents
                 .iter()
-                .map(|e| e.logical_addr + e.len)
+                .map(|e| e.logical_addr.saturating_add(e.len))
                 .max()
                 .unwrap_or(0)
         });
-        let (recovery, surviving, notes) =
-            self.fs.recovery_for_deleted(&d.extents, size);
+        let (recovery, surviving, notes) = self.fs.recovery_for_deleted(&d.extents, size);
         let mut meta = HashMap::from([
             ("inode".into(), format!("{:#x}", d.oid)),
             ("deleted".into(), "true".into()),
@@ -467,99 +464,95 @@ impl Iterator for Walk<'_> {
             }
             return Some(item);
         }
-        loop {
-            if self.plans.is_empty() {
-                if !self.deleted_done {
-                    self.deleted_done = true;
-                    for i in 0..self.fs.deleted.len() {
-                        let e = self.emit_deleted(&self.fs.deleted[i]);
-                        self.queue.push_back(Ok(e));
-                    }
-                    if let Some(item) = self.queue.pop_front() {
-                        return Some(item);
-                    }
+        if self.plans.is_empty() {
+            if !self.deleted_done {
+                self.deleted_done = true;
+                for i in 0..self.fs.deleted.len() {
+                    let e = self.emit_deleted(&self.fs.deleted[i]);
+                    self.queue.push_back(Ok(e));
                 }
-                return None;
+                return self.queue.pop_front();
             }
-            let plan = self.plans.remove(0);
-            let entry = match plan {
-                Plan::Drec {
-                    parent_oid,
-                    name,
-                    file_id,
-                    record_off,
-                    date_added,
-                    flags,
-                    name_hash,
-                    sibling_id,
-                } => {
-                    let (path, mut extra) = match self.dir_path(parent_oid, 0) {
-                        Some(b) => (util::join_path(&b, &name), Vec::new()),
-                        None => (
-                            util::orphan_path(file_id),
-                            vec![("note".into(), "parent directory chain broken".into())],
-                        ),
-                    };
-                    extra.push((
-                        "drec_type".into(),
-                        format!("{:#x}", flags & jrec::DREC_TYPE_MASK),
-                    ));
-                    if date_added != 0 {
-                        extra.push(("date_added".into(), date_added.to_string()));
-                    }
-                    if let Some(h) = name_hash {
-                        extra.push(("name_hash".into(), format!("{h:#x}")));
-                    }
-                    if let Some(s) = sibling_id {
-                        extra.push(("sibling_id".into(), format!("{s:#x}")));
-                    }
-                    let iv = self.fs.view.recs.inodes.get(&file_id).map(|(_, v)| v);
-                    self.emit_inode(file_id, iv, path, name, record_off, extra)
-                }
-                Plan::Sibling {
-                    oid,
-                    sibling_id,
-                    parent_oid,
-                    name,
-                    record_off,
-                } => {
-                    let (path, mut extra) = match self.dir_path(parent_oid, 0) {
-                        Some(b) => (util::join_path(&b, &name), Vec::new()),
-                        None => (
-                            util::orphan_path(oid),
-                            vec![("note".into(), "hardlink parent chain broken".into())],
-                        ),
-                    };
-                    extra.push(("hardlink".into(), "true".into()));
-                    extra.push(("sibling_id".into(), format!("{sibling_id:#x}")));
-                    // Cross-check the sibling map (sibling_id → file_id).
-                    match self.fs.view.recs.sibling_map.get(&sibling_id) {
-                        Some(&target) if target == oid => {
-                            extra.push(("sibling_map_ok".into(), "true".into()))
-                        }
-                        Some(&target) => extra.push((
-                            "note".into(),
-                            format!("sibling map resolves to {target:#x}, not {oid:#x}"),
-                        )),
-                        None => extra.push(("note".into(), "sibling map entry missing".into())),
-                    }
-                    let iv = self.fs.view.recs.inodes.get(&oid).map(|(_, v)| v);
-                    self.emit_inode(oid, iv, path, name, record_off, extra)
-                }
-                Plan::Orphan { oid, record_off } => {
-                    let iv = self.fs.view.recs.inodes.get(&oid).map(|(_, v)| v);
-                    let name = format!("inode_{oid:x}");
-                    self.emit_inode(
-                        oid,
-                        iv,
-                        util::orphan_path(oid),
-                        name,
-                        record_off,
-                        vec![("orphan".into(), "true".into())],
-                    )
-                }
-            };
-            return Some(Ok(entry));
+            return None;
         }
+        let plan = self.plans.remove(0);
+        let entry = match plan {
+            Plan::Drec {
+                parent_oid,
+                name,
+                file_id,
+                record_off,
+                date_added,
+                flags,
+                name_hash,
+                sibling_id,
+            } => {
+                let (path, mut extra) = match self.dir_path(parent_oid, 0) {
+                    Some(b) => (util::join_path(&b, &name), Vec::new()),
+                    None => (
+                        util::orphan_path(file_id),
+                        vec![("note".into(), "parent directory chain broken".into())],
+                    ),
+                };
+                extra.push((
+                    "drec_type".into(),
+                    format!("{:#x}", flags & jrec::DREC_TYPE_MASK),
+                ));
+                if date_added != 0 {
+                    extra.push(("date_added".into(), date_added.to_string()));
+                }
+                if let Some(h) = name_hash {
+                    extra.push(("name_hash".into(), format!("{h:#x}")));
+                }
+                if let Some(s) = sibling_id {
+                    extra.push(("sibling_id".into(), format!("{s:#x}")));
+                }
+                let iv = self.fs.view.recs.inodes.get(&file_id).map(|(_, v)| v);
+                self.emit_inode(file_id, iv, path, name, record_off, extra)
+            }
+            Plan::Sibling {
+                oid,
+                sibling_id,
+                parent_oid,
+                name,
+                record_off,
+            } => {
+                let (path, mut extra) = match self.dir_path(parent_oid, 0) {
+                    Some(b) => (util::join_path(&b, &name), Vec::new()),
+                    None => (
+                        util::orphan_path(oid),
+                        vec![("note".into(), "hardlink parent chain broken".into())],
+                    ),
+                };
+                extra.push(("hardlink".into(), "true".into()));
+                extra.push(("sibling_id".into(), format!("{sibling_id:#x}")));
+                // Cross-check the sibling map (sibling_id → file_id).
+                match self.fs.view.recs.sibling_map.get(&sibling_id) {
+                    Some(&target) if target == oid => {
+                        extra.push(("sibling_map_ok".into(), "true".into()))
+                    }
+                    Some(&target) => extra.push((
+                        "note".into(),
+                        format!("sibling map resolves to {target:#x}, not {oid:#x}"),
+                    )),
+                    None => extra.push(("note".into(), "sibling map entry missing".into())),
+                }
+                let iv = self.fs.view.recs.inodes.get(&oid).map(|(_, v)| v);
+                self.emit_inode(oid, iv, path, name, record_off, extra)
+            }
+            Plan::Orphan { oid, record_off } => {
+                let iv = self.fs.view.recs.inodes.get(&oid).map(|(_, v)| v);
+                let name = format!("inode_{oid:x}");
+                self.emit_inode(
+                    oid,
+                    iv,
+                    util::orphan_path(oid),
+                    name,
+                    record_off,
+                    vec![("orphan".into(), "true".into())],
+                )
+            }
+        };
+        Some(Ok(entry))
     }
 }

@@ -117,7 +117,7 @@ pub(crate) fn parse_xfields(buf: &[u8]) -> Vec<(u8, u8, &[u8])> {
     let num = le::u16(buf, 0).unwrap_or(0) as usize;
     // Plausibility bound: each descriptor is 4 bytes.
     let desc_area = 4usize;
-    let val_area = match desc_area.checked_add(num.checked_mul(4).unwrap_or(usize::MAX)) {
+    let val_area = match desc_area.checked_add(num.saturating_mul(4)) {
         Some(v) if v <= buf.len() => v,
         _ => return out,
     };
@@ -200,16 +200,11 @@ impl InodeVal {
             match xt {
                 xtype::INO_NAME => {
                     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-                    v.xf_name =
-                        Some(String::from_utf8_lossy(&data[..end]).into_owned());
+                    v.xf_name = Some(String::from_utf8_lossy(&data[..end]).into_owned());
                 }
                 xtype::INO_DSTREAM => v.dstream = Dstream::decode(data),
-                xtype::INO_SPARSE_BYTES => {
-                    v.sparse_bytes = le::u64(data, 0)
-                }
-                xtype::INO_DOCUMENT_ID => {
-                    v.document_id = le::u32(data, 0)
-                }
+                xtype::INO_SPARSE_BYTES => v.sparse_bytes = le::u64(data, 0),
+                xtype::INO_DOCUMENT_ID => v.document_id = le::u32(data, 0),
                 xtype::INO_RDEV => v.rdev = le::u64(data, 0),
                 xtype::INO_PREV_FSIZE => v.prev_fsize = le::u64(data, 0),
                 xtype::INO_SNAP_XID => v.snap_xid = le::u64(data, 0),
@@ -298,8 +293,7 @@ pub(crate) enum JRecord {
 /// `auto` sniffs when the caller doesn't know (we try the layout whose
 /// declared name length exactly consumes the key).
 pub(crate) fn decode_record(key: &[u8], val: &[u8], hashed_drec: Option<bool>) -> Result<JRecord> {
-    let (oid, jt) =
-        split_key(key).ok_or_else(|| FsError::corrupt(0, "fs record key < 8 bytes"))?;
+    let (oid, jt) = split_key(key).ok_or_else(|| FsError::corrupt(0, "fs record key < 8 bytes"))?;
     match jt {
         jtype::INODE => Ok(JRecord::Inode {
             oid,
@@ -386,10 +380,7 @@ fn decode_drec(
             if nlen == 0 || 12 + nlen > key.len() {
                 return None;
             }
-            Some((
-                read_named(&key[12..], nlen),
-                Some(nh >> DREC_HASH_SHIFT),
-            ))
+            Some((read_named(&key[12..], nlen), Some(nh >> DREC_HASH_SHIFT)))
         } else {
             let nlen = le::u16(key, 8)? as usize;
             if nlen == 0 || 10 + nlen > key.len() {
@@ -399,8 +390,16 @@ fn decode_drec(
         }
     };
     // Exact-length key fits are trusted; otherwise fall back to the flag.
-    let hashed_ok = sniff(true).filter(|_| le::u32(key, 8).map(|nh| (nh & DREC_LEN_MASK) as usize + 12 == key.len()).unwrap_or(false));
-    let plain_ok = sniff(false).filter(|_| le::u16(key, 8).map(|n| n as usize + 10 == key.len()).unwrap_or(false));
+    let hashed_ok = sniff(true).filter(|_| {
+        le::u32(key, 8)
+            .map(|nh| (nh & DREC_LEN_MASK) as usize + 12 == key.len())
+            .unwrap_or(false)
+    });
+    let plain_ok = sniff(false).filter(|_| {
+        le::u16(key, 8)
+            .map(|n| n as usize + 10 == key.len())
+            .unwrap_or(false)
+    });
     let (name, hash) = match hashed_drec {
         Some(true) => sniff(true)
             .or(hashed_ok)
@@ -410,9 +409,9 @@ fn decode_drec(
             .or(plain_ok)
             .or(hashed_ok)
             .ok_or_else(|| FsError::corrupt(0, "drec key: bad name length"))?,
-        None => hashed_ok.or(plain_ok).ok_or_else(|| {
-            FsError::corrupt(0, "drec key: undecodable name field")
-        })?,
+        None => hashed_ok
+            .or(plain_ok)
+            .ok_or_else(|| FsError::corrupt(0, "drec key: undecodable name field"))?,
     };
     let mut sibling_id = None;
     for (xt, _xf, data) in parse_xfields(val.get(18..).unwrap_or(&[])) {

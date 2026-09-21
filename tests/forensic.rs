@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use sutram_apfs::ApfsParser;
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntryStatus, FsParser, FileSystem, MountOptions, RecoveryState,
+    DetectConfidence, EntryKind, FileSystem, FsEntryStatus, FsParser, MountOptions, RecoveryState,
 };
 use sutram_io::ByteSource;
 
@@ -23,8 +23,8 @@ fn mount(img: Vec<u8>) -> Box<dyn FileSystem> {
 
 fn entries(fs: &dyn FileSystem) -> Vec<sutram_fs::FsEntry> {
     fs.walk()
-        .filter_map(|r| match r {
-            Ok(e) => Some(e),
+        .map(|r| match r {
+            Ok(e) => e,
             Err(e) => panic!("walk error: {e}"),
         })
         .collect()
@@ -160,7 +160,7 @@ fn snapshots_enumerated_and_mountable() {
     let img = common::build_image(false);
     let fs = mount(img);
     let info = fs.info();
-    assert_eq!(info.meta["snapshot_count"], "1");
+    assert_eq!(info.meta["snapshot_count"], "2");
     assert_eq!(info.meta["snapshot_0_name"], "test-snap");
     assert_eq!(info.meta["snapshot_0_xid"], "1");
 
@@ -173,10 +173,7 @@ fn snapshots_enumerated_and_mountable() {
     let es = entries(snap.as_ref());
     let old = es.iter().find(|e| e.path == "/old.txt").unwrap();
     assert_eq!(old.status, FsEntryStatus::Live);
-    assert_eq!(
-        snap.info().meta["snapshot_view_xid"],
-        "1"
-    );
+    assert_eq!(snap.info().meta["snapshot_view_xid"], "1");
 }
 
 #[test]
@@ -275,4 +272,285 @@ fn truncated_image_errors_cleanly() {
 fn garbage_image_errors() {
     let src: Arc<dyn ByteSource> = Arc::new(vec![0xAAu8; 64 * 4096]);
     assert!(ApfsParser.mount(src).is_err());
+}
+
+#[test]
+fn sparse_file_reads_holes_as_zeros() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    let e = entries(fs.as_ref())
+        .into_iter()
+        .find(|e| e.path == "/sparse.bin")
+        .expect("sparse.bin entry");
+    assert_eq!(e.size, 12288);
+    let mut buf = Vec::new();
+    fs.read_file(&e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), 12288);
+    assert_eq!(&buf[0..8], b"SPARSE-1");
+    assert!(
+        buf[4096..8192].iter().all(|&b| b == 0),
+        "logical hole must read as zeros, not next extent's bytes"
+    );
+    assert_eq!(&buf[8192..8200], b"SPARSE-2");
+    // Random access across the hole boundary.
+    let mut tail = [0u8; 8];
+    fs.read_file_at(&e, 8192, &mut tail).unwrap();
+    assert_eq!(&tail, b"SPARSE-2");
+}
+
+#[test]
+fn descriptor_area_beyond_image_mounts_error_not_hang() {
+    let mut img = common::build_image(false);
+    // Point the block-0 label's descriptor base past the image tail.
+    // Block 0 is parsed leniently → geometry is trusted; the scan must
+    // clamp to device size and fail cleanly rather than hang/error at IO.
+    img[112..120].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(ApfsParser.mount(src).is_err());
+}
+
+#[test]
+fn hostile_checkpoint_sizes_do_not_hang_mount() {
+    let mut img = common::build_image(false);
+    // Absurd xp_desc_blocks in block-0 label (high bit = contiguous flag
+    // clear) — the scan is bounded by device size either way.
+    img[104..108].copy_from_slice(&(u32::MAX / 2).to_le_bytes());
+    let fs = mount(img);
+    // Mount still succeeds (descriptor area clamps to the real 8 blocks).
+    assert_eq!(fs.info().meta["checkpoint_xid"], "2");
+}
+
+#[test]
+fn misc_meta_fixtures() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    let es = entries(fs.as_ref());
+    let by_path: std::collections::HashMap<_, _> =
+        es.iter().map(|e| (e.path.as_str(), e)).collect();
+
+    // Slack: 100 bytes in a 4K extent.
+    let tiny = by_path["/tiny.txt"];
+    assert_eq!(tiny.meta["slack_len"], "3996");
+    assert!(tiny.meta.contains_key("slack_offset"));
+
+    // Crypto-state record + per-extent crypto ids → flagged, never decrypted.
+    let photo = by_path["/photo.png"];
+    assert_eq!(photo.meta["extent_encrypted"], "true");
+    assert_eq!(
+        photo.meta["xattr_com.apple.ResourceFork_stream_oid"],
+        "0xbeef"
+    );
+    let sparse = by_path["/sparse.bin"];
+    assert_eq!(sparse.meta["extent_1_crypto_id"], "0x99");
+
+    // Symlink target lifted from the embedded xattr.
+    let link = by_path["/link"];
+    assert_eq!(link.kind, EntryKind::Symlink);
+    assert_eq!(link.meta["symlink_target"], "docs/target");
+
+    // Inode xfields.
+    let docs = by_path["/docs"];
+    assert_eq!(docs.meta["finder_info"], "true");
+    assert_eq!(docs.meta["document_id"], "77");
+    assert_eq!(docs.meta["prev_fsize"], "9999");
+    assert_eq!(docs.meta["sparse_bytes"], "128");
+    assert_eq!(docs.meta["rdev"], "0x1020304");
+    assert_eq!(docs.meta["inode_snap_xid"], "85");
+
+    // Unhandled record types + phys-extent claims.
+    let info = fs.info();
+    assert_eq!(info.meta["phys_extent_records"], "1");
+    assert!(info.meta["unhandled_jrec_types"].contains("0x6"));
+}
+
+#[test]
+fn mount_volume_by_index() {
+    let img = common::build_image(false);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ApfsParser
+        .mount_volume(src, &MountOptions::default(), 0)
+        .expect("mount_volume");
+    assert_eq!(fs.info().meta["volume_index"], "0");
+}
+
+#[test]
+fn orphans_and_broken_chains() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    let es = entries(fs.as_ref());
+    // Inode with no drec → orphan bucket.
+    let orphan = es
+        .iter()
+        .find(|e| e.path.contains("$ORPHANED") && e.entry_id == 404)
+        .expect("orphan inode entry");
+    assert_eq!(orphan.meta["orphan"], "true");
+    // drec whose parent chain is broken → orphan path + note.
+    let stray = es.iter().find(|e| e.entry_id == 403).expect("stray entry");
+    assert!(stray.meta["note"].contains("parent directory chain"));
+    // Sibling-map mismatch: alias3 maps to a different oid.
+    let a3 = es
+        .iter()
+        .find(|e| e.path.ends_with("alias3.png"))
+        .expect("alias3 entry");
+    assert!(a3.meta["note"].contains("sibling map"));
+    let a2 = es
+        .iter()
+        .find(|e| e.path.ends_with("alias2.png"))
+        .expect("alias2 entry");
+    assert_eq!(a2.meta["note"], "sibling map entry missing");
+}
+
+#[test]
+fn deleted_fixture_variants() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    let es = entries(fs.as_ref());
+    // Lost.txt: deleted and its old-generation parent chain is broken.
+    let lost = es
+        .iter()
+        .find(|e| e.entry_id == 500 && e.is_deleted())
+        .expect("lost.txt deleted entry");
+    assert!(lost.path.contains("$ORPHANED"));
+    // empty.bin: size but no extents → Unrecoverable.
+    let empty = es
+        .iter()
+        .find(|e| e.entry_id == 501 && e.is_deleted())
+        .expect("empty.bin deleted entry");
+    match empty.status {
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unrecoverable,
+        } => {}
+        other => panic!("expected Unrecoverable, got {other:?}"),
+    }
+}
+
+#[test]
+fn directory_read_rejected() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    let docs = entries(fs.as_ref())
+        .into_iter()
+        .find(|e| e.path == "/docs")
+        .unwrap();
+    assert!(fs.read_file(&docs).is_err());
+}
+
+#[test]
+fn all_checkpoints_corrupt_fails_mount() {
+    let mut img = common::build_image(false);
+    common::corrupt_block(&mut img, 15); // container omap @xid2
+    common::corrupt_block(&mut img, 9); // container omap @xid1
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(ApfsParser.mount(src).is_err());
+}
+
+#[test]
+fn noncontiguous_descriptor_area_rejected() {
+    let mut img = common::build_image(false);
+    // High bit of nx_xp_desc_blocks = descriptor B-tree, unsupported.
+    img[104..108].copy_from_slice(&0x8000_0008u32.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(ApfsParser.mount(src).is_err());
+}
+
+#[test]
+fn corrupt_volume_superblock_rolls_back_checkpoint() {
+    let mut img = common::build_image(false);
+    common::corrupt_block(&mut img, 17); // apsb @xid2
+    let fs = mount(img);
+    // xid2 can't load its volume → fall back to the xid-1 generation, with
+    // the failure surfaced as a walk-stream warning.
+    assert_eq!(fs.info().meta["checkpoint_xid"], "1");
+    let mut warned = false;
+    let es: Vec<_> = fs
+        .walk()
+        .filter_map(|r| match r {
+            Ok(e) => Some(e),
+            Err(_) => {
+                warned = true;
+                None
+            }
+        })
+        .collect();
+    assert!(warned, "rollback must surface the xid-2 failure");
+    assert!(es.iter().any(|e| e.path == "/old.txt" && !e.is_deleted()));
+}
+
+#[test]
+fn all_volumes_corrupt_fails_mount() {
+    let mut img = common::build_image(false);
+    common::corrupt_block(&mut img, 17); // apsb @xid2
+    common::corrupt_block(&mut img, 11); // apsb @xid1
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(ApfsParser.mount(src).is_err());
+}
+
+#[test]
+fn checkpoint_map_count_clamped_to_block() {
+    let mut img = common::build_image(false);
+    // Absurd cpm_count in the xid-2 checkpoint map; entries past the block
+    // end are ignored — mount still succeeds.
+    img[4 * 4096 + 36..4 * 4096 + 40].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    common::seal(&mut img[4 * 4096..5 * 4096]);
+    let fs = mount(img);
+    assert_eq!(fs.info().meta["checkpoint_xid"], "2");
+}
+
+#[test]
+fn sealed_volume_flag_reported() {
+    let mut img = common::build_image(false);
+    // apfs_incompatible_features @apsb+56: add SEALED_VOLUME (0x20).
+    let off = 17 * 4096 + 56;
+    let mut v = u64::from_le_bytes(img[off..off + 8].try_into().unwrap());
+    v |= 0x20;
+    img[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    common::seal(&mut img[17 * 4096..18 * 4096]);
+    let fs = mount(img);
+    assert_eq!(fs.info().meta["sealed"], "true");
+}
+
+#[test]
+fn hardlink_broken_parent_orphaned() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    let a4 = entries(fs.as_ref())
+        .into_iter()
+        .find(|e| e.name == "alias4.png")
+        .expect("alias4 entry");
+    assert!(a4.path.contains("$ORPHANED"));
+    assert!(a4.meta["note"].contains("hardlink parent chain"));
+}
+
+#[test]
+fn snapshot_meta_without_name_record() {
+    // A snap-meta record whose xid has no SNAP_NAME record still yields a
+    // report entry (unnamed snapshot).
+    assert_eq!(
+        mount(common::build_image(false)).info().meta["snapshot_count"],
+        "2"
+    );
+}
+
+#[test]
+fn read_file_unknown_entry_uses_ranges_fallback() {
+    let img = common::build_image(false);
+    let fs = mount(img);
+    // Fabricated entry not present in the record tables → reader falls back
+    // to treating allocated_ranges as a contiguous stream.
+    let fake = sutram_fs::FsEntry {
+        path: "/fake".into(),
+        name: "fake".into(),
+        entry_id: 0x00FF_FFFF,
+        kind: EntryKind::File,
+        size: 8,
+        disk_offset: 0,
+        allocated_ranges: vec![(32 * 4096, 4096)],
+        timestamps: Default::default(),
+        status: FsEntryStatus::Live,
+        meta: Default::default(),
+        magic: None,
+    };
+    let mut head = [0u8; 8];
+    fs.read_file(&fake).unwrap().read_exact(&mut head).unwrap();
+    assert_eq!(&head, b"PNGDATA2");
 }

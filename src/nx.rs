@@ -258,7 +258,10 @@ pub(crate) struct CheckpointScan {
 /// their entries to the checkpoint matching their `o_xid`. Invalid blocks are
 /// recorded in `malformed_slots` and skipped — a torn checkpoint must not
 /// become the mount target.
-pub(crate) fn scan_checkpoints(src: &dyn ByteSource, label: &NxSuperblock) -> Result<CheckpointScan> {
+pub(crate) fn scan_checkpoints(
+    src: &dyn ByteSource,
+    label: &NxSuperblock,
+) -> Result<CheckpointScan> {
     if !label.xp_desc_contiguous {
         // Caller handles this earlier (Unsupported) — belt & braces.
         return Ok(CheckpointScan {
@@ -268,8 +271,13 @@ pub(crate) fn scan_checkpoints(src: &dyn ByteSource, label: &NxSuperblock) -> Re
     }
     let bs = label.block_size as u64;
     let dev_blocks = src.len() / bs;
-    let n = (label.xp_desc_blocks as u64).min(dev_blocks).min(MAX_DESC_BLOCKS);
     let base = label.xp_desc_base;
+    // The area is bounded by what actually exists on the device: a corrupt
+    // `nx_xp_desc_base`/`nx_xp_desc_blocks` pair must not extend the scan
+    // past the image tail.
+    let n = (label.xp_desc_blocks as u64)
+        .min(dev_blocks.saturating_sub(base))
+        .min(MAX_DESC_BLOCKS);
 
     let mut supers: Vec<(u64, NxSuperblock)> = Vec::new(); // (slot, nxsb)
     let mut maps: Vec<(u64, u64, Vec<CpMapEntry>)> = Vec::new(); // (slot, xid, entries)
@@ -360,9 +368,7 @@ pub(crate) fn detect(src: &dyn ByteSource) -> DetectConfidence {
     if let Ok(block) = src.read_slice(0, bs as usize) {
         if block.len() == bs as usize && checksum::verify(&block) {
             if let Ok(hdr) = ObjHdr::parse(&block, 0, false) {
-                if hdr.type_code() == otype::NX_SUPERBLOCK
-                    && hdr.storage() == Storage::Ephemeral
-                {
+                if hdr.type_code() == otype::NX_SUPERBLOCK && hdr.storage() == Storage::Ephemeral {
                     return DetectConfidence::Certain;
                 }
                 if hdr.type_code() == otype::NX_SUPERBLOCK {

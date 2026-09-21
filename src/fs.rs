@@ -24,7 +24,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntry, FsError, FsInfo, FsParser, FileSystem, MountOptions,
+    DetectConfidence, EntryKind, FileSystem, FsEntry, FsError, FsInfo, FsParser, MountOptions,
     Result,
 };
 use sutram_io::ByteSource;
@@ -32,9 +32,7 @@ use sutram_io::ByteSource;
 use crate::apsb::Apsb;
 use crate::btree::{BtreeNode, MAX_TREE_DEPTH};
 use crate::checksum;
-use crate::jrec::{
-    self, DrecRec, ExtentRec, SiblingLinkRec, SnapMetaRec, SplitRecords, XattrRec,
-};
+use crate::jrec::{self, DrecRec, ExtentRec, SiblingLinkRec, SnapMetaRec, SplitRecords, XattrRec};
 use crate::nx::{self, Checkpoint, CheckpointScan, NxSuperblock};
 use crate::object::{otype, Storage};
 use crate::omap::{OmapIndex, OmapPhys, OMAP_KV_SIZE};
@@ -89,7 +87,7 @@ pub struct VolumeInfo {
 }
 
 /// How an internal B-tree node's 8-byte child references are resolved.
-enum ChildResolver<'a> {
+pub(crate) enum ChildResolver<'a> {
     /// `BTREE_PHYSICAL`: the value *is* the child's block number.
     Physical,
     /// `BTREE_EPHEMERAL`: the value is an oid resolved via the checkpoint map.
@@ -99,15 +97,16 @@ enum ChildResolver<'a> {
 }
 
 impl ChildResolver<'_> {
-    fn resolve(&self, child: u64) -> Result<u64> {
+    pub(crate) fn resolve(&self, child: u64) -> Result<u64> {
         match self {
             ChildResolver::Physical => Ok(child),
-            ChildResolver::Ephemeral(cp) => cp
-                .lookup(child)
-                .map(|(p, _)| p)
-                .ok_or_else(|| FsError::NotFound {
-                    path: format!("ephemeral oid {child:#x} not in checkpoint map"),
-                }),
+            ChildResolver::Ephemeral(cp) => {
+                cp.lookup(child)
+                    .map(|(p, _)| p)
+                    .ok_or_else(|| FsError::NotFound {
+                        path: format!("ephemeral oid {child:#x} not in checkpoint map"),
+                    })
+            }
             ChildResolver::Virtual(omap, bound) => omap
                 .lookup(child, *bound)
                 .map(|e| e.paddr)
@@ -139,7 +138,7 @@ pub(crate) struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(src: &'a dyn ByteSource, block_size: u32) -> Self {
+    pub(crate) fn new(src: &'a dyn ByteSource, block_size: u32) -> Self {
         Ctx {
             src,
             block_size,
@@ -187,7 +186,7 @@ type LeafRecords = Vec<(u64, Vec<u8>, Vec<u8>)>;
 /// encrypted or multi-block nodes) become `ctx.warnings`, not aborts.
 ///
 /// Loop safety: visited set on paddrs + depth cap.
-fn collect_tree(
+pub(crate) fn collect_tree(
     ctx: &mut Ctx,
     root_paddr: u64,
     resolve: &ChildResolver,
@@ -206,10 +205,8 @@ fn collect_tree(
         let node = BtreeNode::parse(&block, paddr * ctx.block_size as u64)?;
         let off = node.disk_offset;
         if depth == 0 && !node.is_root() {
-            ctx.warnings.push(FsError::corrupt(
-                off,
-                "btree root node lacks BTNODE_ROOT",
-            ));
+            ctx.warnings
+                .push(FsError::corrupt(off, "btree root node lacks BTNODE_ROOT"));
         }
         if expect_subtype != 0 && node.hdr.osubtype != 0 && node.hdr.osubtype != expect_subtype {
             ctx.warnings.push(FsError::corrupt(
@@ -249,7 +246,10 @@ fn collect_tree(
                 if expected != 0 && info.flags & expected == 0 {
                     ctx.warnings.push(FsError::corrupt(
                         off,
-                        format!("btree_info flags {:#x} miss expected storage bit", info.flags),
+                        format!(
+                            "btree_info flags {:#x} miss expected storage bit",
+                            info.flags
+                        ),
                     ));
                 }
                 root_info = Some(info);
@@ -288,7 +288,7 @@ fn load_omap_tree(
             Ok(e) => {
                 if e.flags & crate::omap::OMAP_VAL_ENCRYPTED != 0 {
                     ctx.warnings.push(FsError::corrupt(
-                        e.paddr * ctx.block_size as u64,
+                        e.paddr.saturating_mul(ctx.block_size as u64),
                         format!("omap entry for oid {:#x} is OMAP_VAL_ENCRYPTED", e.oid),
                     ));
                 }
@@ -442,7 +442,7 @@ impl ApfsFs {
             .collect();
         if candidates.is_empty() {
             return Err(FsError::corrupt(
-                label.xp_desc_base * block_size as u64,
+                label.xp_desc_base.saturating_mul(block_size as u64),
                 "no valid checkpoint in the descriptor area",
             ));
         }
@@ -477,9 +477,10 @@ impl ApfsFs {
         let fs = match mounted {
             Some(v) => v,
             None => {
-                return Err(errors.into_iter().next().unwrap_or_else(|| {
-                    FsError::corrupt(0, "no mountable checkpoint")
-                }))
+                return Err(errors
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| FsError::corrupt(0, "no mountable checkpoint")))
             }
         };
         if let Ok(mut w) = fs.warnings.lock() {
@@ -509,19 +510,32 @@ impl ApfsFs {
         // Mark the checkpoint infrastructure itself allocated: the whole
         // descriptor ring is reserved even where slots are unused. The data
         // area is NOT marked wholesale — its unreferenced blocks are the
-        // free/carving space reported by `unallocated_ranges`.
-        for i in 0..nx.xp_desc_blocks as u64 {
-            ctx.used.insert(nx.xp_desc_base + i);
+        // free/carving space reported by `unallocated_ranges`. All claims
+        // are clamped to the container block count — hostile sizes must not
+        // wrap or loop for ~2^32 iterations.
+        let desc_end = nx
+            .xp_desc_base
+            .saturating_add(nx.xp_desc_blocks as u64)
+            .min(nx.block_count);
+        for b in nx.xp_desc_base..desc_end {
+            ctx.used.insert(b);
         }
         for e in &cp.map {
-            let blocks = (e.size as u64).max(nx.block_size as u64) / nx.block_size as u64;
-            for b in 0..blocks.max(1) {
-                ctx.used.insert(e.paddr + b);
+            let blocks = (e.size as u64)
+                .max(nx.block_size as u64)
+                .div_ceil(nx.block_size as u64);
+            let end = e.paddr.saturating_add(blocks).min(nx.block_count);
+            for b in e.paddr..end {
+                ctx.used.insert(b);
             }
         }
         if nx.keybag_blocks > 0 {
-            for b in 0..nx.keybag_blocks {
-                ctx.used.insert(nx.keybag_base + b);
+            let end = nx
+                .keybag_base
+                .saturating_add(nx.keybag_blocks)
+                .min(nx.block_count);
+            for b in nx.keybag_base..end {
+                ctx.used.insert(b);
             }
         }
         ctx.used.insert(0);
@@ -538,8 +552,10 @@ impl ApfsFs {
                 .flatten()
                 .filter(|e| e.xid <= bound)
             {
-                for b in 0..(e.size as u64).max(bs).div_ceil(bs) {
-                    ctx.used.insert(e.paddr + b);
+                let blocks = (e.size as u64).max(bs).div_ceil(bs);
+                let end = e.paddr.saturating_add(blocks).min(nx.block_count);
+                for b in e.paddr..end {
+                    ctx.used.insert(b);
                 }
             }
         }
@@ -596,12 +612,9 @@ impl ApfsFs {
 
         // ---- volume object map (physical tree) --------------------------
         let vol_omap_phys_block = ctx.read_object(apsb.omap_oid)?;
-        let vol_omap = OmapPhys::parse(&vol_omap_phys_block, apsb.omap_oid * ctx.block_size as u64)?;
-        let vol_omap_idx = load_omap_tree(
-            &mut ctx,
-            vol_omap.tree_oid,
-            &ChildResolver::Physical,
-        )?;
+        let vol_omap =
+            OmapPhys::parse(&vol_omap_phys_block, apsb.omap_oid * ctx.block_size as u64)?;
+        let vol_omap_idx = load_omap_tree(&mut ctx, vol_omap.tree_oid, &ChildResolver::Physical)?;
 
         // ---- file-system tree (virtual tree via the volume omap) --------
         let root = vol_omap_idx
@@ -678,12 +691,14 @@ impl ApfsFs {
         // ---- live file extents + physical-extent records are claimed ------
         for list in recs.extents.values() {
             for ex in list {
-                claim_extent(&mut ctx.used, ex, nx.block_size as u64);
+                claim_extent(&mut ctx.used, ex, nx.block_size as u64, nx.block_count);
             }
         }
         for &(oid, len) in &recs.phys_extents {
-            for b in 0..len.div_ceil(nx.block_size as u64).max(1) {
-                ctx.used.insert(oid + b);
+            let blocks = len.div_ceil(nx.block_size as u64).max(1);
+            let end = oid.saturating_add(blocks).min(nx.block_count);
+            for b in oid..end {
+                ctx.used.insert(b);
             }
         }
 
@@ -807,12 +822,7 @@ impl ApfsFs {
 
     /// Resolve a volume superblock oid through the container omap and parse
     /// the `apfs_superblock_t` it points at.
-    fn load_apsb(
-        ctx: &mut Ctx,
-        omap: &OmapIndex,
-        fs_oid: u64,
-        bound: u64,
-    ) -> Result<Option<Apsb>> {
+    fn load_apsb(ctx: &mut Ctx, omap: &OmapIndex, fs_oid: u64, bound: u64) -> Result<Option<Apsb>> {
         let Some(e) = omap.lookup(fs_oid, bound) else {
             return Ok(None);
         };
@@ -885,19 +895,18 @@ impl ApfsFs {
     fn free_ranges(&self) -> Vec<(u64, u64)> {
         let bs = self.nx.block_size as u64;
         let total = self.block_count.min(self.src.len() / bs);
+        // Gap iteration over the sorted live set — O(live) rather than a
+        // per-block scan of the whole container.
         let mut out = Vec::new();
-        let mut run_start: Option<u64> = None;
-        for b in 0..total {
-            if self.live_blocks.contains(&b) {
-                if let Some(s) = run_start.take() {
-                    out.push((s * bs, (b - s) * bs));
-                }
-            } else if run_start.is_none() {
-                run_start = Some(b);
+        let mut next_free = 0u64;
+        for &b in self.live_blocks.range(..total) {
+            if b > next_free {
+                out.push((next_free * bs, (b - next_free) * bs));
             }
+            next_free = b + 1;
         }
-        if let Some(s) = run_start {
-            out.push((s * bs, (total - s) * bs));
+        if next_free < total {
+            out.push((next_free * bs, (total - next_free) * bs));
         }
         out
     }
@@ -938,36 +947,9 @@ impl ApfsFs {
                 notes,
             );
         }
-        let mut surviving: Vec<(u64, u64)> = Vec::new();
-        let mut lost_blocks = 0u64;
-        let mut total_blocks = 0u64;
-        let mut exts: Vec<&ExtentRec> = extents.iter().collect();
-        exts.sort_by_key(|e| e.logical_addr);
-        for ex in exts {
-            let nblocks = ex.len.div_ceil(bs).max(1);
-            total_blocks += nblocks;
-            // Per-block granularity: a block either survives or was claimed.
-            let mut run: Option<(u64, u64)> = None; // (start_off, len)
-            for i in 0..nblocks {
-                let blk = ex.phys_block + i;
-                let blk_off = blk * bs;
-                let blk_len = bs.min(ex.len - i * bs);
-                if self.live_blocks.contains(&blk) {
-                    lost_blocks += 1;
-                    if let Some((o, l)) = run.take() {
-                        surviving.push((o, l));
-                    }
-                } else {
-                    match &mut run {
-                        Some((_, l)) => *l += blk_len,
-                        slot => *slot = Some((blk_off, blk_len)),
-                    }
-                }
-            }
-            if let Some((o, l)) = run.take() {
-                surviving.push((o, l));
-            }
-        }
+        let (spans, lost_blocks, total_blocks) =
+            surviving_spans(&self.live_blocks, self.image_blocks(), bs, extents);
+        let surviving: Vec<(u64, u64)> = spans.iter().map(|(_, o, l)| (*o, *l)).collect();
         let recovered_bytes: u64 = surviving.iter().map(|(_, l)| *l).sum::<u64>().min(size);
         if lost_blocks > 0 {
             notes.push(format!(
@@ -986,21 +968,112 @@ impl ApfsFs {
         };
         (state, surviving, notes)
     }
+
+    /// Number of blocks that exist on the source (min of the container
+    /// claim and the actual image length).
+    pub(crate) fn image_blocks(&self) -> u64 {
+        let bs = self.nx.block_size as u64;
+        self.block_count.min(self.src.len() / bs)
+    }
+
+    /// `(logical_off, disk_off, len)` spans backing `entry`'s data, for
+    /// `read_file`. Live files resolve through `private_id` → file extents;
+    /// deleted entries through their old-generation extents filtered by the
+    /// live-block map. Gaps between spans read as zeros (sparse files).
+    fn read_spans(&self, entry: &FsEntry) -> Vec<(u64, u64, u64)> {
+        let bs = self.nx.block_size as u64;
+        if let Some((_, iv)) = self.view.recs.inodes.get(&entry.entry_id) {
+            let mut exts: Vec<&ExtentRec> = self
+                .view
+                .recs
+                .extents
+                .get(&iv.private_id)
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+            exts.sort_by_key(|e| e.logical_addr);
+            return exts
+                .iter()
+                .map(|e| (e.logical_addr, e.phys_block.saturating_mul(bs), e.len))
+                .collect();
+        }
+        if let Some(d) = self.deleted.iter().find(|d| d.oid == entry.entry_id) {
+            return surviving_spans(&self.live_blocks, self.image_blocks(), bs, &d.extents).0;
+        }
+        // Unknown entry — fall back to treating allocated_ranges as a
+        // contiguous stream.
+        let mut pos = 0u64;
+        entry
+            .allocated_ranges
+            .iter()
+            .map(|&(o, l)| {
+                let s = (pos, o, l);
+                pos += l;
+                s
+            })
+            .collect()
+    }
 }
 
-/// Claim the blocks of a file extent as live-allocated.
-fn claim_extent(used: &mut BTreeSet<u64>, ex: &ExtentRec, bs: u64) {
+/// Per-block filtered extents → `(logical_off, disk_off, len)` spans of the
+/// blocks NOT claimed by the live object graph, plus `(lost, total)` block
+/// counts. Spans carry the logical offset so readers can place holes
+/// correctly. Blocks beyond the image count as lost (they can't be read
+/// back); a hostile 56-bit length is bounded by the container size.
+fn surviving_spans(
+    live: &BTreeSet<u64>,
+    image_blocks: u64,
+    bs: u64,
+    extents: &[ExtentRec],
+) -> (Vec<(u64, u64, u64)>, u64, u64) {
+    let mut spans = Vec::new();
+    let mut lost = 0u64;
+    let mut total = 0u64;
+    let mut exts: Vec<&ExtentRec> = extents.iter().collect();
+    exts.sort_by_key(|e| e.logical_addr);
+    for ex in exts {
+        let nblocks = ex.len.div_ceil(bs).max(1);
+        total = total.saturating_add(nblocks);
+        let in_image = image_blocks.saturating_sub(ex.phys_block).min(nblocks);
+        lost = lost.saturating_add(nblocks - in_image);
+        // Per-block granularity: a block either survives or was claimed.
+        let mut run: Option<(u64, u64, u64)> = None; // (logical, off, len)
+        for i in 0..in_image {
+            let blk = ex.phys_block + i;
+            let blk_len = bs.min(ex.len - i * bs);
+            if live.contains(&blk) {
+                lost += 1;
+                if let Some(r) = run.take() {
+                    spans.push(r);
+                }
+            } else {
+                match &mut run {
+                    Some((_, _, l)) => *l += blk_len,
+                    slot => {
+                        *slot = Some((ex.logical_addr.saturating_add(i * bs), blk * bs, blk_len))
+                    }
+                }
+            }
+        }
+        if let Some(r) = run.take() {
+            spans.push(r);
+        }
+    }
+    (spans, lost, total)
+}
+
+/// Claim the blocks of a file extent as live-allocated. The block span is
+/// clamped to the container so a corrupt extent can't wrap `phys_block` or
+/// loop for ~2^56 iterations.
+fn claim_extent(used: &mut BTreeSet<u64>, ex: &ExtentRec, bs: u64, block_count: u64) {
     let n = ex.len.div_ceil(bs).max(1);
-    for i in 0..n {
-        used.insert(ex.phys_block + i);
+    let end = ex.phys_block.saturating_add(n).min(block_count);
+    for b in ex.phys_block..end {
+        used.insert(b);
     }
 }
 
 /// Decode all leaf `(key_off, key, val)` triples into typed records.
-fn decode_leafs(
-    leafs: LeafRecords,
-    hashed: Option<bool>,
-) -> (SplitRecords, Vec<FsError>) {
+fn decode_leafs(leafs: LeafRecords, hashed: Option<bool>) -> (SplitRecords, Vec<FsError>) {
     let mut errs = Vec::new();
     let mut split = SplitRecords::default();
     for (off, k, v) in leafs {
@@ -1117,10 +1190,7 @@ fn pending_records(s: &mut SplitRecords, off: u64, rec: jrec::JRecord) {
 
 /// Merge SNAP_NAME records (fs tree) with snap-metadata records (snap-meta
 /// tree) into per-snapshot report entries.
-fn merge_snapshots(
-    names: &[(u64, String, u64)],
-    meta: &[SnapMetaRec],
-) -> Vec<SnapshotInfo> {
+fn merge_snapshots(names: &[(u64, String, u64)], meta: &[SnapMetaRec]) -> Vec<SnapshotInfo> {
     let mut by_xid: HashMap<u64, SnapshotInfo> = HashMap::new();
     for (off, name, xid) in names {
         let e = by_xid.entry(*xid).or_insert_with(|| SnapshotInfo {
@@ -1195,25 +1265,46 @@ impl FileSystem for ApfsFs {
         let mut meta = HashMap::new();
         meta.insert("container_uuid".into(), self.nx.uuid.clone());
         meta.insert("checkpoint_xid".into(), self.checkpoint_xid.to_string());
-        meta.insert("checkpoints_found".into(), self.checkpoints_found.to_string());
+        meta.insert(
+            "checkpoints_found".into(),
+            self.checkpoints_found.to_string(),
+        );
         meta.insert(
             "block0_checksum_ok".into(),
             self.block0_checksum_ok.to_string(),
         );
         meta.insert("volume_index".into(), self.volume_index.to_string());
         meta.insert("volume_count".into(), self.volumes.len().to_string());
-        meta.insert("volume_oid".into(), format!("{:#x}", self.nx.fs_oids.get(self.volume_index).copied().unwrap_or(0)));
+        meta.insert(
+            "volume_oid".into(),
+            format!(
+                "{:#x}",
+                self.nx.fs_oids.get(self.volume_index).copied().unwrap_or(0)
+            ),
+        );
         meta.insert("apsb_xid".into(), apsb.hdr.xid.to_string());
         meta.insert("apsb_fs_index".into(), apsb.fs_index.to_string());
         meta.insert("apsb_alloc_count".into(), apsb.alloc_count.to_string());
         meta.insert("apsb_unmount_time".into(), apsb.unmount_time.to_string());
         meta.insert("apsb_last_mod_time".into(), apsb.last_mod_time.to_string());
         meta.insert("apsb_num_other".into(), apsb.num_other.to_string());
-        meta.insert("root_tree_type".into(), format!("{:#x}", apsb.root_tree_type));
-        meta.insert("snap_meta_tree_oid".into(), format!("{:#x}", apsb.snap_meta_tree_oid));
-        meta.insert("meta_crypto_present".into(), apsb.meta_crypto_nonzero.to_string());
+        meta.insert(
+            "root_tree_type".into(),
+            format!("{:#x}", apsb.root_tree_type),
+        );
+        meta.insert(
+            "snap_meta_tree_oid".into(),
+            format!("{:#x}", apsb.snap_meta_tree_oid),
+        );
+        meta.insert(
+            "meta_crypto_present".into(),
+            apsb.meta_crypto_nonzero.to_string(),
+        );
         meta.insert("apsb_off".into(), format!("{:#x}", apsb.disk_offset));
-        meta.insert("nx_max_file_systems".into(), self.nx.max_file_systems.to_string());
+        meta.insert(
+            "nx_max_file_systems".into(),
+            self.nx.max_file_systems.to_string(),
+        );
         meta.insert("nx_data_base".into(), self.nx.xp_data_base.to_string());
         meta.insert("nx_data_blocks".into(), self.nx.xp_data_blocks.to_string());
         meta.insert("features".into(), format!("{:#x}", apsb.features));
@@ -1249,7 +1340,10 @@ impl FileSystem for ApfsFs {
             meta.insert("fstree_node_count".into(), info.node_count.to_string());
         }
         if let Some(sm) = &self.spaceman {
-            meta.insert("sm_blocks_per_chunk".into(), sm.blocks_per_chunk.to_string());
+            meta.insert(
+                "sm_blocks_per_chunk".into(),
+                sm.blocks_per_chunk.to_string(),
+            );
             meta.insert("sm_chunks_per_cib".into(), sm.chunks_per_cib.to_string());
             meta.insert("sm_cibs_per_cab".into(), sm.cibs_per_cab.to_string());
             meta.insert("sm_flags".into(), format!("{:#x}", sm.flags));
@@ -1276,16 +1370,16 @@ impl FileSystem for ApfsFs {
         meta.insert("num_directories".into(), apsb.num_directories.to_string());
         meta.insert("num_symlinks".into(), apsb.num_symlinks.to_string());
         meta.insert("root_tree_oid".into(), format!("{:#x}", apsb.root_tree_oid));
-        meta.insert("extentref_tree_oid".into(), format!("{:#x}", apsb.extentref_tree_oid));
+        meta.insert(
+            "extentref_tree_oid".into(),
+            format!("{:#x}", apsb.extentref_tree_oid),
+        );
         if self.xid_bound != u64::MAX {
             meta.insert("snapshot_view_xid".into(), self.xid_bound.to_string());
         }
         meta.insert("sealed".into(), self.sealed.to_string());
         meta.insert("encrypted".into(), self.encrypted.to_string());
-        meta.insert(
-            "deleted_recovered".into(),
-            self.deleted.len().to_string(),
-        );
+        meta.insert("deleted_recovered".into(), self.deleted.len().to_string());
         if !self.malformed_desc_slots.is_empty() {
             meta.insert(
                 "malformed_desc_slots".into(),
@@ -1315,17 +1409,14 @@ impl FileSystem for ApfsFs {
             uuid: Some(apsb.uuid.clone()),
             block_size: self.nx.block_size as u64,
             total_blocks: self.block_count,
-            free_blocks: self
-                .spaceman
-                .map(|s| s.dev_free_count)
-                .or_else(|| {
-                    Some(
-                        self.free_ranges()
-                            .iter()
-                            .map(|(_, l)| l / self.nx.block_size as u64)
-                            .sum(),
-                    )
-                }),
+            free_blocks: self.spaceman.map(|s| s.dev_free_count).or_else(|| {
+                Some(
+                    self.free_ranges()
+                        .iter()
+                        .map(|(_, l)| l / self.nx.block_size as u64)
+                        .sum(),
+                )
+            }),
             total_nodes: Some(self.view.recs.inodes.len() as u64),
             meta,
         }
@@ -1352,10 +1443,10 @@ impl FileSystem for ApfsFs {
         // never decrypted. Files with no readable extents read as empty.
         Ok(Box::new(ExtentReader {
             src: self.src.clone(),
-            ranges: entry.allocated_ranges.clone(),
+            spans: self.read_spans(entry),
             idx: 0,
-            off_in: 0,
-            remaining: entry.size,
+            pos: 0,
+            size: entry.size,
         }))
     }
 
@@ -1367,34 +1458,59 @@ impl FileSystem for ApfsFs {
     }
 }
 
-/// Sequential reader over byte extents, capped at `remaining` logical bytes.
+/// Sequential reader over `(logical_off, disk_off, len)` spans. Gaps
+/// between spans — and any tail of `size` past the last span — yield zeros
+/// (sparse extents / holes), not the next span's bytes.
 pub(crate) struct ExtentReader {
     src: Arc<dyn ByteSource>,
-    ranges: Vec<(u64, u64)>,
+    spans: Vec<(u64, u64, u64)>,
     idx: usize,
-    off_in: u64,
-    remaining: u64,
+    /// Logical position within the file.
+    pos: u64,
+    /// File size: bytes beyond it are EOF.
+    size: u64,
+}
+
+impl ExtentReader {
+    fn zeros(&mut self, buf: &mut [u8], n: u64) -> std::io::Result<usize> {
+        buf[..n as usize].fill(0);
+        self.pos += n;
+        Ok(n as usize)
+    }
 }
 
 impl Read for ExtentReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        while self.remaining > 0 && self.idx < self.ranges.len() {
-            let (off, len) = self.ranges[self.idx];
-            let avail = len - self.off_in;
-            if avail == 0 {
+        if buf.is_empty() || self.pos >= self.size {
+            return Ok(0);
+        }
+        let remaining = self.size - self.pos;
+        while self.idx < self.spans.len() {
+            let (logical, disk, len) = self.spans[self.idx];
+            let end = logical.saturating_add(len);
+            if self.pos >= end {
                 self.idx += 1;
-                self.off_in = 0;
                 continue;
             }
-            let want = buf.len().min(avail.min(self.remaining) as usize);
-            let n = self.src.read_at(off + self.off_in, &mut buf[..want])?;
-            self.off_in += n as u64;
-            self.remaining -= n as u64;
+            if self.pos < logical {
+                // Sparse gap before the next extent → zeros.
+                let gap = (logical - self.pos).min(remaining).min(buf.len() as u64);
+                return self.zeros(buf, gap);
+            }
+            let within = self.pos - logical;
+            let avail = len - within;
+            let want = buf.len().min(avail.min(remaining) as usize);
+            let n = self
+                .src
+                .read_at(disk.saturating_add(within), &mut buf[..want])?;
+            self.pos += n as u64;
             if n == 0 {
                 break;
             }
             return Ok(n);
         }
-        Ok(0)
+        // Past the last span: the rest of the file is a hole.
+        let gap = remaining.min(buf.len() as u64);
+        self.zeros(buf, gap)
     }
 }

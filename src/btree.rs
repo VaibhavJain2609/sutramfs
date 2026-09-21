@@ -226,11 +226,7 @@ impl<'a> BtreeNode<'a> {
     /// provenance anchor for records. `fixed` supplies `(klen, vlen)` used
     /// for `kvoff_t` nodes when this node has no footer (non-root nodes in a
     /// fixed-KV tree).
-    pub(crate) fn entry_at(
-        &self,
-        i: u32,
-        fixed: (u16, u16),
-    ) -> Result<(u64, &'a [u8], &'a [u8])> {
+    pub(crate) fn entry_at(&self, i: u32, fixed: (u16, u16)) -> Result<(u64, &'a [u8], &'a [u8])> {
         let (koff, klen, voff, vlen) = self.toc_entry(i, fixed)?;
         let kstart = self
             .keys_start
@@ -251,15 +247,12 @@ impl<'a> BtreeNode<'a> {
             &[] // ghost entry — key with no value
         } else {
             // v.off counts backward from vals_end to the *start* of the value.
-            let vstart = self
-                .vals_end
-                .checked_sub(voff as usize)
-                .ok_or_else(|| {
-                    FsError::corrupt(self.disk_offset, "btree value offset underflow")
-                })?;
-            let vend = vstart.checked_add(vlen as usize).ok_or_else(|| {
-                FsError::corrupt(self.disk_offset, "btree value length overflow")
+            let vstart = self.vals_end.checked_sub(voff as usize).ok_or_else(|| {
+                FsError::corrupt(self.disk_offset, "btree value offset underflow")
             })?;
+            let vend = vstart
+                .checked_add(vlen as usize)
+                .ok_or_else(|| FsError::corrupt(self.disk_offset, "btree value length overflow"))?;
             if vstart < self.keys_start || vend > self.vals_end {
                 return Err(FsError::corrupt(
                     self.disk_offset + vstart as u64,
@@ -313,7 +306,7 @@ impl<'a> BtreeNode<'a> {
             .vals_end
             .checked_sub(voff as usize)
             .ok_or_else(|| FsError::corrupt(self.disk_offset, "btree child offset underflow"))?;
-        let vend = vstart.checked_add(vlen).unwrap_or(usize::MAX);
+        let vend = vstart.saturating_add(vlen);
         if vend > self.vals_end {
             return Err(FsError::corrupt(
                 self.disk_offset + vstart as u64,
