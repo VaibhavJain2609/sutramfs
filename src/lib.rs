@@ -24,5 +24,6 @@ pub mod common;
 pub mod lnk;
 pub mod plist;
 pub mod recycle;
+pub mod reg;
 
 pub use common::{ArtifactTimestamp as FsTimestamp, Error, Result};
