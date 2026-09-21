@@ -102,15 +102,15 @@ fn sparse_detect_and_decode() {
 
 #[test]
 fn sparse_truncated_data_extent() {
-    // RAW chunk declares 2 blocks but the file ends after one.
+    // RAW chunk declares 2 blocks but the file ends after one. Lenient
+    // contract (sutram-io): the missing tail zero-fills rather than erroring
+    // or leaking the following chunk's bytes.
     let data = vec![0xAB; 4096];
     let mut img = sparse_image(&[(0xCAC1, 2, &data)]);
     img.truncate(28 + 12 + 4096);
-    let err = match open_sparse(src(img)) {
-        Err(e) => e,
-        Ok(_) => panic!("expected Truncated"),
-    };
-    assert!(matches!(err, sutram_fs::FsError::Truncated { .. }));
+    let sf = open_sparse(src(img)).unwrap();
+    assert_eq!(sf.read_slice(0, 4).unwrap(), &[0xAB; 4]);
+    assert_eq!(sf.read_slice(4096, 4).unwrap(), &[0; 4]);
 }
 
 #[test]
