@@ -43,19 +43,28 @@ fn entries(img: Vec<u8>) -> Vec<FsEntry> {
 }
 
 fn find<'a>(es: &'a [FsEntry], path: &str) -> &'a FsEntry {
-    es.iter()
-        .find(|e| e.path == path)
-        .unwrap_or_else(|| panic!("{path} not found; got {:?}", es.iter().map(|e| &e.path).collect::<Vec<_>>()))
+    es.iter().find(|e| e.path == path).unwrap_or_else(|| {
+        panic!(
+            "{path} not found; got {:?}",
+            es.iter().map(|e| &e.path).collect::<Vec<_>>()
+        )
+    })
 }
 
 #[test]
 fn detects_clean_zip() {
-    assert_eq!(ZipParser.detect(src(clean_zip()).as_ref()), DetectConfidence::Certain);
+    assert_eq!(
+        ZipParser.detect(src(clean_zip()).as_ref()),
+        DetectConfidence::Certain
+    );
 }
 
 #[test]
 fn rejects_garbage() {
-    assert_eq!(ZipParser.detect(&vec![0u8; 4096].as_slice()), DetectConfidence::None);
+    assert_eq!(
+        ZipParser.detect(&vec![0u8; 4096].as_slice()),
+        DetectConfidence::None
+    );
     assert_eq!(
         ZipParser.detect(&b"PK\x99\x99 nonsense".to_vec().as_slice()),
         DetectConfidence::None
@@ -169,7 +178,14 @@ fn dos_timestamp_decodes() {
 #[test]
 fn data_descriptor_member_roundtrips() {
     let mut b = ZipBuilder::new();
-    b.add_member("streamed.txt", b"written before sizes known", METHOD_STORE, FLAG_DD, &[], &[]);
+    b.add_member(
+        "streamed.txt",
+        b"written before sizes known",
+        METHOD_STORE,
+        FLAG_DD,
+        &[],
+        &[],
+    );
     let img = b.finish(b"");
     let es = entries(img);
     let e = find(&es, "/streamed.txt");
@@ -182,10 +198,19 @@ fn data_descriptor_member_roundtrips() {
 #[test]
 fn sfx_stub_members_still_found() {
     let mut b = ZipBuilder::new();
-    b.add_member("payload.exe", b"MZ but not really", METHOD_STORE, 0, &[], &[]);
+    b.add_member(
+        "payload.exe",
+        b"MZ but not really",
+        METHOD_STORE,
+        0,
+        &[],
+        &[],
+    );
     let inner = b.finish(b"");
     // Prepend a stub *without* fixing recorded offsets — the classic SFX.
-    let stub: Vec<u8> = (0..64).map(|i| if i % 2 == 0 { 0x4D } else { 0x5A }).collect();
+    let stub: Vec<u8> = (0..64)
+        .map(|i| if i % 2 == 0 { 0x4D } else { 0x5A })
+        .collect();
     let mut img = stub.clone();
     img.extend_from_slice(&inner);
 
@@ -291,7 +316,14 @@ fn encrypted_member_flagged_and_unreadable() {
     let mut b = ZipBuilder::new();
     // Header lies about encryption (flag only) — data is plaintext bytes;
     // the parser must flag it and refuse reads rather than emit garbage.
-    b.add_member("locked.zip", b"pretend-ciphertext", METHOD_STORE, 0x0001, &[], &[]);
+    b.add_member(
+        "locked.zip",
+        b"pretend-ciphertext",
+        METHOD_STORE,
+        0x0001,
+        &[],
+        &[],
+    );
     let img = b.finish(b"");
     let fs = ZipParser.mount(src(img)).unwrap();
     let es: Vec<FsEntry> = fs.walk().filter_map(|r| r.ok()).collect();

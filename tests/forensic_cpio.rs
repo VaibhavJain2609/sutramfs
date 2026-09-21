@@ -36,9 +36,12 @@ fn entries(img: Vec<u8>) -> Vec<FsEntry> {
 }
 
 fn find<'a>(es: &'a [FsEntry], path: &str) -> &'a FsEntry {
-    es.iter()
-        .find(|e| e.path == path)
-        .unwrap_or_else(|| panic!("{path} not found; got {:?}", es.iter().map(|e| &e.path).collect::<Vec<_>>()))
+    es.iter().find(|e| e.path == path).unwrap_or_else(|| {
+        panic!(
+            "{path} not found; got {:?}",
+            es.iter().map(|e| &e.path).collect::<Vec<_>>()
+        )
+    })
 }
 
 #[test]
@@ -65,7 +68,10 @@ fn detects_all_dialects() {
         CpioParser.detect(&b.finish_bare().as_slice()),
         DetectConfidence::High
     );
-    assert_eq!(CpioParser.detect(&vec![0u8; 256].as_slice()), DetectConfidence::None);
+    assert_eq!(
+        CpioParser.detect(&vec![0u8; 256].as_slice()),
+        DetectConfidence::None
+    );
 }
 
 #[test]
@@ -163,7 +169,9 @@ fn slack_after_trailer_is_carve_candidate() {
         .carve_region(e.allocated_ranges[0].0, e.allocated_ranges[0].1, 1)
         .unwrap()
         .collect();
-    assert!(hits.iter().any(|h| matches!(h, Ok(h) if h.kind == MagicType::Png)));
+    assert!(hits
+        .iter()
+        .any(|h| matches!(h, Ok(h) if h.kind == MagicType::Png)));
 }
 
 #[test]
@@ -174,7 +182,8 @@ fn truncated_member_is_partially_overwritten() {
     let off = {
         let name = "cut.txt";
         let namesize = name.len() + 1;
-        let h = format!(
+        let h =
+            format!(
             "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
             200u64, MODE_FILE, 1000u64, 1000u64, 1u64, MTIME, 4096u64, 3u64, 1u64, 0u64, 0u64,
             namesize as u64, 0u64,
@@ -277,7 +286,15 @@ fn crc_variant_detected() {
 #[test]
 fn magic_verdict_on_member() {
     let mut b = CpioBuilder::new();
-    b.add_newc("pic.png", b"\x89PNG\r\n\x1a\npngdata", MODE_FILE, MTIME, 1, None, 0);
+    b.add_newc(
+        "pic.png",
+        b"\x89PNG\r\n\x1a\npngdata",
+        MODE_FILE,
+        MTIME,
+        1,
+        None,
+        0,
+    );
     b.trailer_newc();
     let es = entries(b.finish_bare());
     assert_eq!(

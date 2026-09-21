@@ -122,7 +122,11 @@ impl CpioBuilder {
         let off = self.buf.len() as u64;
         let ino = self.next_ino();
         let w16 = |v: u16| -> [u8; 2] {
-            if le { v.to_le_bytes() } else { v.to_be_bytes() }
+            if le {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
         };
         // 32-bit fields: most-significant 16-bit word first, each word in
         // the archive byte order (PDP-endian).
@@ -139,8 +143,8 @@ impl CpioBuilder {
             w16((mode & 0xFFFF) as u16),
             w16(1000),
             w16(1000),
-            w16(1),                     // nlink
-            w16(0),                     // rdev
+            w16(1), // nlink
+            w16(0), // rdev
         ] {
             fields.extend_from_slice(&f);
         }

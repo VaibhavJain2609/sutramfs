@@ -77,8 +77,9 @@ is `Unknown` — the bytes are carving ground, not a named member.
   members are flagged, not decrypted. Multi-disk archives are rejected.
 - TAR: GNU `S` sparse headers and pax `GNU.sparse.*` maps are honoured;
   exotic typeflags (contiguous '7', dump 'D', …) degrade to `Other`.
-- CPIO: the obsolete "PWB" binary variant shares the `070707` magic and
-  is parsed as binary — field layout is identical.
+- CPIO: the `070702` CRC variant's check field is recorded
+  (`meta["check"]`) but not verified; the obsolete "PWB" binary variant
+  shares the `0x71C7` magic and is parsed as binary.
 - Archive members are not directories in the container sense; implied
   parent directories are emitted as synthetic `Directory` entries where
   the format stores only full paths.

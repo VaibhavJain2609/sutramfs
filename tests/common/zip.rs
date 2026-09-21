@@ -16,7 +16,11 @@ pub fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         c ^= b as u32;
         for _ in 0..8 {
-            c = if c & 1 == 1 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            c = if c & 1 == 1 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
         }
     }
     !c
@@ -100,8 +104,16 @@ impl ZipBuilder {
             (data.to_vec(), crc32(data))
         };
         let real_crc = if flags & FLAG_DD != 0 { 0 } else { crc };
-        let real_cs = if flags & FLAG_DD != 0 { 0 } else { stored.len() as u32 };
-        let real_us = if flags & FLAG_DD != 0 { 0 } else { data.len() as u32 };
+        let real_cs = if flags & FLAG_DD != 0 {
+            0
+        } else {
+            stored.len() as u32
+        };
+        let real_us = if flags & FLAG_DD != 0 {
+            0
+        } else {
+            data.len() as u32
+        };
         // LFH
         w32(&mut self.buf, 0x0403_4b50);
         w16(&mut self.buf, 20); // version needed

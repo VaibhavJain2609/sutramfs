@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use sutram_fs::util;
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser, FsTimestamp,
-    FileSystem, MountOptions, RecoveryState, Result, Timestamps,
+    DetectConfidence, EntryKind, FileSystem, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser,
+    FsTimestamp, MountOptions, RecoveryState, Result, Timestamps,
 };
 use sutram_io::ByteSource;
 
@@ -265,8 +265,13 @@ pub(crate) fn pax_ts(s: &str) -> Option<(u64, i64, &'static str)> {
         std::str::from_utf8(&f).ok()?.parse::<i64>().ok()?
     };
     let base = util::unix_nanos(1970, 1, 1, 0, 0, 0, 0)?;
-    Some((0, base.checked_add(sec.checked_mul(1_000_000_000)?)?.checked_add(nanos)?, "pax-unix-sec"))
-        .map(|(_, v, e)| (sec as u64, v, e))
+    Some((
+        0,
+        base.checked_add(sec.checked_mul(1_000_000_000)?)?
+            .checked_add(nanos)?,
+        "pax-unix-sec",
+    ))
+    .map(|(_, v, e)| (sec as u64, v, e))
 }
 
 fn unix_sec_ts(raw: u64) -> FsTimestamp {
@@ -421,17 +426,15 @@ impl TarFs {
                         self.pax_count += 1;
                     }
                 }
-                b'x' => {
-                    match self.read_data(data_off, hdr.size, MAX_PAX_DATA) {
-                        Ok(d) => {
-                            for (k, v) in parse_pax(&d) {
-                                pax_next.insert(k, v);
-                            }
-                            self.pax_count += 1;
+                b'x' => match self.read_data(data_off, hdr.size, MAX_PAX_DATA) {
+                    Ok(d) => {
+                        for (k, v) in parse_pax(&d) {
+                            pax_next.insert(k, v);
                         }
-                        Err(e) => self.fail(e)?,
+                        self.pax_count += 1;
                     }
-                }
+                    Err(e) => self.fail(e)?,
+                },
                 _ => {
                     pos = self.emit_member(
                         pos,
@@ -489,17 +492,13 @@ impl TarFs {
         }
 
         // Name precedence: pax path > GNU longname > ustar prefix/name.
-        let raw_name = pax
-            .get("path")
-            .cloned()
-            .or(longname)
-            .unwrap_or_else(|| {
-                if hdr.prefix.is_empty() {
-                    hdr.name.clone()
-                } else {
-                    format!("{}/{}", hdr.prefix, hdr.name)
-                }
-            });
+        let raw_name = pax.get("path").cloned().or(longname).unwrap_or_else(|| {
+            if hdr.prefix.is_empty() {
+                hdr.name.clone()
+            } else {
+                format!("{}/{}", hdr.prefix, hdr.name)
+            }
+        });
         let linkname = pax
             .get("linkpath")
             .cloned()
@@ -553,10 +552,8 @@ impl TarFs {
                         _ => break,
                     };
                     for i in 0..21 {
-                        let off =
-                            parse_octal(&eh[i * 24..i * 24 + 12]).unwrap_or(0);
-                        let ln =
-                            parse_octal(&eh[i * 24 + 12..i * 24 + 24]).unwrap_or(0);
+                        let off = parse_octal(&eh[i * 24..i * 24 + 12]).unwrap_or(0);
+                        let ln = parse_octal(&eh[i * 24 + 12..i * 24 + 24]).unwrap_or(0);
                         if ln > 0 {
                             map.push((off, ln));
                         }
@@ -700,7 +697,10 @@ impl TarFs {
             }
         }
         if matches!(hdr.typeflag, b'3' | b'4') {
-            meta.insert("device".into(), format!("{},{}", hdr.devmajor, hdr.devminor));
+            meta.insert(
+                "device".into(),
+                format!("{},{}", hdr.devmajor, hdr.devminor),
+            );
         }
         if let Some(map) = &sparse_map {
             meta.insert("sparse".into(), "true".into());
@@ -901,25 +901,29 @@ impl FileSystem for TarFs {
             next: 0,
             emitted_dirs: HashSet::new(),
             root_done: false,
-            errors: self.errors.iter().map(|e| match e {
-                FsError::Corrupt { offset, msg } => FsError::Corrupt {
-                    offset: *offset,
-                    msg: msg.clone(),
-                },
-                FsError::Truncated {
-                    offset,
-                    needed,
-                    available,
-                } => FsError::Truncated {
-                    offset: *offset,
-                    needed: *needed,
-                    available: *available,
-                },
-                FsError::Unsupported { msg } => FsError::Unsupported { msg: msg.clone() },
-                FsError::Io(e) => FsError::Io(std::io::Error::new(e.kind(), e.to_string())),
-                FsError::NotFound { path } => FsError::NotFound { path: path.clone() },
-                FsError::InvalidInput { msg } => FsError::InvalidInput { msg: msg.clone() },
-            }).collect(),
+            errors: self
+                .errors
+                .iter()
+                .map(|e| match e {
+                    FsError::Corrupt { offset, msg } => FsError::Corrupt {
+                        offset: *offset,
+                        msg: msg.clone(),
+                    },
+                    FsError::Truncated {
+                        offset,
+                        needed,
+                        available,
+                    } => FsError::Truncated {
+                        offset: *offset,
+                        needed: *needed,
+                        available: *available,
+                    },
+                    FsError::Unsupported { msg } => FsError::Unsupported { msg: msg.clone() },
+                    FsError::Io(e) => FsError::Io(std::io::Error::new(e.kind(), e.to_string())),
+                    FsError::NotFound { path } => FsError::NotFound { path: path.clone() },
+                    FsError::InvalidInput { msg } => FsError::InvalidInput { msg: msg.clone() },
+                })
+                .collect(),
             pending: Default::default(),
         })
     }

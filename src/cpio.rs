@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use sutram_fs::util;
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser, FsTimestamp,
-    FileSystem, MountOptions, RecoveryState, Result, Timestamps,
+    DetectConfidence, EntryKind, FileSystem, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser,
+    FsTimestamp, MountOptions, RecoveryState, Result, Timestamps,
 };
 use sutram_io::ByteSource;
 
@@ -259,8 +259,6 @@ fn parse_header(src: &dyn ByteSource, off: u64, v: Variant) -> Result<Option<Hea
     }
 }
 
-
-
 /// A resolved member record.
 struct Member {
     path: String,
@@ -402,7 +400,9 @@ impl CpioFs {
             }
             if kind == EntryKind::Symlink && take > 0 {
                 if let Ok(d) = self.src.read_slice(hdr.data_off, take.min(4096) as usize) {
-                    let t = String::from_utf8_lossy(&d).trim_end_matches('\0').to_string();
+                    let t = String::from_utf8_lossy(&d)
+                        .trim_end_matches('\0')
+                        .to_string();
                     meta.insert("symlink_target".into(), t);
                 }
             }
@@ -488,12 +488,10 @@ impl CpioFs {
             }
             pos = hdr.next;
         }
-        // Trailing bytes with no trailer at all are also slack.
+        // Trailing bytes with no trailer at all are also slack —
+        // carve them even when the stream ended in a parse error.
         if !self.trailer_found && pos < len && !self.members.is_empty() {
-            // Only when the stream ended at a record boundary.
-            if self.errors.is_empty() {
-                self.emit_slack(pos, len - pos);
-            }
+            self.emit_slack(pos, len - pos);
         }
         Ok(())
     }
@@ -539,10 +537,11 @@ impl CpioFs {
     }
 
     fn read_member(&self, m: &Member) -> Result<Box<dyn Read + Send>> {
+        // Segments are already clamped to surviving bytes at parse time.
         Ok(Box::new(SegmentReader::new(
             self.src.clone(),
             m.segs.clone(),
-            m.size.min(m.segs.iter().map(|(_, l)| *l).sum::<u64>().max(m.size)),
+            m.size,
         )))
     }
 }

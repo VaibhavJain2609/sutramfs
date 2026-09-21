@@ -140,7 +140,9 @@ impl Read for InflateReader {
         }
         // We fill the caller's buffer directly but cap the per-call output
         // so the decompressor always has room to report progress.
-        let want = buf.len().min(self.out_remaining.min(OUT_CHUNK as u64) as usize);
+        let want = buf
+            .len()
+            .min(self.out_remaining.min(OUT_CHUNK as u64) as usize);
         let mut written = 0usize;
         while written < want {
             self.refill()?;

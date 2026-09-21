@@ -44,7 +44,7 @@ pub mod zip;
 
 use std::sync::Arc;
 
-use sutram_fs::{DetectConfidence, FsParser, FileSystem, MountOptions, Result};
+use sutram_fs::{DetectConfidence, FileSystem, FsParser, MountOptions, Result};
 use sutram_io::ByteSource;
 
 pub use cpio::{CpioFs, CpioParser};

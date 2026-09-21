@@ -37,9 +37,12 @@ fn entries(img: Vec<u8>) -> Vec<FsEntry> {
 }
 
 fn find<'a>(es: &'a [FsEntry], path: &str) -> &'a FsEntry {
-    es.iter()
-        .find(|e| e.path == path)
-        .unwrap_or_else(|| panic!("{path} not found; got {:?}", es.iter().map(|e| &e.path).collect::<Vec<_>>()))
+    es.iter().find(|e| e.path == path).unwrap_or_else(|| {
+        panic!(
+            "{path} not found; got {:?}",
+            es.iter().map(|e| &e.path).collect::<Vec<_>>()
+        )
+    })
 }
 
 fn find_all<'a>(es: &'a [FsEntry], path: &str) -> Vec<&'a FsEntry> {
@@ -64,7 +67,10 @@ fn detects_v7_as_medium() {
 
 #[test]
 fn rejects_garbage_and_zeros() {
-    assert_eq!(TarParser.detect(&vec![0u8; 4096].as_slice()), DetectConfidence::None);
+    assert_eq!(
+        TarParser.detect(&vec![0u8; 4096].as_slice()),
+        DetectConfidence::None
+    );
     assert_eq!(
         TarParser.detect(&vec![0xAAu8; 4096].as_slice()),
         DetectConfidence::None
@@ -122,13 +128,14 @@ fn superseded_duplicate_paths() {
     assert_eq!(both[0].meta["superseded"], "true");
     assert!(!both[1].meta.contains_key("superseded"));
     // Both versions remain readable.
-    let fs = TarParser.mount(src({
-        let mut b = TarBuilder::new();
-        b.add_file("same.txt", b"old version");
-        b.add_file("same.txt", b"new version!");
-        b.finish()
-    }))
-    .unwrap();
+    let fs = TarParser
+        .mount(src({
+            let mut b = TarBuilder::new();
+            b.add_file("same.txt", b"old version");
+            b.add_file("same.txt", b"new version!");
+            b.finish()
+        }))
+        .unwrap();
     let es: Vec<FsEntry> = fs.walk().filter_map(|r| r.ok()).collect();
     let both: Vec<&FsEntry> = es.iter().filter(|e| e.path == "/same.txt").collect();
     let mut r = fs.read_file(both[0]).unwrap();
@@ -146,7 +153,9 @@ fn truncated_tail_member_is_partially_overwritten() {
     let mut b = TarBuilder::new();
     b.add_file("intact.txt", b"fine");
     // Header claims 2048 bytes but the image ends after 256.
-    b.header("cut.bin", 0o644, 0, 0, 2048, MTIME, b'0', "", b"ustar\0", "");
+    b.header(
+        "cut.bin", 0o644, 0, 0, 2048, MTIME, b'0', "", b"ustar\0", "",
+    );
     b.buf.extend_from_slice(&vec![0xCCu8; 256]);
     let img = b.finish_bare();
     let fs = TarParser.mount(src(img)).unwrap();
@@ -180,7 +189,11 @@ fn truncated_tail_member_is_partially_overwritten() {
 
 #[test]
 fn gnu_longname_applies() {
-    let long = format!("{}/{}", "d".repeat(60), "very-long-name-exceeding-100-chars-total-yes-it-does".repeat(2));
+    let long = format!(
+        "{}/{}",
+        "d".repeat(60),
+        "very-long-name-exceeding-100-chars-total-yes-it-does".repeat(2)
+    );
     let mut b = TarBuilder::new();
     b.add_longname(&long, b"long data");
     let img = b.finish();

@@ -93,7 +93,13 @@ fn tar_checksum_verifies() {
     let sum: u64 = h
         .iter()
         .enumerate()
-        .map(|(i, &b)| if (148..156).contains(&i) { b' ' as u64 } else { b as u64 })
+        .map(|(i, &b)| {
+            if (148..156).contains(&i) {
+                b' ' as u64
+            } else {
+                b as u64
+            }
+        })
         .sum();
     let s = format!("{:06o}\0 ", sum);
     h[148..156].copy_from_slice(s.as_bytes());

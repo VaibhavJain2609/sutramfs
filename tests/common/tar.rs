@@ -84,7 +84,13 @@ impl TarBuilder {
         let sum: u64 = h
             .iter()
             .enumerate()
-            .map(|(i, &b)| if (148..156).contains(&i) { b' ' as u64 } else { b as u64 })
+            .map(|(i, &b)| {
+                if (148..156).contains(&i) {
+                    b' ' as u64
+                } else {
+                    b as u64
+                }
+            })
             .sum();
         let s = format!("{:06o}\0 ", sum);
         h[148..156].copy_from_slice(s.as_bytes());
@@ -106,7 +112,18 @@ impl TarBuilder {
     }
 
     pub fn add_typed(&mut self, name: &str, data: &[u8], tf: u8, magic: &[u8; 6]) -> u64 {
-        let off = self.header(name, 0o644, 1000, 1000, data.len() as u64, MTIME, tf, "", magic, "");
+        let off = self.header(
+            name,
+            0o644,
+            1000,
+            1000,
+            data.len() as u64,
+            MTIME,
+            tf,
+            "",
+            magic,
+            "",
+        );
         self.buf.extend_from_slice(data);
         self.pad_block();
         off
@@ -133,7 +150,18 @@ impl TarBuilder {
 
     /// v7 member — no ustar magic.
     pub fn add_v7(&mut self, name: &str, data: &[u8]) -> u64 {
-        let off = self.header(name, 0o644, 0, 0, data.len() as u64, MTIME, b'0', "", b"\0\0\0\0\0\0", "");
+        let off = self.header(
+            name,
+            0o644,
+            0,
+            0,
+            data.len() as u64,
+            MTIME,
+            b'0',
+            "",
+            b"\0\0\0\0\0\0",
+            "",
+        );
         self.buf.extend_from_slice(data);
         self.pad_block();
         off
@@ -144,18 +172,33 @@ impl TarBuilder {
     }
 
     pub fn add_symlink(&mut self, name: &str, target: &str) -> u64 {
-        self.header(name, 0o777, 1000, 1000, 0, MTIME, b'2', target, b"ustar\0", "")
+        self.header(
+            name, 0o777, 1000, 1000, 0, MTIME, b'2', target, b"ustar\0", "",
+        )
     }
 
     pub fn add_hardlink(&mut self, name: &str, target: &str) -> u64 {
-        self.header(name, 0o644, 1000, 1000, 0, MTIME, b'1', target, b"ustar\0", "")
+        self.header(
+            name, 0o644, 1000, 1000, 0, MTIME, b'1', target, b"ustar\0", "",
+        )
     }
 
     /// GNU longname ('L') + member written with the truncated name.
     pub fn add_longname(&mut self, real_name: &str, data: &[u8]) -> u64 {
         let mut nb = real_name.as_bytes().to_vec();
         nb.push(0);
-        self.header("././@LongLink", 0o644, 0, 0, nb.len() as u64, MTIME, b'L', "", b"ustar ", "");
+        self.header(
+            "././@LongLink",
+            0o644,
+            0,
+            0,
+            nb.len() as u64,
+            MTIME,
+            b'L',
+            "",
+            b"ustar ",
+            "",
+        );
         self.buf.extend_from_slice(&nb);
         self.pad_block();
         let short: String = real_name.chars().take(99).collect();
@@ -165,7 +208,18 @@ impl TarBuilder {
     /// pax extended header ('x') then the member it applies to.
     pub fn add_pax(&mut self, name: &str, data: &[u8], records: &[(&str, &str)]) -> u64 {
         let pb = pax_block(records);
-        self.header("pax_header", 0o644, 0, 0, pb.len() as u64, MTIME, b'x', "", b"ustar\0", "");
+        self.header(
+            "pax_header",
+            0o644,
+            0,
+            0,
+            pb.len() as u64,
+            MTIME,
+            b'x',
+            "",
+            b"ustar\0",
+            "",
+        );
         self.buf.extend_from_slice(&pb);
         self.pad_block();
         self.add_file(name, data)
@@ -173,7 +227,13 @@ impl TarBuilder {
 
     /// pax sparse member: `map` = [(file_offset, len), …], stored bytes
     /// are the concatenated non-hole regions.
-    pub fn add_pax_sparse(&mut self, name: &str, map: &[(u64, u64)], stored: &[u8], realsize: u64) -> u64 {
+    pub fn add_pax_sparse(
+        &mut self,
+        name: &str,
+        map: &[(u64, u64)],
+        stored: &[u8],
+        realsize: u64,
+    ) -> u64 {
         let map_s = map
             .iter()
             .map(|(o, l)| format!("{o},{l}"))
@@ -185,10 +245,32 @@ impl TarBuilder {
             ("GNU.sparse.major", "1"),
             ("GNU.sparse.minor", "0"),
         ]);
-        self.header("pax_sparse", 0o644, 0, 0, pb.len() as u64, MTIME, b'x', "", b"ustar\0", "");
+        self.header(
+            "pax_sparse",
+            0o644,
+            0,
+            0,
+            pb.len() as u64,
+            MTIME,
+            b'x',
+            "",
+            b"ustar\0",
+            "",
+        );
         self.buf.extend_from_slice(&pb);
         self.pad_block();
-        let off = self.header(name, 0o644, 0, 0, stored.len() as u64, MTIME, b'0', "", b"ustar\0", "");
+        let off = self.header(
+            name,
+            0o644,
+            0,
+            0,
+            stored.len() as u64,
+            MTIME,
+            b'0',
+            "",
+            b"ustar\0",
+            "",
+        );
         self.buf.extend_from_slice(stored);
         self.pad_block();
         off
@@ -196,20 +278,47 @@ impl TarBuilder {
 
     /// Old-GNU sparse member ('S'): sparse map inside the header,
     /// realsize at 483, magic "ustar ".
-    pub fn add_gnu_sparse(&mut self, name: &str, map: &[(u64, u64)], stored: &[u8], realsize: u64) -> u64 {
-        let off = self.header(name, 0o644, 0, 0, stored.len() as u64, MTIME, b'S', "", b"ustar ", "");
+    pub fn add_gnu_sparse(
+        &mut self,
+        name: &str,
+        map: &[(u64, u64)],
+        stored: &[u8],
+        realsize: u64,
+    ) -> u64 {
+        let off = self.header(
+            name,
+            0o644,
+            0,
+            0,
+            stored.len() as u64,
+            MTIME,
+            b'S',
+            "",
+            b"ustar ",
+            "",
+        );
         // Patch the header we just wrote with the sparse area.
         let base = off as usize;
         for (i, &(foff, flen)) in map.iter().enumerate().take(4) {
-            octal(&mut self.buf[base + 386 + i * 24..base + 398 + i * 24], foff);
-            octal(&mut self.buf[base + 398 + i * 24..base + 410 + i * 24], flen);
+            octal(
+                &mut self.buf[base + 386 + i * 24..base + 398 + i * 24],
+                foff,
+            );
+            octal(
+                &mut self.buf[base + 398 + i * 24..base + 410 + i * 24],
+                flen,
+            );
         }
         octal(&mut self.buf[base + 483..base + 495], realsize);
         // Recompute checksum after patching.
         let mut sum: u64 = 0;
         for i in 0..512 {
             let b = self.buf[base + i];
-            sum += if (148..156).contains(&i) { b' ' as u64 } else { b as u64 };
+            sum += if (148..156).contains(&i) {
+                b' ' as u64
+            } else {
+                b as u64
+            };
         }
         let s = format!("{:06o}\0 ", sum);
         self.buf[base + 148..base + 156].copy_from_slice(s.as_bytes());

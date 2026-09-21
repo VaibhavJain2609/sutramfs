@@ -38,10 +38,22 @@ fn cpio_img() -> Vec<u8> {
 
 #[test]
 fn archive_detect_identifies_all() {
-    assert_eq!(archive_detect(&zip_img().as_slice()), DetectConfidence::Certain);
-    assert_eq!(archive_detect(&tar_img().as_slice()), DetectConfidence::Certain);
-    assert_eq!(archive_detect(&cpio_img().as_slice()), DetectConfidence::Certain);
-    assert_eq!(archive_detect(&vec![0u8; 4096].as_slice()), DetectConfidence::None);
+    assert_eq!(
+        archive_detect(&zip_img().as_slice()),
+        DetectConfidence::Certain
+    );
+    assert_eq!(
+        archive_detect(&tar_img().as_slice()),
+        DetectConfidence::Certain
+    );
+    assert_eq!(
+        archive_detect(&cpio_img().as_slice()),
+        DetectConfidence::Certain
+    );
+    assert_eq!(
+        archive_detect(&vec![0u8; 4096].as_slice()),
+        DetectConfidence::None
+    );
 }
 
 #[test]
@@ -76,7 +88,10 @@ fn facade_prefers_zip_on_ambiguity() {
     // A zip whose first member is named like a tar header could confuse
     // ordering — the EOCD always wins.
     let img = zip_img();
-    assert_eq!(SutramArchiveParser.detect(&img.as_slice()), DetectConfidence::Certain);
+    assert_eq!(
+        SutramArchiveParser.detect(&img.as_slice()),
+        DetectConfidence::Certain
+    );
     let fs = SutramArchiveParser.mount(src(img)).unwrap();
     assert_eq!(fs.info().fs_type, "ZIP");
 }

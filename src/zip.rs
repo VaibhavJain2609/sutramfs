@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use sutram_fs::util;
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser, FsTimestamp,
-    FileSystem, MountOptions, RecoveryState, Result, Timestamps,
+    DetectConfidence, EntryKind, FileSystem, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser,
+    FsTimestamp, MountOptions, RecoveryState, Result, Timestamps,
 };
 use sutram_io::ByteSource;
 
@@ -151,16 +151,13 @@ fn find_eocd(src: &dyn ByteSource) -> Result<Option<Eocd>> {
             entries: r16(rec, 10) as u64,
             comment: rec[EOCD_LEN as usize..].to_vec(),
             zip64: false,
-            multi_disk: r16(rec, 4) != 0
-                || r16(rec, 6) != 0
-                || r16(rec, 8) != r16(rec, 10),
+            multi_disk: r16(rec, 4) != 0 || r16(rec, 6) != 0 || r16(rec, 8) != r16(rec, 10),
         };
         // ZIP64: any saturated field, or a locator parked before the EOCD.
         let saturated = e.cd_off == u32::MAX as u64
             || e.cd_size == u32::MAX as u64
             || e.entries == u16::MAX as u64;
-        if (saturated || e.eocd_off >= Z64_LOC_LEN)
-            && read_zip64_eocd(src, &mut e).unwrap_or(false)
+        if (saturated || e.eocd_off >= Z64_LOC_LEN) && read_zip64_eocd(src, &mut e).unwrap_or(false)
         {
             e.zip64 = true;
         }
@@ -370,12 +367,7 @@ struct ExtraOut {
     tags: Vec<u16>,
 }
 
-fn parse_extra(
-    extra: &[u8],
-    need_uncomp: bool,
-    need_comp: bool,
-    need_off: bool,
-) -> ExtraOut {
+fn parse_extra(extra: &[u8], need_uncomp: bool, need_comp: bool, need_off: bool) -> ExtraOut {
     let mut out = ExtraOut {
         uncomp_size: None,
         comp_size: None,
@@ -401,21 +393,18 @@ fn parse_extra(
                 // fixed order.
                 let mut j = 0usize;
                 if need_uncomp && j + 8 <= f.len() {
-                    out.uncomp_size = Some(u64::from_le_bytes(
-                        f[j..j + 8].try_into().unwrap_or([0; 8]),
-                    ));
+                    out.uncomp_size =
+                        Some(u64::from_le_bytes(f[j..j + 8].try_into().unwrap_or([0; 8])));
                     j += 8;
                 }
                 if need_comp && j + 8 <= f.len() {
-                    out.comp_size = Some(u64::from_le_bytes(
-                        f[j..j + 8].try_into().unwrap_or([0; 8]),
-                    ));
+                    out.comp_size =
+                        Some(u64::from_le_bytes(f[j..j + 8].try_into().unwrap_or([0; 8])));
                     j += 8;
                 }
                 if need_off && j + 8 <= f.len() {
-                    out.local_off = Some(u64::from_le_bytes(
-                        f[j..j + 8].try_into().unwrap_or([0; 8]),
-                    ));
+                    out.local_off =
+                        Some(u64::from_le_bytes(f[j..j + 8].try_into().unwrap_or([0; 8])));
                 }
             }
             0x5455 => {
@@ -461,7 +450,8 @@ fn parse_extra(
                             raw_encoding: "ntfs-filetime",
                             granularity: Duration::from_nanos(100),
                         };
-                        out.meta.push(("ntfs_mtime_filetime".into(), format!("{m:#x}")));
+                        out.meta
+                            .push(("ntfs_mtime_filetime".into(), format!("{m:#x}")));
                         out.accessed = Some(ts(ac));
                         out.changed = Some(ts(c));
                     }
@@ -473,9 +463,7 @@ fn parse_extra(
                 if f.len() >= 2 {
                     let ul = f[1] as usize;
                     if 2 + ul < f.len() {
-                        let uid = f[2..2 + ul]
-                            .iter()
-                            .fold(0u64, |a, &b| (a << 8) | b as u64);
+                        let uid = f[2..2 + ul].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
                         let gl = f[2 + ul] as usize;
                         let gid = f
                             .get(3 + ul..3 + ul + gl)
@@ -559,10 +547,7 @@ impl ZipFs {
             Ok(Some(e)) => {
                 fs.zip64 = e.zip64;
                 fs.comment = Some(String::from_utf8_lossy(&e.comment).into_owned());
-                fs.eocd_region = Some((
-                    e.eocd_off,
-                    len - e.eocd_off,
-                ));
+                fs.eocd_region = Some((e.eocd_off, len - e.eocd_off));
                 if e.multi_disk {
                     fs.errors.push(FsError::unsupported(
                         "multi-disk archive: central directory may be on another disk",
@@ -623,10 +608,7 @@ impl ZipFs {
             cd_start = adjusted;
         }
         self.base_delta = cd_start.saturating_sub(recorded);
-        let cd_end = e
-            .eocd_off
-            .min(cd_start.saturating_add(e.cd_size))
-            .min(len);
+        let cd_end = e.eocd_off.min(cd_start.saturating_add(e.cd_size)).min(len);
         if !sig_at(cd_start) && e.cd_size > 0 {
             return Err(FsError::corrupt(
                 cd_start,
@@ -736,7 +718,11 @@ impl ZipFs {
         if !x.tags.is_empty() {
             meta.insert(
                 "extra_fields".into(),
-                x.tags.iter().map(|t| format!("{t:#06x}")).collect::<Vec<_>>().join(","),
+                x.tags
+                    .iter()
+                    .map(|t| format!("{t:#06x}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
             );
         }
 
@@ -768,7 +754,10 @@ impl ZipFs {
             );
         }
         if name_raw != path.as_bytes() {
-            meta.insert("raw_name".into(), String::from_utf8_lossy(&name_raw).into_owned());
+            meta.insert(
+                "raw_name".into(),
+                String::from_utf8_lossy(&name_raw).into_owned(),
+            );
         }
 
         // Unix mode rides the high 16 bits of external attributes when the
@@ -837,8 +826,7 @@ impl ZipFs {
                 }
                 let data_end = l.data_off.saturating_add(comp_size.min(len));
                 let end = if flags & FLAG_DATA_DESC != 0 {
-                    let zip64 = comp_size > u32::MAX as u64
-                        || uncomp_size > u32::MAX as u64;
+                    let zip64 = comp_size > u32::MAX as u64 || uncomp_size > u32::MAX as u64;
                     skip_data_descriptor(self.src.as_ref(), data_end, zip64)
                 } else {
                     data_end
@@ -881,7 +869,11 @@ impl ZipFs {
 
         let (name, _) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
         self.members.push(Member {
-            name: if name.is_empty() { path.clone() } else { name.to_string() },
+            name: if name.is_empty() {
+                path.clone()
+            } else {
+                name.to_string()
+            },
             path,
             kind,
             size: uncomp_size,
@@ -905,8 +897,7 @@ impl ZipFs {
     /// source when there is no EOCD).
     fn scan_hidden(&mut self) {
         let limit = self.cd_region.map(|(s, _)| s).unwrap_or(self.src.len());
-        let referenced: HashSet<u64> =
-            self.members.iter().filter_map(|m| m.lfh_off).collect();
+        let referenced: HashSet<u64> = self.members.iter().filter_map(|m| m.lfh_off).collect();
         // Compressed sizes keyed by LFH offset let the scan skip live
         // member data without rescanning it.
         let known: HashMap<u64, u64> = self
@@ -952,10 +943,7 @@ impl ZipFs {
                             )
                         } else {
                             self.add_hidden(abs, &l);
-                            (
-                                l.comp_size as u64,
-                                l.flags & FLAG_DATA_DESC != 0,
-                            )
+                            (l.comp_size as u64, l.flags & FLAG_DATA_DESC != 0)
                         };
                         found.insert(abs);
                         let mut end = l.data_off.saturating_add(csize);
@@ -992,7 +980,10 @@ impl ZipFs {
         meta.insert("compression_method".into(), method_name(l.method).into());
         meta.insert("flags".into(), format!("{:#06x}", l.flags));
         meta.insert("crc32".into(), format!("{:#010x}", l.crc32));
-        meta.insert("raw_name".into(), String::from_utf8_lossy(&l.name).into_owned());
+        meta.insert(
+            "raw_name".into(),
+            String::from_utf8_lossy(&l.name).into_owned(),
+        );
         if l.flags & FLAG_ENCRYPTED != 0 {
             meta.insert("encrypted".into(), "true".into());
         }
@@ -1000,7 +991,11 @@ impl ZipFs {
         if !x.tags.is_empty() {
             meta.insert(
                 "extra_fields".into(),
-                x.tags.iter().map(|t| format!("{t:#06x}")).collect::<Vec<_>>().join(","),
+                x.tags
+                    .iter()
+                    .map(|t| format!("{t:#06x}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
             );
         }
         let mut ts = Timestamps::default();
@@ -1032,7 +1027,9 @@ impl ZipFs {
                 }
             }
         } else {
-            span_end = l.data_off.saturating_add(comp_size.min(len - l.data_off.min(len)));
+            span_end = l
+                .data_off
+                .saturating_add(comp_size.min(len - l.data_off.min(len)));
         }
         self.finish_hidden(off, l, path, is_dir, comp_size, span_end, bounded, meta, ts);
     }
@@ -1041,7 +1038,10 @@ impl ZipFs {
     /// descriptor signature ahead and recover the compressed size.
     /// Returns `(comp_size, span_end)`.
     fn bound_hidden_data(&self, data_off: u64) -> Option<(u64, u64)> {
-        let limit = self.src.len().min(data_off.saturating_add(64 * 1024 * 1024));
+        let limit = self
+            .src
+            .len()
+            .min(data_off.saturating_add(64 * 1024 * 1024));
         let mut pos = data_off;
         while pos + 8 <= limit {
             let want = (limit - pos).min(SCAN_WIN) as usize;
@@ -1103,7 +1103,11 @@ impl ZipFs {
         let (name, _) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
         self.hidden_count += 1;
         self.members.push(Member {
-            name: if name.is_empty() { path.clone() } else { name.to_string() },
+            name: if name.is_empty() {
+                path.clone()
+            } else {
+                name.to_string()
+            },
             path,
             kind,
             size: l.uncomp_size as u64,
@@ -1144,10 +1148,12 @@ impl ZipFs {
             msg: "member data offset unknown (local header missing)".into(),
         })?;
         match m.method {
+            // Stored: the compressed span IS the content; cap at what's
+            // physically present (uncompressed size is metadata-only).
             0 => Ok(Box::new(SegmentReader::new(
                 self.src.clone(),
                 vec![(Segment::Disk(data_off), m.data_avail)],
-                m.data_avail.min(m.size.max(m.data_avail)),
+                m.data_avail,
             ))),
             8 => Ok(Box::new(InflateReader::new(
                 self.src.clone(),
