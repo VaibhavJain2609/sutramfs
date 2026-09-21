@@ -126,4 +126,29 @@ mod tests {
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
     }
+
+    #[test]
+    fn padding_boundary_vectors() {
+        // Lengths around the 56-byte padding boundary and the 64-byte block
+        // edge — where hand-rolled SHA-256 implementations get the trailing
+        // block(s) wrong. Digests computed with an independent reference
+        // implementation (FIPS 180-4 conformant).
+        let vectors: &[(usize, &str)] = &[
+            (55, "463eb28e72f82e0a96c0a4cc53690c571281131f672aa229e0d45ae59b598b59"),
+            (56, "da2ae4d6b36748f2a318f23e7ab1dfdf45acdc9d049bd80e59de82a60895f562"),
+            (57, "2fe741af801cc238602ac0ec6a7b0c3a8a87c7fc7d7f02a3fe03d1c12eac4d8f"),
+            (63, "29af2686fd53374a36b0846694cc342177e428d1647515f078784d69cdb9e488"),
+            (64, "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"),
+            (65, "4bfd2c8b6f1eec7a2afeb48b934ee4b2694182027e6d0fc075074f2fabb31781"),
+            (119, "da18797ed7c3a777f0847f429724a2d8cd5138e6ed2895c3fa1a6d39d18f7ec6"),
+            (120, "f52b23db1fbb6ded89ef42a23ce0c8922c45f25c50b568a93bf1c075420bbb7c"),
+            (128, "471fb943aa23c511f6f72f8d1652d9c880cfa392ad80503120547703e56a2be5"),
+            (129, "5099c6a56203f9687f7d33f4bfdf576d31dc91f6b695ecea38b2770c87631135"),
+            (200, "1901da1c9f699b48f6b2636e65cbf73abf99d0441ef67f5c540a42f7051dec6f"),
+        ];
+        for (n, want) in vectors {
+            let data: Vec<u8> = (0..*n).map(|i| (i % 256) as u8).collect();
+            assert_eq!(&hex(&sha256(&data)), want, "sha256 of {n}-byte pattern");
+        }
+    }
 }

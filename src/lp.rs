@@ -681,6 +681,16 @@ pub fn logical_partitions_verbose(
                                 d.size
                             ));
                         }
+                        // Same check against the bytes actually in hand: a
+                        // truncated super image otherwise yields a partition
+                        // whose tail reads fail silently mid-mount.
+                        if end > src.len() {
+                            warnings.push(format!(
+                                "LP partition {name}: extent end {end:#x} exceeds source \
+                                 length {:#x} — truncated image or corrupt extent table",
+                                src.len()
+                            ));
+                        }
                         SparseKind::Data {
                             source: src.clone(),
                             src_offset: src_off,

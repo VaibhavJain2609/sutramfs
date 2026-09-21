@@ -303,11 +303,15 @@ pub fn parse_at(
     }
 
     let descriptors = if desc_size > 0 && desc_offset.saturating_add(desc_size) <= aux_size {
-        let base = offset + VBMETA_HEADER_SIZE + auth_size;
+        // Saturating adds: `offset` is caller-supplied and need not relate
+        // to a real source length — clamp rather than wrap/panic.
+        let base = offset
+            .saturating_add(VBMETA_HEADER_SIZE)
+            .saturating_add(auth_size);
         let blob = src
-            .read_slice(base + desc_offset, desc_size as usize)
+            .read_slice(base.saturating_add(desc_offset), desc_size as usize)
             .map_err(FsError::Io)?;
-        parse_descriptors(&blob, base + desc_offset, &mut warnings)
+        parse_descriptors(&blob, base.saturating_add(desc_offset), &mut warnings)
     } else {
         Vec::new()
     };
@@ -403,22 +407,30 @@ fn parse_descriptors(
 
 fn parse_one_descriptor(tag: u64, d: &[u8], _warnings: &mut Vec<String>) -> VbmetaDescriptor {
     match tag {
-        // PROPERTY: key_len u32, value_len u32, key bytes + NUL, value + NUL.
+        // PROPERTY: key_num_bytes u64, value_num_bytes u64, then key bytes +
+        // NUL, then value bytes + NUL (lengths exclude the terminators).
         0 => {
-            let key_len = le::u32_be(d, 0).unwrap_or(0) as usize;
-            let value_len = le::u32_be(d, 4).unwrap_or(0) as usize;
-            let key = d.get(8..8 + key_len).map(cstr).unwrap_or_default();
-            let voff = 8 + key_len.saturating_add(1);
+            let key_len = le::u64_be(d, 0).unwrap_or(0) as usize;
+            let value_len = le::u64_be(d, 8).unwrap_or(0) as usize;
+            let key = d
+                .get(16..16usize.saturating_add(key_len))
+                .map(cstr)
+                .unwrap_or_default();
+            let voff = 16usize.saturating_add(key_len).saturating_add(1);
             let value = d
                 .get(voff..voff.saturating_add(value_len))
                 .map(|v| v.to_vec())
                 .unwrap_or_default();
             VbmetaDescriptor::Property { key, value }
         }
-        // HASHTREE — fixed part 104 bytes, then name/salt/digest.
+        // HASHTREE — fixed part 104 bytes + reserved[60], then
+        // name/salt/digest at offset 164.
         1 => {
             let name_len = le::u32_be(d, 88).unwrap_or(0) as usize;
-            let partition_name = d.get(104..104 + name_len).map(cstr).unwrap_or_default();
+            let partition_name = d
+                .get(164..164usize.saturating_add(name_len))
+                .map(cstr)
+                .unwrap_or_default();
             VbmetaDescriptor::Hashtree {
                 partition_name,
                 dm_verity_version: le::u32_be(d, 0).unwrap_or(0),

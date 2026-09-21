@@ -110,8 +110,11 @@ pub fn split_slot_suffix(name: &str) -> (&str, Option<char>) {
 }
 
 /// `true` when the name carries a trailing A/B `_<slot>` suffix.
+///
+/// Case-insensitive on the slot letter (`Boot_A` counts) to stay
+/// consistent with [`classify_name`].
 pub fn has_slot_suffix(name: &str) -> bool {
-    split_slot_suffix(name).1.is_some()
+    split_slot_suffix(&name.to_ascii_lowercase()).1.is_some()
 }
 
 /// Classify an Android partition name into a [`PartitionRole`].
@@ -121,9 +124,12 @@ pub fn has_slot_suffix(name: &str) -> bool {
 /// Prefix matches are used for families like `vbmeta_system`,
 /// `modemst1`/`modemst2`, `xbl_a`-style Qualcomm chains.
 pub fn classify_name(name: &str) -> PartitionRole {
-    let (base, _slot) = split_slot_suffix(name);
-    let n = base.to_ascii_lowercase();
-    let n = n.as_str();
+    // Lowercase first so vendor case variants (`Boot_A`, `SUPER`) still
+    // de-suffix and classify — the split itself is case-sensitive on the
+    // slot letter.
+    let lower = name.to_ascii_lowercase();
+    let (base, _slot) = split_slot_suffix(&lower);
+    let n = base;
 
     let role = match n {
         "boot" => PartitionRole::Boot,

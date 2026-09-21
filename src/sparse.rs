@@ -134,8 +134,8 @@ pub fn open_sparse(src: Arc<dyn ByteSource>) -> Result<SparseFile> {
 /// `total_blks * blk_sz`, or DONT_CARE/RAW chunks left output gaps.
 pub fn inspect_sparse(src: Arc<dyn ByteSource>) -> Result<(SparseFile, SparseHeader, Vec<String>)> {
     let header = read_header(src.as_ref())?;
-    let sf = open_sparse(src)?;
-    let mut warnings = Vec::new();
+    let sf = open_sparse(src.clone())?;
+    let mut warnings = chunk_warnings(src.as_ref(), &header);
     let declared = header.output_size();
     if declared != sf.len() {
         warnings.push(format!(
@@ -144,4 +144,100 @@ pub fn inspect_sparse(src: Arc<dyn ByteSource>) -> Result<(SparseFile, SparseHea
         ));
     }
     Ok((sf, header, warnings))
+}
+
+/// Chunk types (AOSP `sparse_format.h`).
+const CHUNK_RAW: u16 = 0xCAC1;
+const CHUNK_FILL: u16 = 0xCAC2;
+const CHUNK_DONT_CARE: u16 = 0xCAC3;
+const CHUNK_CRC32: u16 = 0xCAC4;
+
+/// Bound on emitted chunk warnings — a uniformly corrupt table should not
+/// produce a million-entry vector.
+const MAX_CHUNK_WARNINGS: usize = 32;
+
+/// Re-walk the chunk table, reporting structural inconsistencies that
+/// [`SparseFile::from_android_sparse`] absorbs silently — most importantly
+/// a RAW chunk whose `total_sz` cannot hold its declared `chunk_sz` blocks
+/// (the decoded extent then maps non-payload bytes).
+///
+/// Warnings only, never fatal: the decoder's output is still faithfully
+/// "what the table declares"; we flag where declaration and reality split.
+fn chunk_warnings(src: &dyn ByteSource, h: &SparseHeader) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut suppressed = 0u64;
+    let warn = |warnings: &mut Vec<String>, suppressed: &mut u64, msg: String| {
+        if warnings.len() < MAX_CHUNK_WARNINGS {
+            warnings.push(msg);
+        } else {
+            *suppressed += 1;
+        }
+    };
+    let chdr = h.chunk_header_size as u64;
+    let mut cursor = h.file_header_size as u64;
+    for i in 0..h.total_chunks {
+        let ch = match src.read_slice(cursor, chdr as usize) {
+            Ok(b) => b,
+            Err(_) => {
+                warn(
+                    &mut warnings,
+                    &mut suppressed,
+                    format!("sparse chunk {i}: header read failed at {cursor:#x}"),
+                );
+                break;
+            }
+        };
+        if ch.len() < 12 {
+            warn(
+                &mut warnings,
+                &mut suppressed,
+                format!("sparse chunk {i}: truncated header at {cursor:#x}"),
+            );
+            break;
+        }
+        let ctype = le::u16(&ch, 0).unwrap_or(0);
+        let chunk_blocks = le::u32(&ch, 4).unwrap_or(0) as u64;
+        let total_sz = le::u32(&ch, 8).unwrap_or(0) as u64;
+        if total_sz < chdr {
+            warn(
+                &mut warnings,
+                &mut suppressed,
+                format!("sparse chunk {i}: total_sz {total_sz} < chunk header {chdr}"),
+            );
+            break; // cursor arithmetic is meaningless past this
+        }
+        let out_len = chunk_blocks.saturating_mul(h.block_size as u64);
+        let payload = total_sz - chdr;
+        let mismatch = match ctype {
+            // Payload must cover exactly the declared output blocks.
+            CHUNK_RAW => payload != out_len,
+            // FILL carries a 4-byte pattern; CRC32 a 4-byte checksum.
+            CHUNK_FILL | CHUNK_CRC32 => payload != 4,
+            // DONT_CARE: any payload size is tolerated (usually 0).
+            CHUNK_DONT_CARE => false,
+            _ => false, // unknown types already rejected by the decoder
+        };
+        if mismatch {
+            let detail = if payload < out_len && ctype == CHUNK_RAW {
+                "decoded extent maps non-payload bytes"
+            } else {
+                "declared/actual chunk size disagree"
+            };
+            warn(
+                &mut warnings,
+                &mut suppressed,
+                format!(
+                    "sparse chunk {i} (type {ctype:#06x}): payload {payload:#x} B vs \
+                     declared output {out_len:#x} B — {detail}"
+                ),
+            );
+        }
+        cursor = cursor.saturating_add(total_sz);
+    }
+    if suppressed > 0 {
+        warnings.push(format!(
+            "sparse: {suppressed} further chunk-table inconsistencies suppressed"
+        ));
+    }
+    warnings
 }

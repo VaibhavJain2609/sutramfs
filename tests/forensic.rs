@@ -300,6 +300,41 @@ fn gpt_super_partition_expands_logical() {
 }
 
 #[test]
+fn lp_extent_past_source_end_warns() {
+    // Truncate the super image inside the last partition's data: the LP
+    // metadata is intact (it lives at the head) but a LINEAR extent now
+    // runs past EOF — that must be surfaced as a warning, not silent
+    // read failures later.
+    let mut img = sample_super();
+    img.truncate(common::LP_FIRST_SECTOR as usize * 512 + 512);
+    let (parts, warnings) =
+        sutram_part::lp::logical_partitions_verbose(arc(img)).unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(
+        warnings.iter().any(|w| w.contains("exceeds source length")),
+        "expected truncation warning, got {warnings:?}"
+    );
+}
+
+#[test]
+fn mbr_image_reports_mbr_container() {
+    // Non-protective MBR (unusual on Android): partitions must be parsed
+    // AND the container must not claim "raw".
+    let mut img = vec![0u8; (2048 + 100) * 512];
+    img[0x1BE] = 0x80; // bootable
+    img[0x1BE + 4] = 0x83; // Linux type
+    img[0x1BE + 8..0x1BE + 12].copy_from_slice(&2048u32.to_le_bytes());
+    img[0x1BE + 12..0x1BE + 16].copy_from_slice(&100u32.to_le_bytes());
+    img[0x1FE] = 0x55;
+    img[0x1FF] = 0xAA;
+    let layout = analyze(arc(img)).unwrap();
+    assert_eq!(layout.container, ContainerKind::Mbr);
+    assert_eq!(layout.partitions.len(), 1);
+    assert_eq!(layout.partitions[0].meta["table"], "mbr");
+    assert!(layout.warnings.iter().any(|w| w.contains("MBR")));
+}
+
+#[test]
 fn gpt_partition_byte_provenance() {
     let layout = analyze(arc(sample_gpt())).unwrap();
     let persist = find(&layout, "persist");

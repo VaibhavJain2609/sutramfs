@@ -100,6 +100,10 @@ pub enum ContainerKind {
     Raw,
     /// GPT-partitioned device image (physical partitions).
     Gpt,
+    /// MBR-partitioned device image — unusual on Android (GPT expected);
+    /// kept distinct from `Raw` so a report never claims "no partition
+    /// layer" for a table that did yield partitions.
+    Mbr,
 }
 
 impl ContainerKind {
@@ -110,6 +114,7 @@ impl ContainerKind {
             ContainerKind::Super => "super",
             ContainerKind::Raw => "raw",
             ContainerKind::Gpt => "gpt",
+            ContainerKind::Mbr => "mbr",
         }
     }
 }
@@ -342,7 +347,7 @@ fn analyze_layer(src: Arc<dyn ByteSource>, depth: u32) -> Result<AndroidLayout> 
                 container: if gpt {
                     ContainerKind::Gpt
                 } else {
-                    ContainerKind::Raw
+                    ContainerKind::Mbr
                 },
                 partitions: parts,
                 vbmeta: vbmeta_info,
