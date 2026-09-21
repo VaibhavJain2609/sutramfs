@@ -91,6 +91,14 @@ impl BootSector {
                 format!("implausible MFT record size {file_record_size}"),
             ));
         }
+        // Same bound for INDX records (typically 4096): an unchecked size
+        // would drive absurd over-reads in the slack pass.
+        if index_record_size < bps || index_record_size > 0x1_0000 {
+            return Err(FsError::corrupt(
+                68,
+                format!("implausible index record size {index_record_size}"),
+            ));
+        }
         let serial = le::u64(&b, 72).unwrap_or(0);
         Ok(BootSector {
             bytes_per_sector: bps,

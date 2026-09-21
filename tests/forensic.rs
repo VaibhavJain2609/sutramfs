@@ -462,3 +462,215 @@ fn extension_record_not_emitted_standalone() {
         .any(|e| e.meta.get("mft_record").map(|r| r == "32").unwrap_or(false)
             && e.name != "ATTRLIST.BIN"));
 }
+
+#[test]
+fn dos_alias_and_dos_flags() {
+    let entries = all_entries();
+    let e = find(&entries, "DOSFLAGS.TXT");
+    assert_eq!(e.meta["dos_name"], "DOSFLA~1.TXT");
+    assert_eq!(e.meta["readonly"], "true");
+    assert_eq!(e.meta["hidden"], "true");
+    assert_eq!(e.meta["system"], "true");
+}
+
+#[test]
+fn symlink_reparse_target() {
+    let entries = all_entries();
+    let e = find(&entries, "SYMLINK.LNK");
+    assert_eq!(e.kind, sutram_fs::EntryKind::Symlink);
+    // PrintName field of the reparse buffer, not the substitute name.
+    assert_eq!(e.meta["symlink_target"], "target\\real.txt");
+    assert_eq!(e.meta["reparse_tag"], "0xa000000c");
+}
+
+#[test]
+fn object_id_and_fn_only_timestamps() {
+    let entries = all_entries();
+    let e = find(&entries, "OBJID.BIN");
+    assert_eq!(e.meta["object_id"], "04030201-0605-0807-090a-0b0c0d0e0f10");
+    // No $SI: FN is the only timestamp set and still fills Timestamps.
+    let m = e.timestamps.modified.as_ref().unwrap();
+    assert_eq!(m.value, Some(1_705_314_620_000_000_000));
+    assert!(e.meta.contains_key("fn_created"));
+    assert!(!e.meta.contains_key("si_created"));
+}
+
+#[test]
+fn compressed_raw_and_sparse_units() {
+    let entries = all_entries();
+    let e = find(&entries, "RAWCMP.BIN");
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), 32 * common::CSZ);
+    // Unit 0 was stored raw (incompressible) — verbatim bytes come back.
+    assert!(buf.starts_with(b"RAWCMP-UNIT0-STORED-RAW"));
+    // Unit 1 is a wholly sparse compression unit — zeros.
+    assert!(buf[16 * common::CSZ..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn sparse_stream_leading_vcn_gap() {
+    let entries = all_entries();
+    let e = find(&entries, "GAPDATA.BIN");
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), 8 * common::CSZ);
+    // VCNs 0..4 are an unmapped gap → zeros; the extent at VCN 4 is real.
+    assert!(buf[..4 * common::CSZ].iter().all(|&b| b == 0));
+    assert_eq!(&buf[4 * common::CSZ..4 * common::CSZ + 20], b"GAPDATA-REAL-EXTENT-");
+}
+
+#[test]
+fn deleted_extent_still_marked_in_bitmap() {
+    let entries = all_entries();
+    let e = find(&entries, "BITDEL.TXT");
+    // runlist covers 1 of 2 needed clusters; survivor is marked allocated.
+    assert_eq!(
+        e.meta["recovery_note_1"],
+        "runlist covers 1 of 2 expected clusters"
+    );
+    assert_eq!(
+        e.meta["recovery_note_2"],
+        "1 surviving cluster(s) still marked allocated in $BITMAP"
+    );
+    match e.status {
+        FsEntryStatus::Deleted {
+            recovery:
+                RecoveryState::PartiallyOverwritten {
+                    recovered_bytes,
+                    total_bytes,
+                },
+        } => assert_eq!((recovered_bytes, total_bytes), (4096, 8000)),
+        other => panic!("expected partial recovery, got {other:?}"),
+    }
+}
+
+#[test]
+fn deleted_dir_assessed_via_index_allocation() {
+    let entries = all_entries();
+    let e = find(&entries, "DELDIR");
+    // Cluster 63 is free and unclaimed — the index stream survives intact.
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    ));
+}
+
+#[test]
+fn orphan_extension_record_emitted() {
+    let entries = all_entries();
+    // record 42 is an extension record whose base (45) is an empty slot.
+    let e = entries
+        .iter()
+        .find(|e| e.meta.get("mft_record").map(|r| r == "42").unwrap_or(false))
+        .expect("orphan extension record should be emitted");
+    assert_eq!(e.meta["orphan"], "true");
+    assert_eq!(e.name, "EXTORPHAN.DAT");
+    assert!(e.path.starts_with("/$ORPHANED/"));
+}
+
+#[test]
+fn corrupt_attribute_recorded_as_note() {
+    let entries = all_entries();
+    let e = find(&entries, "BADATTR.BIN");
+    assert!(e.meta["note"].starts_with("attribute parse:"), "{}", e.meta["note"]);
+}
+
+#[test]
+fn deleted_ads_stream_assessed() {
+    let entries = all_entries();
+    let e = find(&entries, "DELADS.TXT:hidden");
+    assert_eq!(e.path, "/DELADS.TXT:hidden");
+    assert_eq!(e.meta["ads"], "true");
+    // Resident stream data lives in the surviving record → intact.
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    ));
+}
+
+#[test]
+fn indx_root_slack_residue() {
+    let entries = all_entries();
+    // Slack of the resident $INDEX_ROOT inside SUBDIR's record.
+    let slack = entries
+        .iter()
+        .find(|e| {
+            e.meta.get("source").map(|s| s.as_str()) == Some("indx_slack")
+                && e.name == "ROOTSLACK.TXT"
+        })
+        .expect("index-root slack residue should be emitted");
+    assert_eq!(slack.path, "/SUBDIR/ROOTSLACK.TXT");
+    assert_eq!(slack.meta["target_record"], "91");
+}
+
+#[test]
+fn read_file_rejects_directories() {
+    let entries = all_entries();
+    let e = find(&entries, "SUBDIR");
+    let err = mount().read_file(e).err().expect("not a file");
+    assert!(matches!(err, sutram_fs::FsError::InvalidInput { .. }));
+}
+
+#[test]
+fn source_accessor_returns_image() {
+    let fs = mount();
+    assert_eq!(fs.source().len(), image().len());
+    assert_eq!(NtfsParser.name(), "ntfs");
+}
+
+#[test]
+fn mount_rejects_bad_boot_sectors() {
+    // Valid image, then successively break each checked field.
+    for (off, val, why) in [
+        (3usize, 0u8, "OEM"),
+        (510, 0u8, "signature"),
+        (11, 0u8, "bytes/sector"),
+        (13, 0u8, "sectors/cluster"),
+        (40, 0u8, "total sectors"),
+        (64, 0u8, "clusters-per-record"),
+    ] {
+        let mut img = common::build_ntfs();
+        match off {
+            11 => common::w16(&mut img, 11, 300), // not a power of two
+            40 => common::w64(&mut img, 40, 0),
+            _ => img[off] = val,
+        }
+        let src: Arc<dyn ByteSource> = Arc::new(img);
+        assert!(
+            NtfsParser.mount(src).is_err(),
+            "mount should reject corrupt {why}"
+        );
+    }
+    // Truncated boot sector.
+    let tiny: Arc<dyn ByteSource> = Arc::new(vec![0u8; 100]);
+    assert!(NtfsParser.mount(tiny).is_err());
+    // Garbage index-record-size byte (0x00 → decode fails; 0x7F → implausible).
+    for bad in [0x00u8, 0x7F] {
+        let mut img = common::build_ntfs();
+        img[68] = bad;
+        let src: Arc<dyn ByteSource> = Arc::new(img);
+        assert!(NtfsParser.mount(src).is_err(), "index record byte {bad:#x}");
+    }
+    // $MFT LCN out of range.
+    let mut img = common::build_ntfs();
+    common::w64(&mut img, 48, 999_999);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(NtfsParser.mount(src).is_err());
+}
+
+#[test]
+fn detect_low_confidence_without_signature() {
+    // NTFS OEM string but no 0x55AA → Low, not None.
+    let mut img = common::build_ntfs();
+    img[510] = 0;
+    img[511] = 0;
+    assert_eq!(
+        NtfsParser.detect(&img.as_slice()),
+        DetectConfidence::Low
+    );
+}

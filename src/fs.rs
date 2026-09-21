@@ -223,9 +223,12 @@ impl NtfsFs {
 
         // Scan bound: the MFT's *allocated* span (covers MFT slack used for
         // fragment carving), capped by run coverage and image size.
-        let covered_clusters: u64 = fs.mft_runs.iter().map(|r| r.len).sum();
+        let covered_clusters: u64 = fs
+            .mft_runs
+            .iter()
+            .fold(0u64, |acc, r| acc.saturating_add(r.len));
         let scan_bytes = mft_alloc_size
-            .min(covered_clusters * csz)
+            .min(covered_clusters.saturating_mul(csz))
             .min(fs.src.len());
         let rec_count = scan_bytes / rec_size;
         fs.live_rec_end = mft_data_size / rec_size;
@@ -335,8 +338,12 @@ impl NtfsFs {
         let vcn = logical / csz;
         let in_run = logical % csz;
         for r in &self.mft_runs {
-            if vcn >= r.vcn && vcn < r.vcn + r.len {
-                return r.lcn.map(|l| l * csz + (vcn - r.vcn) * csz + in_run);
+            if vcn >= r.vcn && vcn < r.vcn.saturating_add(r.len) {
+                return r.lcn.and_then(|l| {
+                    l.saturating_mul(csz)
+                        .checked_add((vcn - r.vcn).saturating_mul(csz))
+                        .and_then(|o| o.checked_add(in_run))
+                });
             }
         }
         None
@@ -517,10 +524,12 @@ impl NtfsFs {
             if out.len() as u64 >= size {
                 break;
             }
-            let want = ((r.len * csz).min(size - out.len() as u64)) as usize;
+            let want = (r.len.saturating_mul(csz).min(size - out.len() as u64)) as usize;
             match r.lcn {
                 Some(l) => {
-                    let b = src.read_slice(l * csz, want).map_err(FsError::Io)?;
+                    let b = src
+                        .read_slice(l.saturating_mul(csz), want)
+                        .map_err(FsError::Io)?;
                     out.extend_from_slice(&b);
                     if b.len() < want {
                         break; // truncated source
@@ -596,28 +605,32 @@ impl NtfsFs {
     }
 
     /// Subtract live-claimed clusters from `runs`; returns surviving
-    /// `(lcn, len)` cluster extents plus per-run logical VCN for reporting.
-    pub(crate) fn surviving_runs(&self, runs: &[DataRun]) -> (Vec<(u64, u64)>, Vec<String>) {
+    /// `(vcn, lcn, len)` cluster extents so callers can map survivors back
+    /// to logical file offsets.
+    pub(crate) fn surviving_runs(
+        &self,
+        runs: &[DataRun],
+    ) -> (Vec<(u64, u64, u64)>, Vec<String>) {
         let mut surviving = Vec::new();
         let mut notes = Vec::new();
         let mut lost = 0u64;
         for r in runs {
             let Some(lcn) = r.lcn else { continue }; // sparse runs: nothing to lose
             let mut pos = lcn;
-            let run_end = lcn + r.len;
+            let run_end = lcn.saturating_add(r.len);
             while pos < run_end {
                 // Find the first live range that could overlap [pos, run_end).
                 let idx = self.live_ranges.partition_point(|&(s, _)| s <= pos);
                 let overlap = if idx > 0 {
                     let (s, l) = self.live_ranges[idx - 1];
-                    if s + l > pos { Some((s, l)) } else { None }
+                    if s.saturating_add(l) > pos { Some((s, l)) } else { None }
                 } else {
                     None
                 };
                 match overlap {
                     Some((s, l)) if s <= pos => {
                         // pos inside a live range — skip to its end.
-                        pos = (s + l).min(run_end);
+                        pos = s.saturating_add(l).min(run_end);
                         lost += 1; // refined below by bytes
                     }
                     _ => {
@@ -628,7 +641,7 @@ impl NtfsFs {
                             .find(|&s| s > pos)
                             .unwrap_or(run_end);
                         let free_end = next_live.min(run_end);
-                        surviving.push((pos, free_end - pos));
+                        surviving.push((r.vcn + (pos - lcn), pos, free_end - pos));
                         pos = free_end;
                     }
                 }
@@ -784,22 +797,20 @@ impl FileSystem for NtfsFs {
         let needs_rebuild = matches!(entry.status, sutram_fs::FsEntryStatus::Live)
             && (entry.meta.contains_key("sparse") || entry.meta.contains_key("compressed"));
         if needs_rebuild {
-            match self.rebuild_stream(entry) {
-                Ok(stream) => {
-                    if stream.compressed {
-                        return Ok(Box::new(CompressedReader::new(
-                            self.src.clone(),
-                            stream,
-                            self.bs.cluster_size,
-                        )));
-                    }
-                    return Ok(Box::new(SparseReader::new(
+            // Fall back to flat extents when the stream can't be rebuilt.
+            if let Ok(stream) = self.rebuild_stream(entry) {
+                if stream.compressed {
+                    return Ok(Box::new(CompressedReader::new(
                         self.src.clone(),
                         stream,
                         self.bs.cluster_size,
                     )));
                 }
-                Err(_) => {} // fall back to extents
+                return Ok(Box::new(SparseReader::new(
+                    self.src.clone(),
+                    stream,
+                    self.bs.cluster_size,
+                )));
             }
         }
         Ok(Box::new(ExtentReader {
@@ -925,12 +936,9 @@ impl Read for SparseReader {
                     .min(foff + len - self.pos)
                     .min(self.size - self.pos) as usize;
                 let n = match doff {
-                    Some(d) => {
-                        let n = self
-                            .src
-                            .read_at(d + (self.pos - foff), &mut buf[..want])?;
-                        n
-                    }
+                    Some(d) => self
+                        .src
+                        .read_at(d + (self.pos - foff), &mut buf[..want])?,
                     None => {
                         buf[..want].fill(0);
                         want
@@ -940,8 +948,18 @@ impl Read for SparseReader {
                 return Ok(n);
             }
         }
-        // Gap in the map (uninitialized tail) — zeros.
-        let want = (buf.len() as u64).min(self.size - self.pos) as usize;
+        // Gap in the map (uninitialized region between runs) — zeros,
+        // but only up to the next extent so real data isn't skipped.
+        let next_start = self
+            .map
+            .iter()
+            .filter(|&&(foff, _, _)| foff > self.pos)
+            .map(|&(foff, _, _)| foff)
+            .min()
+            .unwrap_or(self.size);
+        let want = (buf.len() as u64)
+            .min(self.size - self.pos)
+            .min(next_start - self.pos) as usize;
         buf[..want].fill(0);
         self.pos += want as u64;
         Ok(want)

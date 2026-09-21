@@ -163,7 +163,10 @@ pub(crate) fn decode_runlist(buf: &[u8], base_vcn: u64, limit_off: u64) -> Resul
             for i in 0..off_sz {
                 v |= (buf[pos + i] as i64) << (8 * i);
             }
-            if buf[pos + off_sz - 1] & 0x80 != 0 {
+            // Sign-extend only for fields narrower than i64: at off_sz == 8
+            // the loaded bytes already *are* the full signed value, and a
+            // `<< 64` would overflow (debug panic / masked shift in release).
+            if off_sz < 8 && buf[pos + off_sz - 1] & 0x80 != 0 {
                 v |= -1i64 << (8 * off_sz);
             }
             pos += off_sz;
@@ -189,7 +192,9 @@ pub(crate) fn decode_runlist(buf: &[u8], base_vcn: u64, limit_off: u64) -> Resul
             }
             None => runs.push(DataRun { vcn, len, lcn: None }),
         }
-        vcn += len;
+        vcn = vcn.checked_add(len).ok_or_else(|| {
+            FsError::corrupt(limit_off + pos as u64, "runlist VCN overflow")
+        })?;
     }
     Ok(runs)
 }
@@ -224,6 +229,15 @@ pub(crate) fn parse_attr(data: &[u8], off: usize, rec_off: u64) -> Result<Option
     let name_off = le::u16(data, off + 10).unwrap_or(0) as usize;
     let flags = le::u16(data, off + 12).unwrap_or(0);
     let name = if name_len > 0 {
+        // The name lives inside the attribute header: bound it by this
+        // attribute's own length so a corrupt name_off cannot alias the
+        // following attribute's bytes.
+        if name_off + name_len * 2 > len {
+            return Err(FsError::corrupt(
+                rec_off + off as u64,
+                "attribute name out of bounds",
+            ));
+        }
         match le::get(data, off + name_off, name_len * 2) {
             Some(nb) => Some(utf16(nb)),
             None => {
@@ -258,7 +272,11 @@ pub(crate) fn parse_attr(data: &[u8], off: usize, rec_off: u64) -> Result<Option
         let end = (off + content_off)
             .checked_add(content_len as usize)
             .ok_or_else(|| FsError::corrupt(rec_off + off as u64, "resident content overflow"))?;
-        if end > data.len() || content_off as usize >= len {
+        // Resident content lives *inside* the attribute: it must fit both
+        // the record and this attribute's own `len`, else a corrupt
+        // content_len would alias the following attributes' bytes.
+        let content_end = content_off as u64 + content_len as u64;
+        if end > data.len() || content_end > len as u64 {
             return Err(FsError::corrupt(
                 rec_off + off as u64,
                 format!("resident content out of bounds (type {type_code:#x})"),
@@ -442,10 +460,12 @@ pub(crate) fn parse_reparse(body: &[u8]) -> Option<(u32, Option<String>)> {
         return None;
     }
     let tag = le::u32(body, 0)?;
-    // IO_REPARSE_TAG_SYMLINK = 0xA000000C: print name is the display target.
+    // IO_REPARSE_TAG_SYMLINK = 0xA000000C: the display target is the
+    // PrintName field — PrintNameOffset@0x0C / PrintNameLength@0x0E,
+    // relative to PathBuffer@0x14 (0x10 is the SYMLINK Flags field).
     let target = if tag == 0xA000_000C && body.len() >= 0x14 {
-        let print_off = le::u16(body, 0x0E).unwrap_or(0) as usize;
-        let print_len = le::u16(body, 0x10).unwrap_or(0) as usize;
+        let print_off = le::u16(body, 0x0C).unwrap_or(0) as usize;
+        let print_len = le::u16(body, 0x0E).unwrap_or(0) as usize;
         le::get(body, 0x14 + print_off, print_len).map(utf16)
     } else {
         None

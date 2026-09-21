@@ -23,9 +23,13 @@
 //! | 52–53    | NEWFILE.TXT (live — overwrote PARTIAL's first extent)  |
 //! | 54–55    | PARTIAL.BIN surviving tail                            |
 //! | 60,61    | EVIL.DOC (MZ), RESUME.DOCX (PK)                       |
+//! | 62       | BITDEL.TXT (deleted, still marked in $BITMAP)           |
+//! | 63       | DELDIR $INDEX_ALLOCATION (deleted dir)                  |
 //! | 64       | COMPRESS.BIN LZNT1 unit                               |
 //! | 70–71,72–73 | ATTRLIST.BIN split extents                       |
 //! | 80       | root dir INDX block (live + slack + dangling entries)  |
+//! | 96–111   | RAWCMP.BIN unit 0 stored raw (unit 1 is fully sparse)   |
+//! | 120–123  | GAPDATA.BIN extent (VCN gap before it)                  |
 
 pub const BPS: usize = 512;
 pub const SPC: usize = 8;
@@ -47,12 +51,14 @@ pub const FLG_DIR: u16 = 0x02;
 pub const T_SI: u32 = 0x10;
 pub const T_ALIST: u32 = 0x20;
 pub const T_FN: u32 = 0x30;
+pub const T_OBJID: u32 = 0x40;
 pub const T_VNAME: u32 = 0x60;
 pub const T_VINFO: u32 = 0x70;
 pub const T_DATA: u32 = 0x80;
 pub const T_IROOT: u32 = 0x90;
 pub const T_IALLOC: u32 = 0xA0;
 pub const T_BITMAP: u32 = 0xB0;
+pub const T_REPARSE: u32 = 0xC0;
 pub const T_EAINFO: u32 = 0xD0;
 pub const T_EA: u32 = 0xE0;
 
@@ -287,6 +293,24 @@ pub fn ea_body(entries: &[(&str, &[u8])]) -> Vec<u8> {
         e[8 + name.len() + 1..8 + name.len() + 1 + val.len()].copy_from_slice(val);
         b.extend_from_slice(&e);
     }
+    b
+}
+
+/// $REPARSE_POINT content for a symlink: substitute + print names.
+pub fn reparse_symlink_body(substitute: &str, print: &str) -> Vec<u8> {
+    let sub = utf16(substitute);
+    let prn = utf16(print);
+    let total = 0x14 + sub.len() + prn.len();
+    let mut b = vec![0u8; total];
+    w32(&mut b, 0, 0xA000_000C); // IO_REPARSE_TAG_SYMLINK
+    w16(&mut b, 4, (total - 8) as u16); // data length (excl. header)
+    w16(&mut b, 8, 0); // SubstituteNameOffset
+    w16(&mut b, 0x0A, sub.len() as u16);
+    w16(&mut b, 0x0C, sub.len() as u16); // PrintNameOffset (after substitute)
+    w16(&mut b, 0x0E, prn.len() as u16);
+    w32(&mut b, 0x10, 1); // SYMLINK_FLAG_RELATIVE
+    b[0x14..0x14 + sub.len()].copy_from_slice(&sub);
+    b[0x14 + sub.len()..0x14 + sub.len() + prn.len()].copy_from_slice(&prn);
     b
 }
 
@@ -825,9 +849,11 @@ pub fn build_ntfs() -> Vec<u8> {
     );
 
     // ---- record 24: SUBDIR -------------------------------------------------------
+    // Index-root slack: ROOTSLACK.TXT is deleted-name residue between the
+    // used and allocated lengths of the resident index node.
     let sub_ir = index_root_body(
         &[indx_entry(25, "INNER.TXT", 24, 5, [t; 4]), indx_end()],
-        &[],
+        &[indx_entry(91, "ROOTSLACK.TXT", 24, 5, [t; 4])],
     );
     file_record(
         &mut img,
@@ -1043,6 +1069,225 @@ pub fn build_ntfs() -> Vec<u8> {
         ],
     );
 
+    // ---- record 35: DOSFLAGS.TXT — DOS 8.3 alias + DOS attribute bits ------------------------
+    file_record(
+        &mut img,
+        35,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x07), 0), // RO+hidden+system
+            attr_resident(T_FN, "", &fn_body(5, "DOSFLAGS.TXT", 1, 0x20, 5, [t; 4]), 1),
+            attr_resident(T_FN, "", &fn_body(5, "DOSFLA~1.TXT", 2, 0x20, 5, [t; 4]), 2),
+            attr_resident(T_DATA, "", b"flags", 3),
+        ],
+    );
+
+    // ---- record 36: SYMLINK.LNK — $REPARSE_POINT symlink ---------------------------------------
+    file_record(
+        &mut img,
+        36,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "SYMLINK.LNK", 1, 0x20, 0, [t; 4]), 1),
+            attr_resident(
+                T_REPARSE,
+                "",
+                &reparse_symlink_body("\\??\\C:\\target\\real.txt", "target\\real.txt"),
+                2,
+            ),
+        ],
+    );
+
+    // ---- record 37: OBJID.BIN — $OBJECT_ID, and no $SI (FN-only timestamps) ---------------------
+    file_record(
+        &mut img,
+        37,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0,
+        &[
+            attr_resident(T_FN, "", &fn_body(5, "OBJID.BIN", 1, 0x20, 4, [t; 4]), 1),
+            attr_resident(
+                T_OBJID,
+                "",
+                &[
+                    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+                    0x0D, 0x0E, 0x0F, 0x10,
+                ],
+                2,
+            ),
+            attr_resident(T_DATA, "", b"oid!", 3),
+        ],
+    );
+
+    // ---- record 38: RAWCMP.BIN — compressed stream, unit 0 stored raw, unit 1 sparse -------------
+    // A 16-cluster unit that did not compress is stored verbatim; a fully
+    // sparse unit decodes to zeros.
+    file_record(
+        &mut img,
+        38,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "RAWCMP.BIN", 1, 0x20, 32 * CSZ as u64, [t; 4]), 1),
+            attr_nonresident(
+                T_DATA,
+                "",
+                &[(16, Some(96)), (16, None)],
+                0,
+                32 * CSZ as u64,
+                32 * CSZ as u64,
+                32 * CSZ as u64,
+                AFLAG_COMPRESSED | AFLAG_SPARSE,
+                4,
+                2,
+            ),
+        ],
+    );
+    put(&mut img, 96, b"RAWCMP-UNIT0-STORED-RAW");
+
+    // ---- record 39: GAPDATA.BIN — sparse stream with a leading VCN gap ---------------------------
+    // first_vcn=4: logical offsets 0..16KiB are an unmapped gap (reads as
+    // zeros) before the real extent at vcn 4.
+    file_record(
+        &mut img,
+        39,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "GAPDATA.BIN", 1, 0x20, 8 * CSZ as u64, [t; 4]), 1),
+            attr_nonresident(
+                T_DATA,
+                "",
+                &[(4, Some(120))],
+                4, // first VCN — bytes before this are a hole
+                8 * CSZ as u64,
+                8 * CSZ as u64,
+                8 * CSZ as u64,
+                AFLAG_SPARSE,
+                0,
+                2,
+            ),
+        ],
+    );
+    put(&mut img, 120, b"GAPDATA-REAL-EXTENT-");
+
+    // ---- record 40: BITDEL.TXT — deleted; extent still marked in $BITMAP --------------------------
+    // Cluster 62 stays marked allocated in the volume bitmap although no
+    // live record claims it — the "still marked allocated" anomaly note.
+    file_record(
+        &mut img,
+        40,
+        b"FILE",
+        2,
+        0, // deleted
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "BITDEL.TXT", 1, 0x20, 8000, [t; 4]), 1),
+            attr_nonresident(T_DATA, "", &[(1, Some(62))], 0, CSZ as u64, 8000, CSZ as u64, 0, 0, 2),
+        ],
+    );
+    put(&mut img, 62, b"BITDEL-SURVIVING-CLUSTER");
+
+    // ---- record 41: DELDIR — deleted directory with $INDEX_ALLOCATION ----------------------------
+    file_record(
+        &mut img,
+        41,
+        b"FILE",
+        1,
+        FLG_DIR, // deleted directory
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x1000_0006), 0),
+            attr_resident(T_FN, "", &fn_body(5, "DELDIR", 1, 0x1000_0006, 0, [t; 4]), 1),
+            attr_nonresident(
+                T_IALLOC,
+                "$I30",
+                &[(1, Some(63))],
+                0,
+                INDX_SIZE as u64,
+                INDX_SIZE as u64,
+                INDX_SIZE as u64,
+                0,
+                0,
+                2,
+            ),
+        ],
+    );
+
+    // ---- record 42: orphaned extension record (base record 45 absent) ----------------------------
+    file_record(
+        &mut img,
+        42,
+        b"FILE",
+        1,
+        FLG_INUSE,
+        1,
+        45, // base record ref — record 45 is an empty slot
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(45, "EXTORPHAN.DAT", 1, 0x20, 0, [t; 4]), 1),
+        ],
+    );
+
+    // ---- record 43: BADATTR.BIN — live record with a corrupt attribute header --------------------
+    {
+        let mut bad = attr_resident(T_DATA, "", b"x", 4);
+        w32(&mut bad, 4, 0x00FF_FFFF); // attribute length runs off the record
+        file_record(
+            &mut img,
+            43,
+            b"FILE",
+            1,
+            FLG_INUSE,
+            1,
+            0,
+            &[
+                attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+                attr_resident(T_FN, "", &fn_body(5, "BADATTR.BIN", 1, 0x20, 1, [t; 4]), 1),
+                bad,
+            ],
+        );
+    }
+
+    // ---- record 44: DELADS.TXT — deleted file with a named stream ---------------------------------
+    file_record(
+        &mut img,
+        44,
+        b"FILE",
+        1,
+        0, // deleted
+        1,
+        0,
+        &[
+            attr_resident(T_SI, "", &si_body(t, t, t, t, 0x20), 0),
+            attr_resident(T_FN, "", &fn_body(5, "DELADS.TXT", 1, 0x20, 8, [t; 4]), 1),
+            attr_resident(T_DATA, "hidden", b"dead-ads", 2),
+        ],
+    );
+
     // ---- record 70: FILE fragment in MFT slack ----------------------------------------------
     // (MFT allocated = 20 clusters → records 0..79; used = 16 clusters → 0..63)
     file_record(
@@ -1103,11 +1348,14 @@ pub fn build_ntfs() -> Vec<u8> {
 
     // ---- volume cluster bitmap at cluster 30 -----------------------------------------------------
     // mark allocated: 0-3 (boot/rsvd), 4-23 (MFT), 30-33, 40-47, 52-53,
-    // 60-61, 64, 70-73, 80.
+    // 60-61, 64, 70-73, 80, plus the live extents of the extra records.
+    // 62 is marked although only the *deleted* BITDEL.TXT points at it —
+    // the "deallocation never committed" anomaly the parser reports.
     for c in 0..TOTAL_CLUSTERS {
         let used = matches!(
             c,
-            0..=3 | 4..=23 | 30..=33 | 40..=47 | 52..=53 | 60..=61 | 64 | 70..=73 | 80
+            0..=3 | 4..=23 | 30..=33 | 40..=47 | 52..=53 | 60..=64 | 70..=73 | 80
+                | 96..=111 | 120..=123
         );
         bitmap_set(&mut img, c, used);
     }

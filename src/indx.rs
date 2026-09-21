@@ -78,11 +78,13 @@ pub(crate) fn index_entries(
             break;
         }
         let is_end = flags & 0x02 != 0;
+        // The stream lives inside the entry: cap at the declared entry
+        // size so a corrupt stream_len cannot alias the following entry.
         let entry = IndexEntry {
             file_ref: le::u64(data, base).unwrap_or(0),
             record_no: le::u64(data, base).unwrap_or(0) & 0x0000_FFFF_FFFF_FFFF,
             body_off: base + 0x10,
-            body_len: stream_len,
+            body_len: stream_len.min(size.saturating_sub(0x10)),
             is_end,
             rel_off: pos,
         };

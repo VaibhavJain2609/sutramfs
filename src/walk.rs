@@ -243,8 +243,16 @@ impl<'m> Walk<'m> {
         let (surviving, mut n) = self.fs.surviving_runs(&s.runs);
         notes.append(&mut n);
         let expected = s.real_size.div_ceil(csz);
-        let allocated: u64 = s.runs.iter().filter(|r| r.lcn.is_some()).map(|r| r.len).sum();
-        let sparse: u64 = s.runs.iter().filter(|r| r.lcn.is_none()).map(|r| r.len).sum();
+        let allocated: u64 = s
+            .runs
+            .iter()
+            .filter(|r| r.lcn.is_some())
+            .fold(0u64, |a, r| a.saturating_add(r.len));
+        let sparse: u64 = s
+            .runs
+            .iter()
+            .filter(|r| r.lcn.is_none())
+            .fold(0u64, |a, r| a.saturating_add(r.len));
         if allocated < expected && sparse == 0 {
             notes.push(format!(
                 "runlist covers {allocated} of {expected} expected clusters"
@@ -253,21 +261,29 @@ impl<'m> Walk<'m> {
         if sparse > 0 {
             notes.push(format!("{sparse} sparse cluster(s) (zero-filled content)"));
         }
+        // Survivors carry their logical VCN: only clusters inside the
+        // file's [0, real_size) window count as recoverable bytes — data
+        // beyond the logical end (partially-trimmed tail) does not.
+        let eof_vcn = s.real_size.div_ceil(csz);
         let mut surviving_bytes: u64 = 0;
         let mut ranges = Vec::new();
-        let mut remaining = s.real_size;
-        for &(lcn, len) in &surviving {
-            let blen = (len * csz).min(remaining);
-            surviving_bytes += blen;
-            remaining = remaining.saturating_sub(blen);
-            ranges.push((lcn * csz, len * csz));
+        for &(vcn, lcn, len) in &surviving {
+            // Clusters of this extent that fall inside [0, eof_vcn).
+            let in_file = eof_vcn.saturating_sub(vcn).min(len);
+            surviving_bytes = surviving_bytes.saturating_add(in_file.saturating_mul(csz));
+            let off = lcn.saturating_mul(csz);
+            ranges.push((
+                off,
+                len.saturating_mul(csz)
+                    .min(self.fs.src.len().saturating_sub(off)),
+            ));
         }
-        let surviving_clusters: u64 = surviving.iter().map(|&(_, l)| l).sum();
+        let surviving_clusters: u64 = surviving.iter().map(|&(_, _, l)| l).sum();
         // $BITMAP cross-check: extents still marked allocated suggest the
         // deletion never fully committed (or $BITMAP itself is stale).
         let marked: u64 = surviving
             .iter()
-            .map(|&(l, len)| {
+            .map(|&(_, l, len)| {
                 (0..len)
                     .filter(|&c| self.fs.cluster_allocated(l + c) == Some(true))
                     .count() as u64
@@ -692,9 +708,9 @@ impl<'m> Walk<'m> {
         {
             for r in &a.runs {
                 let Some(lcn) = r.lcn else { continue };
-                let mut off = lcn * csz;
-                let end = off + r.len * csz;
-                while off + irec as u64 <= end {
+                let mut off = lcn.saturating_mul(csz);
+                let end = off.saturating_add(r.len.saturating_mul(csz));
+                while end.saturating_sub(off) >= irec as u64 {
                     let raw = match self.fs.src.read_slice(off, irec) {
                         Ok(b) => b,
                         Err(e) => {
@@ -874,8 +890,9 @@ fn decorate_stream_meta(meta: &mut HashMap<String, String>, s: &Stream, csz: u64
             .runs
             .iter()
             .filter(|r| r.lcn.is_some())
-            .map(|r| r.len * csz)
-            .sum();
+            .fold(0u64, |acc, r| {
+                acc.saturating_add(r.len.saturating_mul(csz))
+            });
         if alloc > s.real_size {
             meta.insert("slack_len".into(), (alloc - s.real_size).to_string());
         }
