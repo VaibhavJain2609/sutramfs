@@ -1,0 +1,17 @@
+[package]
+name = "sutram-archive"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Forensic archive/container parsers (ZIP, TAR, CPIO): deleted/hidden entries, anomalies, provenance, magic verdicts"
+keywords = ["forensics", "archive", "zip", "tar", "cpio", "dfir"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
+# Pure-Rust DEFLATE for ZIP method 8 (already used by sutram-io's EWF
+# reader; no C FFI). `with-alloc` is a default feature.
+miniz_oxide = "0.9"
