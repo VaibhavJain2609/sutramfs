@@ -332,7 +332,6 @@ impl Ext4Fs {
     /// Read a directory's data (bounded by `MAX_DIR_BYTES`) plus a
     /// logical→disk offset map for dirent provenance.
     pub(crate) fn read_dir(&self, inode: &Inode) -> Result<(Vec<u8>, DirMap)> {
-        let cap = inode.size.min(MAX_DIR_BYTES);
         match self.map(inode)? {
             BlockMap::Inline { len } => {
                 // Inline-data file (files aren't normally read as dirs,
@@ -349,6 +348,15 @@ impl Ext4Fs {
             }
             BlockMap::Empty => Ok((Vec::new(), Vec::new())),
             BlockMap::Runs(runs) => {
+                // Read the whole mapped range, not just i_size: a
+                // corrupt/short i_size must not hide dirents or the
+                // freed-entry residue that can survive past it.
+                let mapped_end = runs
+                    .iter()
+                    .map(|r| (r.logical + r.len) * self.sb.block_size)
+                    .max()
+                    .unwrap_or(0);
+                let cap = inode.size.max(mapped_end).min(MAX_DIR_BYTES);
                 let mut data = Vec::new();
                 let mut map = Vec::new();
                 let mut logical = 0u64;

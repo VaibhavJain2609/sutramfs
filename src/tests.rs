@@ -383,6 +383,19 @@ fn indirect_double_and_self_cycle() {
 }
 
 #[test]
+fn indirect_cap_tracks_file_size() {
+    // The logical-slot bound must reach a legit 20 GiB file's tail on a
+    // large volume (blocks_count > 4M) — the old flat 4M cap truncated.
+    let cap = extent::indirect_cap(20 << 30, 4096, 1 << 30);
+    assert!(cap >= (20 << 30) / 4096, "cap {cap} below size-in-blocks");
+    // But it is still bounded: huge corrupt sizes clamp to blocks_count,
+    // small/zero sizes floor at 4M slots (never hide residue).
+    assert_eq!(extent::indirect_cap(u64::MAX, 4096, 1 << 30), 1 << 30);
+    assert_eq!(extent::indirect_cap(0, 4096, 1 << 30), 1 << 22);
+    assert_eq!(extent::indirect_cap(0, 1024, 1000), 1000);
+}
+
+#[test]
 fn superblock_rejects_bad_fields() {
     let base = || {
         let mut img = vec![0u8; 4096];

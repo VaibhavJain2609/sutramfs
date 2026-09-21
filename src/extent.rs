@@ -84,7 +84,7 @@ pub(crate) fn map_inode(
     }
     Ok(BlockMap::Runs(walk_indirect(
         src,
-        &inode.block60,
+        inode,
         block_size,
         blocks_count,
     )?))
@@ -189,14 +189,25 @@ fn walk_extents(
 // Legacy direct/indirect block map (ext2/3)
 // ---------------------------------------------------------------------------
 
+/// Logical-slot bound for an indirect map: the file's declared size in
+/// blocks, but never below a 4M-slot floor (a corrupt small `i_size`
+/// must not hide data) and never above the volume's block count (a
+/// corrupt huge `i_size` must not drive an unbounded walk).
+pub(crate) fn indirect_cap(size: u64, block_size: u64, blocks_count: u64) -> u64 {
+    size.div_ceil(block_size)
+        .min(blocks_count)
+        .max(blocks_count.min(1 << 22))
+}
+
 /// Decode the 15 `i_block` slots of a non-extents inode:
 /// 12 direct, then single/double/triple indirect block-number lists.
 fn walk_indirect(
     src: &dyn ByteSource,
-    block60: &[u8; 60],
+    inode: &Inode,
     block_size: u64,
     blocks_count: u64,
 ) -> Result<Vec<BlockRun>> {
+    let block60 = &inode.block60;
     let mut runs = Vec::new();
     let mut logical = 0u64;
     let ptrs = |i: usize| -> u32 { le::u32(block60, i * 4).unwrap_or(0) };
@@ -211,8 +222,10 @@ fn walk_indirect(
     // Indirect pointers at depth 1..3.
     let per_block = block_size / 4;
     let mut visited = HashSet::new();
-    // Total data blocks cannot exceed the volume's block count.
-    let cap = blocks_count.min(1 << 22);
+    // Logical-slot bound: the file's own size, raised to at least 4M
+    // slots so a corrupt small i_size can't hide data (and a corrupt
+    // huge i_size is still bounded by the volume's block count).
+    let cap = indirect_cap(inode.size, block_size, blocks_count);
     for level in 1..=3u8 {
         let root_ptr = ptrs(11 + level as usize) as u64;
         if root_ptr == 0 {

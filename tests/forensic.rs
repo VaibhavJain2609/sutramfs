@@ -705,3 +705,23 @@ fn deleted_entry_partial_ranges_cap_read() {
     assert!(buf.starts_with(b"OLD LOG TAIL SURVIVES HERE"));
     assert!(!buf.windows(7).any(|w| w == b"NEWFILE"));
 }
+
+#[test]
+fn dir_with_short_isize_still_walks() {
+    // A corrupt directory i_size must not hide the block's dirents or
+    // residue: shrink subdir (ino 12) i_size to 16 bytes — live dirents
+    // start at offset 24, so a naive size-capped read finds nothing.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::inode_off(12) + 4, 16);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = Ext4Parser.mount(src).unwrap();
+    let paths: Vec<String> = fs
+        .walk()
+        .filter_map(|r| r.ok())
+        .map(|e| e.path)
+        .collect();
+    assert!(
+        paths.iter().any(|p| p == "/subdir/inner.txt"),
+        "short i_size hid /subdir/inner.txt: {paths:?}"
+    );
+}
