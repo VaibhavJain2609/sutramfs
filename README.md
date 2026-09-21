@@ -45,8 +45,9 @@ Pure HFS is detected but not mounted (`FsError::Unsupported`).
 - **decmpfs compression** — `com.apple.decmpfs` headers parsed
   (`decmpfs_type`, `decmpfs_uncompressed_size` meta). Types 1/9/10
   (uncompressed) and 3/4 (zlib inline / zlib resource-fork block table)
-  decompress transparently in `read_file` via pure-Rust `miniz_oxide`.
-  LZVN (7/8) and LZFSE (11/12) are flagged `compression_note=unsupported`.
+  decompress transparently in `read_file` via pure-Rust `miniz_oxide`;
+  LZVN (7 inline / 8 resource-fork) via `sutram-compress`. LZFSE (11/12)
+  and LZBITMAP (13/14) are flagged `compression_note=unsupported`.
 - **Deleted & recoverable entries** — three residue sources:
   1. free space inside live catalog leaf nodes,
   2. dead B-tree nodes freed by compaction (still descriptor-valid),
@@ -138,11 +139,11 @@ deleted entry returns only recoverable bytes.
   it is out of scope for this crate.
 - **Journal replay is not implemented** — JIB/buffer metadata is
   reported; transactions pending at acquisition are not applied.
-- **Compression** — only decmpfs types 1/3/4/9/10 decompress; LZVN
-  (types 7/8) and LZFSE (types 11/12) surface `compression_note` =
-  `unsupported` and read back the stored (compressed) bytes.
+- **Compression** — decmpfs types 1/3/4/7/8/9/10 decompress (zlib and
+  LZVN, inline and resource-fork table); LZFSE (11/12) and LZBITMAP
+  (13/14) surface `compression_note` = `unsupported`.
 - **Encrypted volumes** (FileVault/CoreStorage) and **compressed
-  resource-fork codecs** beyond zlib are not handled.
+  resource-fork codecs** beyond zlib/LZVN are not handled.
 - **Free-space residue** cannot always recover full key context (e.g.
   parent CNID of a key whose surrounding bytes were overwritten); such
   entries appear under `/$DELETED`/`/$ORPHANED` with `residue` meta.

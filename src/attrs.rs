@@ -9,8 +9,9 @@
 //! (LE magic `"cmpf"` = 0x636d7066, LE `compression_type`, LE
 //! `uncompressed_size`), then either an inline payload (odd types) or a
 //! resource-fork block table (even types). zlib types (3 inline, 4 resource
-//! fork) are decompressed via `miniz_oxide`; LZVN/LZFSE/LZBITMAP are
-//! reported `Unsupported`.
+//! fork) are decompressed via `miniz_oxide`; LZVN types (7 inline, 8
+//! resource fork) via `sutram-compress`; LZFSE/LZBITMAP are reported
+//! `Unsupported`.
 
 use sutram_fs::{FsError, Result};
 use sutram_io::le;
@@ -188,10 +189,31 @@ fn inflate(data: &[u8], cap: u64) -> Result<Vec<u8>> {
         .map_err(|e| FsError::corrupt(0, format!("decmpfs zlib inflate failed: {e:?}")))
 }
 
+/// Map a `sutram-compress` error onto `FsError`.
+fn comp_err(e: sutram_compress::CompError, input_len: usize) -> FsError {
+    use sutram_compress::CompError as C;
+    match e {
+        C::Truncated { needed } => FsError::truncated(0, needed, input_len as u64),
+        C::Corrupt { msg } => FsError::corrupt(0, format!("decmpfs decode failed: {msg}")),
+        C::OutputLimit { limit } => FsError::corrupt(
+            0,
+            format!("decmpfs decode exceeded output bound {limit}"),
+        ),
+        C::Unsupported { msg } => FsError::unsupported(msg),
+    }
+}
+
+/// Decode an LZVN stream (decmpfs types 7/8), capped at `cap` bytes.
+fn inflate_lzvn(data: &[u8], cap: u64) -> Result<Vec<u8>> {
+    sutram_compress::lzvn::decompress(data, cap as usize)
+        .map_err(|e| comp_err(e, data.len()))
+}
+
 /// Decompress a decmpfs payload.
 ///
 /// `hdr` comes from [`parse_decmpfs`]; `rsrc` is the resource fork's bytes
-/// when the type needs it. Returns `Err(Unsupported)` for LZVN/LZFSE/etc.
+/// when the type needs it. Returns `Err(Unsupported)` for LZFSE/LZBITMAP
+/// and other codecs this build cannot decode.
 pub(crate) fn decompress(hdr: &DecmpfsHeader, rsrc: Option<&[u8]>) -> Result<Vec<u8>> {
     let cap = hdr.uncompressed_size.max(CHUNK_SIZE);
     match hdr.compression_type {
@@ -208,7 +230,20 @@ pub(crate) fn decompress(hdr: &DecmpfsHeader, rsrc: Option<&[u8]>) -> Result<Vec
                 offset: 0,
                 msg: "decmpfs type 4 requires the resource fork".into(),
             })?;
-            decompress_rsrc_table(rsrc, hdr.uncompressed_size)
+            decompress_rsrc_table(rsrc, hdr.uncompressed_size, inflate)
+        }
+        // LZVN inline; the same leading-0xFF verbatim convention as zlib.
+        7 => match hdr.inline.first() {
+            Some(0xFF) => Ok(hdr.inline[1..].to_vec()),
+            _ => inflate_lzvn(&hdr.inline, cap),
+        },
+        // LZVN in the resource fork: same block table as type 4, LZVN blocks.
+        8 => {
+            let rsrc = rsrc.ok_or_else(|| FsError::Corrupt {
+                offset: 0,
+                msg: "decmpfs type 8 requires the resource fork".into(),
+            })?;
+            decompress_rsrc_table(rsrc, hdr.uncompressed_size, inflate_lzvn)
         }
         // Uncompressed chunked resource fork.
         10 => {
@@ -225,11 +260,17 @@ pub(crate) fn decompress(hdr: &DecmpfsHeader, rsrc: Option<&[u8]>) -> Result<Vec
     }
 }
 
-/// Parse the zlib resource-fork block table (decmpfs type 4):
+/// Parse the compressed resource-fork block table (decmpfs types 4 and 8):
 /// `CmpfRsrcHead` (BE u32 headerSize, totalSize, dataSize, flags), then at
 /// `headerSize`: BE u32 dataSize, LE u32 numBlocks, `numBlocks` × LE
-/// `(offset, size)` — offsets relative to `headerSize`.
-fn decompress_rsrc_table(rsrc: &[u8], uncompressed_size: u64) -> Result<Vec<u8>> {
+/// `(offset, size)` — offsets relative to `headerSize`. Each block is
+/// decoded by `decode` (zlib for type 4, LZVN for type 8); a leading 0xFF
+/// byte stores the rest of the block verbatim.
+fn decompress_rsrc_table(
+    rsrc: &[u8],
+    uncompressed_size: u64,
+    decode: fn(&[u8], u64) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let header_size = le::u32_be(rsrc, 0).unwrap_or(0) as usize;
     if header_size < 16 || header_size + 8 > rsrc.len() {
         return Err(FsError::corrupt(
@@ -257,7 +298,7 @@ fn decompress_rsrc_table(rsrc: &[u8], uncompressed_size: u64) -> Result<Vec<u8>>
         if chunk.first() == Some(&0xFF) {
             out.extend_from_slice(&chunk[1..]);
         } else {
-            out.extend_from_slice(&inflate(chunk, CHUNK_SIZE)?);
+            out.extend_from_slice(&decode(chunk, CHUNK_SIZE)?);
         }
         if out.len() as u64 >= uncompressed_size {
             break;

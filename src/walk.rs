@@ -382,7 +382,7 @@ impl<'m> Walk<'m> {
             Some(x.ranges.clone())
         };
         // Codec support check (inline types can be probed without rsrc).
-        if !matches!(hdr.compression_type, 4 | 10) {
+        if !attrs::decmpfs_is_rsrc(hdr.compression_type) {
             let probe = DecmpfsHeader {
                 compression_type: hdr.compression_type,
                 uncompressed_size: hdr.uncompressed_size,

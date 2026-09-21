@@ -330,8 +330,54 @@ fn decmpfs_type3_ff_prefix_skips_inflate() {
 }
 
 #[test]
+fn decmpfs_type7_lzvn_inline() {
+    // 类型 7 内联：payload 是裸 LZVN 流（sml_l "LZVNDATA" + eos）。
+    let mut lzvn = vec![0xE8u8]; // sml_l, 8 literals
+    lzvn.extend_from_slice(b"LZVNDATA");
+    lzvn.push(0x06); // eos opcode
+    lzvn.extend_from_slice(&[0u8; 7]);
+    let hdr = DecmpfsHeader {
+        compression_type: 7,
+        uncompressed_size: 8,
+        inline: lzvn,
+    };
+    assert_eq!(attrs::decompress(&hdr, None).unwrap(), b"LZVNDATA");
+    // 首字节 0xFF → 尾部原样存储（与类型 3 同一约定）。
+    let hdr = DecmpfsHeader {
+        compression_type: 7,
+        uncompressed_size: 3,
+        inline: {
+            let mut v = vec![0xFF];
+            v.extend_from_slice(b"RAW");
+            v
+        },
+    };
+    assert_eq!(attrs::decompress(&hdr, None).unwrap(), b"RAW");
+}
+
+#[test]
+fn decmpfs_type8_lzvn_rsrc_table() {
+    // 类型 8：资源叉块表，每块是 LZVN 流。
+    let mut lzvn = vec![0xE8u8];
+    lzvn.extend_from_slice(b"RSRCLZVN");
+    lzvn.push(0x06);
+    lzvn.extend_from_slice(&[0u8; 7]);
+    let rsrc = rsrc_table(&[(0, &lzvn)]);
+    let hdr = DecmpfsHeader {
+        compression_type: 8,
+        uncompressed_size: 8,
+        inline: Vec::new(),
+    };
+    assert_eq!(
+        attrs::decompress(&hdr, Some(&rsrc)).unwrap(),
+        b"RSRCLZVN"
+    );
+}
+
+#[test]
 fn decmpfs_rsrc_types_need_fork() {
-    // 4/8/10/12 没有 rsrc 就报错；8/12 即便有 rsrc 也是 Unsupported。
+    // 4/8/10/12 没有 rsrc 就报错；有 rsrc 但 codec 不可用时也报错
+    // (8 现在是 LZVN — 全零 rsrc 解码失败；12 LZFSE 仍 Unsupported)。
     for t in [4u32, 10] {
         let hdr = DecmpfsHeader {
             compression_type: t,

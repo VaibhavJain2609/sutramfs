@@ -16,3 +16,6 @@ sutram-magic = { path = "../sutram-magic", version = "0.1" }
 # AppleFSCompression stores most compressed files as zlib; without a DEFLATE
 # codec those files would all be Unrecoverable-in-practice.
 miniz_oxide = "0.9"
+# Shared pure-Rust codecs: LZVN for decmpfs types 7/8 (default-features off:
+# keeps ruzstd's 1.87 rust-version out of this crate's 1.85 MSRV).
+sutram-compress = { path = "../sutram-compress", version = "0.1", default-features = false }

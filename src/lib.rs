@@ -21,8 +21,9 @@
 //!   `name:xattr:<attr>` pseudo-entries + `xattr_*` meta keys.
 //! * **decmpfs** — `com.apple.decmpfs` files get `compressed`/`decmpfs_*`
 //!   meta; zlib types (3 inline, 4 resource-fork block table, 1/9/10 raw)
-//!   decompress transparently in `read_file`; LZVN/LZFSE are flagged
-//!   `Unsupported` via `compression_note`.
+//!   and LZVN types (7 inline, 8 resource-fork) decompress transparently
+//!   in `read_file`; LZFSE/LZBITMAP are flagged `Unsupported` via
+//!   `compression_note`.
 //! * **Deleted & recoverable** — three residue sources: live leaf nodes'
 //!   free space, dead B-tree nodes (freed by compaction), and orphaned
 //!   extents-overflow records (`/$ORPHANED/extents_<cnid>`). Recovery state
