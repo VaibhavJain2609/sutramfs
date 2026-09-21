@@ -1,5 +1,9 @@
 //! Shared test corpus for sutram-analyze.
 //!
+//! Not every helper is used by every test binary — dead code is
+//! expected in a corpus module.
+#![allow(dead_code)]
+//!
 //! Two vehicles:
 //!
 //! * [`MockFs`] — a canned `FileSystem` (entries + byte content) for

@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod entropy;
+pub mod grep;
 pub mod hash;
 pub mod suspicion;
 pub mod timeline;
@@ -21,6 +22,7 @@ pub use entropy::{
     chi_square, entry_entropy, entropy_bytes, range_entropy, shannon_entropy, EntropyVerdict,
     HIGH_ENTROPY, NONUNIFORM_CHI2, SAMPLE_CAP,
 };
+pub use grep::{search, Pattern, SearchHit, SearchHits, SearchOptions};
 pub use hash::{
     hash_entry, hash_reader, hash_source, verify_acquisition, verify_ewf, verify_source,
     AcqVerification, Digests, HashMismatch, HashResult, Md5, MediaHashes, Sha1, Sha256,
