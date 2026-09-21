@@ -69,6 +69,42 @@ fn rejects_garbage_and_pure_hfs() {
 }
 
 #[test]
+fn alternate_volume_header_fallback() {
+    // TN1150: the alternate volume header starts 1024 bytes before the
+    // end of the volume. Copy the primary there, then destroy the primary.
+    let mut img = common::build_hfsplus();
+    let alt = img.len() - 1024;
+    img.copy_within(1024..1536, alt);
+    // 1) Bad signature at 1024 → mount via the alternate copy.
+    img[1024..1026].copy_from_slice(&0xDEADu16.to_be_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img.clone());
+    let fs = HfsParser.mount(src).unwrap();
+    let info = fs.info();
+    assert_eq!(info.fs_type, "HFS+");
+    assert_eq!(info.meta["alt_volume_header"], "true");
+    assert!(fs.walk().any(|e| e.is_ok()));
+
+    // 2) Primary decodes as H+ but fails validation → also falls back.
+    let mut img = common::build_hfsplus();
+    let alt = img.len() - 1024;
+    img.copy_within(1024..1536, alt);
+    img[1024 + 40..1024 + 44].copy_from_slice(&4097u32.to_be_bytes()); // bad block size
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(HfsParser.mount(src).is_ok());
+
+    // 3) Both copies destroyed → mount must fail.
+    let mut img = common::build_hfsplus();
+    let alt = img.len() - 1024;
+    img.copy_within(1024..1536, alt);
+    for b in &mut img[1024..1536] {
+        *b = 0;
+    }
+    img[alt..alt + 2].copy_from_slice(&0xDEADu16.to_be_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(HfsParser.mount(src).is_err());
+}
+
+#[test]
 fn info_reports_volume() {
     let info = mount().info();
     assert_eq!(info.fs_type, "HFS+");
@@ -198,6 +234,46 @@ fn decmpfs_inline_zlib_decompresses() {
 }
 
 #[test]
+fn decmpfs_rsrc_table_decompresses() {
+    // decmpfs compression_type 4: zlib payload chunked through the
+    // CmpfRsrcHead block table in the resource fork.
+    let entries = all_entries();
+    let e = find(&entries, "RSRCCOMP.BIN");
+    assert_eq!(e.meta["compressed"], "decmpfs");
+    assert_eq!(e.meta["decmpfs_type"], "4");
+    assert_eq!(e.meta["decmpfs_codec"], "zlib-resource-fork");
+    assert_eq!(e.size, 44); // uncompressed size, not the stored table size
+    // No `:rsrc` pseudo-entry — the rsrc is compressed payload.
+    assert!(!entries.iter().any(|x| x.name == "RSRCCOMP.BIN:rsrc"));
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"resource fork compressed payload hello hello");
+}
+
+#[test]
+fn unreachable_records_become_orphans() {
+    // Records keyed to a parent CNID with no folder record are live
+    // catalog records that the tree walk can't reach → /$ORPHANED/.
+    let entries = all_entries();
+    let o = entries
+        .iter()
+        .find(|e| e.name == "ORPHAN.TXT")
+        .expect("orphan file not emitted");
+    assert!(o.path.starts_with("/$ORPHANED/"));
+    assert_eq!(o.meta["orphan"], "true");
+    assert!(o.is_deleted());
+    let mut buf = Vec::new();
+    mount().read_file(o).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"ORPHANED-FILE-DATA"));
+    let d = entries
+        .iter()
+        .find(|e| e.name == "ORPHDIR")
+        .expect("orphan dir not emitted");
+    assert!(d.path.starts_with("/$ORPHANED/"));
+    assert_eq!(d.kind, EntryKind::Directory);
+}
+
+#[test]
 fn deleted_residue_leaf_free_space() {
     let entries = all_entries();
     let e = find(&entries, "DELETED.TXT");
@@ -320,6 +396,37 @@ fn lenient_walk_survives_corruption() {
     let fs = HfsParser.mount(src).unwrap();
     let items: Vec<_> = fs.walk().collect();
     assert!(items.iter().any(|i| i.is_ok()));
+}
+
+#[test]
+fn orphans_disabled_by_option() {
+    // MountOptions::include_orphans = false → OrphanLive / OrphanExtents
+    // 两个阶段整体跳过，no /$ORPHANED/ entries at all.
+    let src: Arc<dyn ByteSource> = Arc::new(common::build_hfsplus());
+    let opts = MountOptions {
+        include_orphans: false,
+        ..Default::default()
+    };
+    let fs = HfsParser.mount_with(src, &opts).unwrap();
+    let entries: Vec<_> = fs.walk().filter_map(|i| i.ok()).collect();
+    assert!(!entries.iter().any(|e| e.path.contains("$ORPHANED")));
+    // Live tree + residue still emit.
+    assert!(entries.iter().any(|e| e.name == "hello.txt"));
+    assert!(entries.iter().any(|e| e.name == "DELETED.TXT"));
+}
+
+#[test]
+fn strict_walk_dies_on_mount_note() {
+    // Corrupt the attributes-tree header node → build_trees records a
+    // mount_note → strict walk replays it as the FIRST item then ends.
+    let mut img = common::build_hfsplus();
+    let attr0 = common::block_off(common::ATTR_BLOCK);
+    img[attr0 + 8] = 0xFF; // kind: header → leaf, invalid
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = HfsParser.mount_with(src, &MountOptions::strict()).unwrap();
+    let mut items = fs.walk();
+    assert!(items.next().unwrap().is_err());
+    assert!(items.next().is_none());
 }
 
 #[test]

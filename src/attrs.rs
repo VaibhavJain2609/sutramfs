@@ -277,7 +277,8 @@ fn decompress_rsrc_table_raw(rsrc: &[u8], uncompressed_size: u64) -> Result<Vec<
     let mut out = Vec::with_capacity(uncompressed_size.min(1 << 26) as usize);
     for i in 0..num_blocks {
         let off = le::u32(rsrc, table + i * 8).unwrap_or(0) as usize;
-        let size = le::u32_be(rsrc, table + i * 8 + 4).unwrap_or(0) as usize;
+        // Block-run entries are little-endian, same table as type 4.
+        let size = le::u32(rsrc, table + i * 8 + 4).unwrap_or(0) as usize;
         let abs = header_size + off;
         let chunk = rsrc
             .get(abs..abs.saturating_add(size))

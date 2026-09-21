@@ -310,7 +310,7 @@ impl<'m> Walk<'m> {
         for x in &xattrs {
             let mut xmeta = std::collections::HashMap::new();
             xmeta.insert("xattr".into(), x.name.clone());
-            xmeta.insert("xattr_storage".into(), x.storage.into());
+            xmeta.insert("xattr_storage".into(), x.storage.clone());
             if x.start_block != 0 {
                 xmeta.insert("xattr_continuation".into(), x.start_block.to_string());
             }

@@ -218,6 +218,7 @@ pub fn node(
 }
 
 /// B-tree header node (node 0): descriptor kind=1 + BTHeaderRec @14.
+#[allow(clippy::too_many_arguments)] // mirrors the on-disk header record fields
 pub fn header_node(
     depth: u16,
     root: u32,
@@ -394,6 +395,16 @@ pub fn build_hfsplus() -> Vec<u8> {
     );
     put_node(&mut img, CAT_BLOCK, 1, &node1);
 
+    // decmpfs type-4: `RSRCCOMP.BIN`'s compressed bytes live in a
+    // CmpfRsrcHead block table inside its resource fork (block 38).
+    let rsrc_plain = b"resource fork compressed payload hello hello";
+    let rz = miniz_oxide::deflate::compress_to_vec_zlib(rsrc_plain, 6);
+    let rsrc_size = 32 + rz.len();
+    let mut decmpfs4_val = Vec::new();
+    decmpfs4_val.extend_from_slice(&0x636D7066u32.to_le_bytes());
+    decmpfs4_val.extend_from_slice(&4u32.to_le_bytes()); // zlib resource fork
+    decmpfs4_val.extend_from_slice(&(rsrc_plain.len() as u64).to_le_bytes());
+
     let node2 = node(
         -1,
         1,
@@ -436,6 +447,11 @@ pub fn build_hfsplus() -> Vec<u8> {
                 "RICHES.TXT",
                 &file_rec(47, 0, 0, 0, 0, 0, &[(36, 1)], 12, &[(37, 1)], 18),
             ),
+            leaf_record(
+                2,
+                "RSRCCOMP.BIN",
+                &file_rec(49, 0, 0x20, 0, 0, 0, &[], 0, &[(38, 1)], rsrc_size as u64),
+            ),
             leaf_record(2, "subdir", &folder_rec(30, 1)),
             leaf_record(
                 2,
@@ -470,6 +486,14 @@ pub fn build_hfsplus() -> Vec<u8> {
                 "inner.bin",
                 &file_rec(31, 0, 0, 0, 0, 0, &[(15, 1)], 10, &[], 0),
             ),
+            // Unreachable-from-root records (parent cnid 77 has no folder
+            // record): the OrphanLive pass emits them under /$ORPHANED/.
+            leaf_record(
+                77,
+                "ORPHAN.TXT",
+                &file_rec(70, 0, 0, 0, 0, 0, &[(39, 1)], 20, &[], 0),
+            ),
+            leaf_record(77, "ORPHDIR", &folder_rec(71, 0)),
         ],
         // Residue: a deleted file record rotting in node 2's free space.
         &leaf_record(
@@ -557,6 +581,7 @@ pub fn build_hfsplus() -> Vec<u8> {
         &[
             attr_inline_record(45, "com.apple.decmpfs", &decmpfs_val),
             attr_inline_record(20, "com.apple.FinderInfo", &finder_info_val),
+            attr_inline_record(49, "com.apple.decmpfs", &decmpfs4_val),
         ],
         &[],
     );
@@ -584,6 +609,21 @@ pub fn build_hfsplus() -> Vec<u8> {
     put_block(&mut img, 35, b"/hello.txt");
     put_block(&mut img, 36, b"RICHES-DATA!");
     put_block(&mut img, 37, b"RESOURCE-FORK-DATA");
+    put_block(&mut img, 39, b"ORPHANED-FILE-DATA!");
+
+    // CmpfRsrcHead @ block 38: BE headerSize/totalSize/dataSize/flags,
+    // then @headerSize: BE dataSize + LE numBlocks + LE (off,size) table,
+    // payloads relative to headerSize.
+    let rb = block_off(38);
+    w32(&mut img, rb, 16); // headerSize
+    w32(&mut img, rb + 4, rsrc_size as u32); // totalSize
+    w32(&mut img, rb + 8, rsrc_plain.len() as u32); // dataSize
+    // flags @12 left 0
+    w32(&mut img, rb + 16, rsrc_plain.len() as u32); // block-table dataSize
+    img[rb + 20..rb + 24].copy_from_slice(&1u32.to_le_bytes()); // numBlocks LE
+    img[rb + 24..rb + 28].copy_from_slice(&16u32.to_le_bytes()); // off (rel.)
+    img[rb + 28..rb + 32].copy_from_slice(&(rz.len() as u32).to_le_bytes());
+    img[rb + 32..rb + 32 + rz.len()].copy_from_slice(&rz);
 
     // ---- journal ---------------------------------------------------------
     // JournalInfoBlock at block 40: flags, device_sig[8], offset, size.

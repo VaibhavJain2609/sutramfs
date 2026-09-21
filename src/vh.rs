@@ -122,6 +122,9 @@ pub(crate) struct VolumeHeader {
     pub wrapped: bool,
     /// HFS wrapper volume label, when wrapped.
     pub wrapper_label: Option<String>,
+    /// `true` when the *alternate* volume header (at volume end − 1024)
+    /// was used because the primary was missing/corrupt.
+    pub used_alt_vh: bool,
 }
 
 impl VolumeHeader {
@@ -142,6 +145,13 @@ impl VolumeHeader {
 
     /// Parse + validate the volume header at `base + 1024`, following an HFS
     /// wrapper's embedded extent when present. Firmer than [`detect`].
+    ///
+    /// When the primary header is absent or fails validation, the
+    /// **alternate volume header** — 512 bytes starting 1024 bytes before
+    /// the volume's end — is tried before giving up (TN1150: the last 512
+    /// bytes are reserved). For an unwrapped volume the end of the source
+    /// is taken as the volume end; for a wrapped volume the embedded
+    /// extent's size bounds the copy.
     pub(crate) fn parse(src: &dyn ByteSource) -> Result<VolumeHeader> {
         let b = src.read_slice(VH_OFFSET, VH_LEN).map_err(FsError::Io)?;
         if b.len() < VH_LEN {
@@ -149,13 +159,65 @@ impl VolumeHeader {
         }
         let sig = le::u16_be(&b, 0).unwrap_or(0);
         match sig {
-            SIG_HFSPLUS | SIG_HFSX => Self::parse_vh(&b, 0, false, None),
+            SIG_HFSPLUS | SIG_HFSX => match Self::parse_vh(&b, 0, false, None) {
+                Ok(vh) => Ok(vh),
+                // Primary decoded as H+/HX but failed validation — the
+                // alternate copy may still be intact.
+                Err(e) => Self::parse_alternate(src, src.len(), 0, false, None)
+                    .map_err(|_| e),
+            },
             SIG_HFS_MDB => Self::parse_wrapped(src, &b),
-            _ => Err(FsError::corrupt(
-                VH_OFFSET,
-                format!("bad signature {sig:#06x} (want H+/HX/BD)"),
-            )),
+            _ => {
+                let e = FsError::corrupt(
+                    VH_OFFSET,
+                    format!("bad signature {sig:#06x} (want H+/HX/BD)"),
+                );
+                // Sector-level damage to the primary is common on carved
+                // images; the alternate copy sits near the volume's tail.
+                Self::parse_alternate(src, src.len(), 0, false, None).map_err(|_| e)
+            }
         }
+    }
+
+    /// Read + validate the alternate volume header at `end - 1024`.
+    /// `base`/`wrapped`/`label` describe the (possibly embedded) volume.
+    fn parse_alternate(
+        src: &dyn ByteSource,
+        vol_end: u64,
+        base: u64,
+        wrapped: bool,
+        label: Option<String>,
+    ) -> Result<VolumeHeader> {
+        let alt_off = base.checked_add(vol_end).and_then(|e| e.checked_sub(1024));
+        let alt_off = alt_off.ok_or_else(|| {
+            FsError::corrupt(base, "alternate volume header offset underflow")
+        })?;
+        // The alternate must sit past the primary header — otherwise the
+        // volume is too small to hold both copies.
+        if alt_off < base + VH_OFFSET + VH_LEN as u64 {
+            return Err(FsError::corrupt(
+                alt_off,
+                "volume too small for an alternate header",
+            ));
+        }
+        let b = src.read_slice(alt_off, VH_LEN).map_err(FsError::Io)?;
+        if b.len() < VH_LEN {
+            return Err(FsError::truncated(
+                alt_off,
+                VH_LEN as u64,
+                b.len() as u64,
+            ));
+        }
+        let sig = le::u16_be(&b, 0).unwrap_or(0);
+        if sig != SIG_HFSPLUS && sig != SIG_HFSX {
+            return Err(FsError::corrupt(
+                alt_off,
+                format!("alternate header signature {sig:#06x} is not H+/HX"),
+            ));
+        }
+        let mut vh = Self::parse_vh(&b, base, wrapped, label)?;
+        vh.used_alt_vh = true;
+        Ok(vh)
     }
 
     /// Follow an HFS wrapper's embedded-volume descriptor.
@@ -184,24 +246,36 @@ impl VolumeHeader {
                 Some(s)
             }
         };
-        let b = src
-            .read_slice(embed_off + VH_OFFSET, VH_LEN)
-            .map_err(FsError::Io)?;
-        if b.len() < VH_LEN {
-            return Err(FsError::truncated(
-                embed_off + VH_OFFSET,
-                VH_LEN as u64,
-                b.len() as u64,
-            ));
+        // The embedded volume's alternate header sits 1024 bytes before
+        // the end of the embedded extent (drEmbedExtent.blockCount).
+        let embed_count = le::u16_be(mdb, 0x80).unwrap_or(0) as u64;
+        let embed_size = embed_count.saturating_mul(al_blk_siz);
+        let label2 = wrapper_label.clone();
+        let primary = (|| -> Result<VolumeHeader> {
+            let b = src
+                .read_slice(embed_off + VH_OFFSET, VH_LEN)
+                .map_err(FsError::Io)?;
+            if b.len() < VH_LEN {
+                return Err(FsError::truncated(
+                    embed_off + VH_OFFSET,
+                    VH_LEN as u64,
+                    b.len() as u64,
+                ));
+            }
+            let sig = le::u16_be(&b, 0).unwrap_or(0);
+            if sig != SIG_HFSPLUS && sig != SIG_HFSX {
+                return Err(FsError::corrupt(
+                    embed_off + VH_OFFSET,
+                    format!("embedded volume signature {sig:#06x} is not H+/HX"),
+                ));
+            }
+            Self::parse_vh(&b, embed_off, true, label2)
+        })();
+        match primary {
+            Ok(vh) => Ok(vh),
+            Err(e) => Self::parse_alternate(src, embed_size, embed_off, true, wrapper_label)
+                .map_err(|_| e),
         }
-        let sig = le::u16_be(&b, 0).unwrap_or(0);
-        if sig != SIG_HFSPLUS && sig != SIG_HFSX {
-            return Err(FsError::corrupt(
-                embed_off + VH_OFFSET,
-                format!("embedded volume signature {sig:#06x} is not H+/HX"),
-            ));
-        }
-        Self::parse_vh(&b, embed_off, true, wrapper_label)
     }
 
     /// Validate + decode a raw 512-byte volume header buffer.
@@ -277,6 +351,7 @@ impl VolumeHeader {
             block0_offset: embed_base,
             wrapped,
             wrapper_label,
+            used_alt_vh: false,
         })
     }
 

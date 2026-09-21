@@ -144,7 +144,7 @@ pub(crate) fn unistr(buf: &[u8], off: usize, max_units: usize) -> Option<(String
 pub(crate) fn parse_key(rec: &[u8]) -> Option<CatKey> {
     let key_len = le::u16_be(rec, 0)? as usize;
     // HFS+ catalog keys: 2-byte parent + UniStr255 → 6..=516 bytes.
-    if key_len < 6 || key_len > 516 || rec.len() < 2 + key_len {
+    if !(6..=516).contains(&key_len) || rec.len() < 2 + key_len {
         return None;
     }
     let parent = le::u32_be(rec, 2)?;

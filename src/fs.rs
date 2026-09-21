@@ -59,11 +59,15 @@ pub(crate) struct Xattr {
     pub ranges: Vec<(u64, u64)>,
     /// Value byte length.
     pub size: u64,
-    /// Where the value lives (`"inline"` / `"fork"` / `"extents"`).
-    pub storage: &'static str,
+    /// Where the value lives (`"inline"` / `"fork"` / `"extents"` /
+    /// `"unknown type 0x…"` for unrecognised attr record types).
+    pub storage: String,
     /// Key's `startBlock` — non-zero marks a continuation record.
     pub start_block: u32,
 }
+
+/// `(cnid, fork_type)` → ordered `(start_block, extents)` overflow records.
+pub(crate) type OverflowMap = HashMap<(u32, u8), Vec<(u32, Vec<Extent>)>>;
 
 /// An extents-overflow record that references a CNID with no catalog
 /// record — orphaned extents, carved under `/$ORPHANED/`.
@@ -107,7 +111,7 @@ pub struct HfsFs {
     /// Drives overwritten detection for deleted residue.
     pub(crate) live_blocks: HashMap<u32, String>,
     /// `(cnid, fork)` → `(start_block, extents)` overflow records.
-    pub(crate) overflow: HashMap<(u32, u8), Vec<(u32, Vec<Extent>)>>,
+    pub(crate) overflow: OverflowMap,
     /// Extents records whose CNID is not in the live catalog.
     pub(crate) orphan_extents: Vec<OrphanExtent>,
     /// CNID → extended attributes found in the attributes file.
@@ -584,12 +588,12 @@ impl HfsFs {
                     AttrData::Inline { data_off, len } => (
                         vec![(data_disk + data_off as u64, len as u64)],
                         len as u64,
-                        "inline",
+                        "inline".to_string(),
                     ),
                     AttrData::ForkData(fork) => (
                         self.extents_to_ranges(&VolumeHeader::extents_of(&fork), fork.logical_size),
                         fork.logical_size,
-                        "fork",
+                        "fork".to_string(),
                     ),
                     AttrData::Extents(e) => (
                         vec![(
@@ -597,15 +601,11 @@ impl HfsFs {
                             e.count as u64 * self.vh.block_size as u64,
                         )],
                         e.count as u64 * self.vh.block_size as u64,
-                        "extents",
+                        "extents".to_string(),
                     ),
-                    AttrData::Other(t) => (
-                        Vec::new(),
-                        0,
-                        match t {
-                            _ => "unknown",
-                        },
-                    ),
+                    AttrData::Other(t) => {
+                        (Vec::new(), 0, format!("unknown type {t:#x}"))
+                    }
                 };
                 found.push((
                     key.cnid,
@@ -703,12 +703,12 @@ impl HfsFs {
         let mut surviving_runs: Vec<(u32, u32)> = Vec::new();
         let mut lost = 0u64;
         let mut lost_to: Vec<String> = Vec::new();
-        for e in extents {
+        'exts: for e in extents {
             for b in e.start..e.start.saturating_add(e.count) {
-                have_blocks += 1;
-                if have_blocks > expected_blocks {
-                    break;
+                if have_blocks >= expected_blocks {
+                    break 'exts;
                 }
+                have_blocks += 1;
                 match self.live_blocks.get(&b) {
                     Some(owner) => {
                         lost += 1;
@@ -827,6 +827,7 @@ impl FileSystem for HfsFs {
         meta.insert("file_count".into(), vh.file_count.to_string());
         meta.insert("folder_count".into(), vh.folder_count.to_string());
         meta.insert("wrapped".into(), vh.wrapped.to_string());
+        meta.insert("alt_volume_header".into(), vh.used_alt_vh.to_string());
         if let Some(l) = &vh.wrapper_label {
             meta.insert("wrapper_label".into(), l.clone());
         }
@@ -940,7 +941,7 @@ impl FileSystem for HfsFs {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(entry.size);
             let mut blob = Vec::new();
-            let cap = usize_hint.saturating_mul(4).max(1 << 20).min(512 << 20);
+            let cap = usize_hint.saturating_mul(4).clamp(1 << 20, 512 << 20);
             let mut rdr = ExtentReader {
                 src: self.src.clone(),
                 ranges: entry.allocated_ranges.clone(),
