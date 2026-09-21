@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-// Temporary until the parsers land (removed with the ZIP feature).
-#[allow(dead_code)]
 mod reader;
+pub mod zip;
+
+pub use zip::{ZipFs, ZipParser};

@@ -15,7 +15,8 @@ use sutram_io::ByteSource;
 pub(crate) enum Segment {
     /// Bytes stored literally at this absolute disk offset.
     Disk(u64),
-    /// A hole — yields zeroes (TAR sparse regions).
+    /// A hole — yields zeroes (TAR sparse regions; used by tar.rs).
+    #[allow(dead_code)] // constructed once the TAR parser lands
     Zero,
 }
 
@@ -143,12 +144,8 @@ impl Read for InflateReader {
         let mut written = 0usize;
         while written < want {
             self.refill()?;
-            if self.in_pos >= self.inbuf.len() && self.cpos >= self.cend {
-                // Compressed input exhausted — stream is over (possibly
-                // truncated; callers compare byte counts).
-                self.done = true;
-                break;
-            }
+            // Note: even with input fully consumed the decompressor may
+            // hold pending output in its dictionary window — always call.
             let res = miniz_oxide::inflate::stream::inflate(
                 &mut self.state,
                 &self.inbuf[self.in_pos..],
