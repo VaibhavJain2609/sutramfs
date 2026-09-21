@@ -150,7 +150,7 @@ fn gpt_entries(src: &dyn ByteSource, lba_size: u64, hdr: &[u8]) -> Result<Vec<Pa
     let entries_lba = le::u64(hdr, 72).unwrap_or(0);
     let num = le::u32(hdr, 80).unwrap_or(0);
     let entsz = le::u32(hdr, 84).unwrap_or(0) as usize;
-    if entsz < 128 || entsz > 4096 {
+    if !(128..=4096).contains(&entsz) {
         return Err(Error::corrupt(
             lba_size + 84,
             format!("implausible GPT entry size {entsz}"),
@@ -169,7 +169,7 @@ fn gpt_entries(src: &dyn ByteSource, lba_size: u64, hdr: &[u8]) -> Result<Vec<Pa
     let mut done = 0u32;
     while done < num {
         let n = (num - done).min(BLOCK as u32) as usize;
-        let off = base + done as u64 * entsz as u64;
+        let off = base.saturating_add(done as u64 * entsz as u64);
         let buf = src.read_slice(off, n * entsz).map_err(Error::Io)?;
         if buf.len() < n * entsz {
             break; // truncated table — emit what parsed
@@ -183,11 +183,21 @@ fn gpt_entries(src: &dyn ByteSource, lba_size: u64, hdr: &[u8]) -> Result<Vec<Pa
             if last < first {
                 continue; // corrupt entry — skip, don't abort the table
             }
+            // Checked LBA→byte math: a corrupt entry with absurd LBAs must
+            // not wrap around and alias real data at low offsets.
+            let (Some(offset), Some(size)) = (
+                first.checked_mul(lba_size),
+                last.checked_sub(first)
+                    .and_then(|d| d.checked_add(1))
+                    .and_then(|n| n.checked_mul(lba_size)),
+            ) else {
+                continue;
+            };
             let label = utf16_label(&e[56..entsz.min(128)]);
             out.push(Partition {
                 index: done + i as u32,
-                offset: first * lba_size,
-                size: (last - first + 1) * lba_size,
+                offset,
+                size,
                 ptype: None,
                 type_guid: le::uuid_le(e, 0),
                 partition_guid: le::uuid_le(e, 16),

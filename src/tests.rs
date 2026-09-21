@@ -223,6 +223,258 @@ fn le_helpers_never_panic() {
 }
 
 #[test]
+fn gpt_entry_lba_overflow_is_skipped() {
+    // Regression: a corrupt GPT entry whose LBA*sector math overflows u64
+    // must be skipped, not wrap and alias low offsets of the disk.
+    let mut disk = vec![0u8; 512 * 64];
+    disk[0x1FE] = 0x55;
+    disk[0x1FF] = 0xAA;
+    disk[0x1BE + 4] = 0xEE;
+    let h = 512;
+    disk[h..h + 8].copy_from_slice(b"EFI PART");
+    disk[h + 72..h + 80].copy_from_slice(&(2u64).to_le_bytes());
+    disk[h + 80..h + 84].copy_from_slice(&le32(128));
+    disk[h + 84..h + 88].copy_from_slice(&le32(128));
+    // entry 0: absurd LBAs that overflow when scaled by 512
+    let e0 = 1024;
+    disk[e0] = 0xAA; // nonzero type guid
+    disk[e0 + 32..e0 + 40].copy_from_slice(&u64::MAX.to_le_bytes());
+    disk[e0 + 40..e0 + 48].copy_from_slice(&u64::MAX.to_le_bytes());
+    // entry 1: sane
+    let e1 = 1024 + 128;
+    disk[e1] = 0xBB;
+    disk[e1 + 32..e1 + 40].copy_from_slice(&(4u64).to_le_bytes());
+    disk[e1 + 40..e1 + 48].copy_from_slice(&(9u64).to_le_bytes());
+    let parts = partitions(&disk.as_slice()).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].index, 1);
+    assert_eq!(parts[0].offset, 4 * 512);
+    assert_eq!(parts[0].size, 6 * 512);
+}
+
+#[test]
+fn gpt_rejects_implausible_entry_geometry() {
+    let mut disk = vec![0u8; 512 * 64];
+    disk[0x1FE] = 0x55;
+    disk[0x1FF] = 0xAA;
+    disk[0x1BE + 4] = 0xEE;
+    disk[0x1BE + 8..0x1BE + 12].copy_from_slice(&le32(1));
+    disk[0x1BE + 12..0x1BE + 16].copy_from_slice(&le32(63));
+    let h = 512;
+    disk[h..h + 8].copy_from_slice(b"EFI PART");
+    disk[h + 72..h + 80].copy_from_slice(&(2u64).to_le_bytes());
+    disk[h + 80..h + 84].copy_from_slice(&le32(128));
+    disk[h + 84..h + 88].copy_from_slice(&le32(64)); // entry size too small
+    // Protective MBR but broken GPT → falls back to the MBR view
+    // (the protective entry itself is reported).
+    let parts = partitions(&disk.as_slice()).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].ptype, Some(0xEE));
+    assert_eq!(parts[0].table, TableKind::Mbr);
+}
+
+#[test]
+fn android_sparse_bad_total_sz_is_corrupt() {
+    // Regression: total_sz < chunk header size used to silently continue
+    // with the cursor re-reading earlier bytes as later chunks.
+    let blk = 4096u32;
+    let mut img = Vec::new();
+    img.extend_from_slice(&le32(0xED26_FF3A));
+    img.extend_from_slice(&le16(1));
+    img.extend_from_slice(&le16(0));
+    img.extend_from_slice(&le16(28));
+    img.extend_from_slice(&le16(12));
+    img.extend_from_slice(&le32(blk));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(0));
+    img.extend_from_slice(&le16(0xCAC1)); // RAW
+    img.extend_from_slice(&le16(0));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(4)); // total_sz < header → corrupt
+    let res = SparseFile::from_android_sparse(vec_src(img));
+    assert!(matches!(res, Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn android_sparse_truncated_chunk_header() {
+    let blk = 4096u32;
+    let mut img = Vec::new();
+    img.extend_from_slice(&le32(0xED26_FF3A));
+    img.extend_from_slice(&le16(1));
+    img.extend_from_slice(&le16(0));
+    img.extend_from_slice(&le16(28));
+    img.extend_from_slice(&le16(12));
+    img.extend_from_slice(&le32(blk));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(0));
+    img.extend_from_slice(&le16(0xCAC1)); // half a chunk header only
+    let res = SparseFile::from_android_sparse(vec_src(img));
+    assert!(matches!(res, Err(Error::Truncated { .. })));
+}
+
+#[test]
+fn android_sparse_short_raw_payload_zero_fills() {
+    // Regression: a RAW chunk whose declared payload is shorter than its
+    // output extent must zero-fill the tail, not leak the next chunk's
+    // bytes into the logical image.
+    let blk = 4096u32;
+    let mut img = Vec::new();
+    img.extend_from_slice(&le32(0xED26_FF3A));
+    img.extend_from_slice(&le16(1));
+    img.extend_from_slice(&le16(0));
+    img.extend_from_slice(&le16(28));
+    img.extend_from_slice(&le16(12));
+    img.extend_from_slice(&le32(blk));
+    img.extend_from_slice(&le32(2));
+    img.extend_from_slice(&le32(2));
+    img.extend_from_slice(&le32(0));
+    // RAW chunk claiming 1 block out but only 16 bytes of payload.
+    img.extend_from_slice(&le16(0xCAC1));
+    img.extend_from_slice(&le16(0));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(12 + 16));
+    img.extend_from_slice(&[0xCC; 16]);
+    // DONT_CARE for the second block.
+    img.extend_from_slice(&le16(0xCAC3));
+    img.extend_from_slice(&le16(0));
+    img.extend_from_slice(&le32(1));
+    img.extend_from_slice(&le32(12));
+    let s = SparseFile::from_android_sparse(vec_src(img)).unwrap();
+    let out = s.read_slice(0, blk as usize).unwrap();
+    assert_eq!(&out[..16], &[0xCC; 16]);
+    // Tail of the block is zeros — NOT the bytes of the next chunk header.
+    assert!(out[16..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn sparse_file_zero_and_fill_only() {
+    // Extent-less tail reads as zeros; Fill pattern is offset-aligned.
+    let s = SparseFile::new(
+        16,
+        vec![SparseExtent {
+            out_offset: 4,
+            len: 4,
+            kind: SparseKind::Fill(0x01020304),
+        }],
+    )
+    .unwrap();
+    let out = s.read_slice(0, 16).unwrap();
+    assert_eq!(&out[..4], &[0; 4]);
+    assert_eq!(&out[4..8], &[0x04, 0x03, 0x02, 0x01]);
+    assert!(out[8..].iter().all(|&b| b == 0));
+    // Fill pattern must phase correctly when read starts mid-extent.
+    let mid = s.read_slice(6, 2).unwrap();
+    assert_eq!(mid, [0x02, 0x01]);
+}
+
+#[test]
+fn concat_source_past_end() {
+    let a: Arc<dyn ByteSource> = Arc::new(vec![1u8; 4]);
+    let c = ConcatSource::new(vec![a]);
+    assert_eq!(c.read_slice(4, 8).unwrap().len(), 0);
+    assert_eq!(c.read_slice(0, 0).unwrap().len(), 0);
+}
+
+#[test]
+fn le_be_helpers_and_ascii_uuid() {
+    let buf = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+    assert_eq!(le::u16_be(&buf, 0), Some(0x1234));
+    assert_eq!(le::u32_be(&buf, 0), Some(0x12345678));
+    assert_eq!(le::u64_be(&buf, 0), Some(0x123456789ABCDEF0));
+    assert_eq!(le::u64(&buf, 0), Some(0xF0DEBC9A78563412));
+    assert_eq!(le::u64_be(&buf, 4), None);
+    // GPT-style mixed-endian GUID
+    let mut g = [0u8; 20];
+    g[4..20].copy_from_slice(&[
+        0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+        0xEE, 0xFF,
+    ]);
+    let s = le::uuid_le(&g, 4).unwrap();
+    assert_eq!(s, "00112233-4455-7766-8899-aabbccddeeff");
+    assert_eq!(le::uuid_le(&g, 8), None); // short
+    // ascii: NUL- and space-terminated
+    let name = *b"VOL   \0\xFF";
+    assert_eq!(le::ascii(&name, 0, 8), Some("VOL".to_string()));
+    let nul = *b"AB\0CD";
+    assert_eq!(le::ascii(&nul, 0, 5), Some("AB".to_string()));
+    assert_eq!(le::ascii(&nul, 0, 99), None);
+}
+
+#[test]
+fn file_backed_sources() {
+    // File (positioned reads) and FileSource (mutex cursor) over a real file.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let f = std::fs::File::open(&path).unwrap();
+    let file_len = f.len();
+    assert!(file_len > 4);
+    let mut buf = [0u8; 4];
+    assert_eq!(f.read_at(0, &mut buf).unwrap(), 4);
+    assert_eq!(&buf, b"[pac");
+
+    let fs = FileSource::open(&path).unwrap();
+    assert_eq!(fs.len(), file_len);
+    assert_eq!(fs.read_slice(0, 4).unwrap(), b"[pac");
+    assert_eq!(fs.read_slice(file_len, 8).unwrap().len(), 0);
+
+    let f2 = std::fs::File::open(&path).unwrap();
+    let fs2 = FileSource::new(f2).unwrap();
+    assert_eq!(fs2.read_slice(0, 4).unwrap(), b"[pac");
+}
+
+#[test]
+fn read_exact_at_eof_and_errors() {
+    let data: &[u8] = &[1, 2, 3];
+    let mut buf = [0u8; 8];
+    let e = data.read_exact_at(0, &mut buf).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+    // exact fill succeeds
+    let mut small = [0u8; 3];
+    data.read_exact_at(0, &mut small).unwrap();
+    assert_eq!(small, [1, 2, 3]);
+    // empty buffer is trivially Ok
+    data.read_exact_at(0, &mut []).unwrap();
+}
+
+#[test]
+fn reader_position_and_box_arc() {
+    use std::io::Read;
+    let data: Box<dyn ByteSource> = Box::new(vec![9u8, 8, 7, 6]);
+    assert_eq!(data.len(), 4);
+    let arc = into_arc(vec![1u8, 2, 3]);
+    assert_eq!(arc.len(), 3);
+    assert!(!arc.is_empty());
+    let mut r = SourceReader::new(&arc, 1);
+    assert_eq!(r.position(), 1);
+    let mut buf = [0u8; 2];
+    assert_eq!(r.read(&mut buf).unwrap(), 2);
+    assert_eq!(r.position(), 3);
+}
+
+#[test]
+fn error_display_and_source() {
+    let io_err = Error::Io(std::io::Error::other("x"));
+    assert!(io_err.to_string().contains("i/o error"));
+    assert!(std::error::Error::source(&io_err).is_some());
+    let c = Error::corrupt(0x10, "bad");
+    assert!(c.to_string().contains("0x10"));
+    let u = Error::unsupported("ewf");
+    assert!(u.to_string().contains("ewf"));
+    let t = Error::Truncated {
+        offset: 4,
+        requested: 8,
+        available: 2,
+    };
+    let s = t.to_string();
+    assert!(s.contains("truncated"));
+    assert!(std::error::Error::source(&t).is_none());
+    // From<io::Error>
+    let e: Error = std::io::Error::other("y").into();
+    assert!(matches!(e, Error::Io(_)));
+}
+
+#[test]
 fn ewf_stub_reports_unsupported() {
     let mut e01 = vec![0u8; 512];
     e01[..ewf::EWF_SIGNATURE.len()].copy_from_slice(ewf::EWF_SIGNATURE);

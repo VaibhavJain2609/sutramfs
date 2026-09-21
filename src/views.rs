@@ -60,7 +60,8 @@ impl ByteSource for OffsetView {
             return Ok(0);
         }
         let want = buf.len().min((self.len - offset) as usize);
-        self.inner.read_at(self.offset + offset, &mut buf[..want])
+        self.inner
+            .read_at(self.offset.saturating_add(offset), &mut buf[..want])
     }
 }
 
@@ -79,8 +80,9 @@ impl ConcatSource {
         let mut segments = Vec::with_capacity(parts.len());
         let mut pos = 0u64;
         for p in parts {
+            let l = p.len();
             segments.push((pos, p));
-            pos += segments.last().unwrap().1.len();
+            pos = pos.saturating_add(l);
         }
         Self {
             segments,
@@ -94,7 +96,8 @@ impl ConcatSource {
         // keeps the code obviously correct.
         let mut idx = None;
         for (i, (start, src)) in self.segments.iter().enumerate() {
-            if *start <= offset && offset < start + src.len() {
+            // `offset - start` avoids `start + len` overflowing u64.
+            if *start <= offset && offset - start < src.len() {
                 idx = Some((i, offset - start));
             }
         }
@@ -123,7 +126,7 @@ impl ByteSource for ConcatSource {
                 break;
             }
             done += n;
-            pos += n as u64;
+            pos = pos.saturating_add(n as u64);
             buf = &mut buf[n..];
         }
         Ok(done)
@@ -200,8 +203,7 @@ impl SparseFile {
     /// Index of the extent that may contain `offset` (the last extent whose
     /// `out_offset <= offset`), or `None` if offset is before extent 0.
     fn locate(&self, offset: u64) -> Option<usize> {
-        match self
-            .extents
+        self.extents
             .binary_search_by(|e| {
                 if offset < e.out_offset {
                     std::cmp::Ordering::Greater
@@ -210,10 +212,8 @@ impl SparseFile {
                 } else {
                     std::cmp::Ordering::Equal
                 }
-            }) {
-            Ok(i) => Some(i),
-            Err(_) => None,
-        }
+            })
+            .ok()
     }
 
     /// Read one extent's byte at `within` offset into `buf`. Returns bytes
@@ -224,7 +224,9 @@ impl SparseFile {
         within: u64,
         buf: &mut [u8],
     ) -> io::Result<usize> {
-        let n = buf.len().min((ext.len - within) as usize);
+        // `as usize` on a >usize::MAX remainder would wrap on 32-bit targets.
+        let avail = usize::try_from(ext.len - within).unwrap_or(usize::MAX);
+        let n = buf.len().min(avail);
         match &ext.kind {
             SparseKind::Data { source, src_offset } => {
                 source.read_at(src_offset + within, &mut buf[..n])
@@ -286,20 +288,48 @@ impl SparseFile {
         let mut out = 0u64; // logical output offset
         for i in 0..total_chunks {
             let ch = src.read_slice(cursor, chunk_hdr_sz as usize).map_err(Error::Io)?;
+            if ch.len() < chunk_hdr_sz as usize {
+                return Err(Error::Truncated {
+                    offset: cursor,
+                    requested: chunk_hdr_sz,
+                    available: ch.len() as u64,
+                });
+            }
             let ctype = le::u16(&ch, 0).unwrap_or(0);
             let chunk_blocks = le::u32(&ch, 4).unwrap_or(0) as u64;
             let total_sz = le::u32(&ch, 8).unwrap_or(0) as u64;
+            // total_sz covers the chunk header itself; a smaller value is
+            // corrupt and would send the cursor backwards through the image.
+            if total_sz < chunk_hdr_sz {
+                return Err(Error::corrupt(
+                    cursor + 8,
+                    format!("Android sparse chunk {i}: total_sz {total_sz} < header"),
+                ));
+            }
             let out_len = chunk_blocks.saturating_mul(blk_sz);
             match ctype {
                 CHUNK_RAW => {
-                    extents.push(SparseExtent {
-                        out_offset: out,
-                        len: out_len,
-                        kind: SparseKind::Data {
-                            source: src.clone(),
-                            src_offset: cursor + chunk_hdr_sz,
-                        },
-                    });
+                    // Only `total_sz - header` bytes of payload follow the
+                    // header; a corrupt short payload must not leak the next
+                    // chunk's bytes into the output image.
+                    let data_len = (total_sz - chunk_hdr_sz).min(out_len);
+                    if data_len > 0 {
+                        extents.push(SparseExtent {
+                            out_offset: out,
+                            len: data_len,
+                            kind: SparseKind::Data {
+                                source: src.clone(),
+                                src_offset: cursor + chunk_hdr_sz,
+                            },
+                        });
+                    }
+                    if data_len < out_len {
+                        extents.push(SparseExtent {
+                            out_offset: out.saturating_add(data_len),
+                            len: out_len - data_len,
+                            kind: SparseKind::Zero,
+                        });
+                    }
                 }
                 CHUNK_FILL => {
                     let v = src
@@ -364,7 +394,7 @@ impl ByteSource for SparseFile {
                     if n == 0 {
                         break;
                     }
-                    pos += n as u64;
+                    pos = pos.saturating_add(n as u64);
                     buf_off += n;
                     done += n;
                 }
@@ -376,9 +406,11 @@ impl ByteSource for SparseFile {
                         .find(|e| e.out_offset > pos)
                         .map(|e| e.out_offset)
                         .unwrap_or(self.len);
-                    let n = ((next - pos) as usize).min(buf.len() - buf_off);
+                    // try_from guards the >usize::MAX hole case on 32-bit.
+                    let hole = usize::try_from(next - pos).unwrap_or(usize::MAX);
+                    let n = hole.min(buf.len() - buf_off);
                     buf[buf_off..buf_off + n].fill(0);
-                    pos += n as u64;
+                    pos = pos.saturating_add(n as u64);
                     buf_off += n;
                     done += n;
                 }

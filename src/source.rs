@@ -223,7 +223,7 @@ impl ByteSource for FileSource {
         let mut f = self
             .file
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "FileSource lock poisoned"))?;
+            .map_err(|_| io::Error::other("FileSource lock poisoned"))?;
         f.seek(SeekFrom::Start(offset))?;
         let want = buf.len().min((self.len - offset) as usize);
         f.read(&mut buf[..want])
