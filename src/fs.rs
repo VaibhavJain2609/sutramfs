@@ -107,9 +107,12 @@ pub struct HfsFs {
     pub(crate) live_keys: HashSet<(u32, String)>,
     /// Node indices of the live leaf chain (skipped by dead-node scan).
     pub(crate) leaf_nodes: Vec<u32>,
-    /// Allocation blocks owned by live files/metadata → owner path.
-    /// Drives overwritten detection for deleted residue.
-    pub(crate) live_blocks: HashMap<u32, String>,
+    /// Allocation blocks owned by live files/metadata as a sorted,
+    /// coalesced interval list `(start, end_exclusive, owner)`. Interval
+    /// storage keeps mount memory proportional to *file count*, not block
+    /// count (a per-block `HashMap` allocates one entry per live block —
+    /// memory-fatal on large/hostile images).
+    pub(crate) live_intervals: Vec<(u32, u32, Arc<str>)>,
     /// `(cnid, fork)` → `(start_block, extents)` overflow records.
     pub(crate) overflow: OverflowMap,
     /// Extents records whose CNID is not in the live catalog.
@@ -165,7 +168,7 @@ impl HfsFs {
             file_recs: HashMap::new(),
             live_keys: HashSet::new(),
             leaf_nodes: Vec::new(),
-            live_blocks: HashMap::new(),
+            live_intervals: Vec::new(),
             overflow: HashMap::new(),
             orphan_extents: Vec::new(),
             xattrs: HashMap::new(),
@@ -182,6 +185,7 @@ impl HfsFs {
         fs.index_attrs();
         fs.claim_metadata_blocks();
         fs.claim_live_blocks();
+        fs.finish_intervals();
         fs.read_bitmap();
         Ok(fs)
     }
@@ -245,7 +249,8 @@ impl HfsFs {
     }
 
     /// Expand `(block, count)` extents into absolute `(offset, len)` byte
-    /// ranges, clipped to `logical` bytes total.
+    /// ranges, clipped to `logical` bytes total. The logical-position
+    /// accumulator saturates so absurd extent counts can't wrap it.
     pub(crate) fn extents_to_ranges(&self, extents: &[Extent], logical: u64) -> Vec<(u64, u64)> {
         let bs = self.vh.block_size as u64;
         let mut out = Vec::with_capacity(extents.len());
@@ -260,7 +265,7 @@ impl HfsFs {
                 break;
             }
             out.push((self.vh.block_off(e.start), want));
-            acc += bytes;
+            acc = acc.saturating_add(bytes);
         }
         out
     }
@@ -419,12 +424,18 @@ impl HfsFs {
     }
 
     /// Keep only extents-overflow records whose CNID has no live catalog
-    /// record — those are the orphaned extents.
+    /// record — those are the orphaned extents. Reserved CNIDs (< 16: the
+    /// metadata files themselves) never appear as ordinary records, so
+    /// their extents would misfire as orphans — exclude them.
     fn index_extents_orphans(&mut self) {
+        const FIRST_USER_CNID: u32 = 16; // kHFSFirstUserCatalogNodeID
         let live = &self.file_recs;
         let folders = &self.folders;
-        self.orphan_extents
-            .retain(|o| !live.contains_key(&o.cnid) && !folders.contains_key(&o.cnid));
+        self.orphan_extents.retain(|o| {
+            o.cnid >= FIRST_USER_CNID
+                && !live.contains_key(&o.cnid)
+                && !folders.contains_key(&o.cnid)
+        });
     }
 
     /// Re-read + parse the record body for a [`RecRef`].
@@ -443,6 +454,17 @@ impl HfsFs {
         let record = catalog::parse_record(data)
             .ok_or_else(|| FsError::corrupt(r.disk_off, "record body unreadable"))?;
         Ok((record, rec.to_vec()))
+    }
+
+    /// Append `(start, end, owner)` to the unsorted interval list, clamped
+    /// to `total_blocks` — block IDs at/past the volume end are impossible.
+    fn claim_extent(&mut self, e: Extent, owner: &str) {
+        let total = self.vh.total_blocks;
+        let start = e.start.min(total);
+        let end = e.start.saturating_add(e.count).min(total);
+        if end > start {
+            self.live_intervals.push((start, end, Arc::from(owner)));
+        }
     }
 
     /// Claim the allocation blocks of the five special files.
@@ -467,17 +489,26 @@ impl HfsFs {
                 extents::FORK_DATA,
             );
             for e in extents {
-                for b in e.start..e.start.saturating_add(e.count) {
-                    self.live_blocks.insert(b, name.to_string());
-                }
+                self.claim_extent(e, name);
             }
         }
         // The volume header itself lives in block 0.
-        self.live_blocks.insert(0, "$Metadata/volume-header".into());
+        self.claim_extent(
+            Extent {
+                start: 0,
+                count: 1,
+            },
+            "$Metadata/volume-header",
+        );
         // Journal info block + buffer are live too.
         if let Some(j) = &self.journal {
-            self.live_blocks
-                .insert(j.jib_block, "$Metadata/journal-info".into());
+            self.claim_extent(
+                Extent {
+                    start: j.jib_block,
+                    count: 1,
+                },
+                "$Metadata/journal-info",
+            );
         }
     }
 
@@ -502,11 +533,50 @@ impl HfsFs {
                     &f.rsrc_fork
                 };
                 for e in self.fork_extents(fork, f.cnid, ft) {
-                    for b in e.start..e.start.saturating_add(e.count) {
-                        self.live_blocks.entry(b).or_insert_with(|| path.clone());
-                    }
+                    self.claim_extent(e, &path);
                 }
             }
+        }
+    }
+
+    /// Sort + coalesce the claimed intervals so [`Self::block_owner`] can
+    /// binary-search. Overlaps keep the *first* claim (metadata wins over
+    /// file extents — claimed earlier).
+    pub(crate) fn finish_intervals(&mut self) {
+        self.live_intervals
+            .sort_by_key(|(s, e, _)| (*s, *e));
+        let mut out: Vec<(u32, u32, Arc<str>)> =
+            Vec::with_capacity(self.live_intervals.len());
+        for (s, e, owner) in self.live_intervals.drain(..) {
+            match out.last_mut() {
+                // Overlapping an earlier claim: the earlier interval keeps
+                // the shared span; any tail the new claim adds gets its own
+                // owner label (earliest-start wins on contested blocks).
+                Some(last) if s < last.1 => {
+                    if e > last.1 {
+                        let tail = last.1;
+                        out.push((tail, e, owner));
+                    }
+                }
+                _ => out.push((s, e, owner)),
+            }
+        }
+        self.live_intervals = out;
+    }
+
+    /// Owner of allocation block `b`, when a live file/metadata claims it.
+    pub(crate) fn block_owner(&self, b: u32) -> Option<&str> {
+        let i = self
+            .live_intervals
+            .partition_point(|(s, _, _)| *s <= b);
+        if i == 0 {
+            return None;
+        }
+        let (_, e, owner) = &self.live_intervals[i - 1];
+        if b < *e {
+            Some(owner)
+        } else {
+            None
         }
     }
 
@@ -566,9 +636,17 @@ impl HfsFs {
     }
 
     /// Scan the attributes-file leaf chain into `xattrs`.
+    ///
+    /// Records for the same `(cnid, name)` attribute are **reassembled**:
+    /// a `0x20` fork-data record establishes the attribute's own extent
+    /// list and `0x30` extents records (keyed by their logical
+    /// `startBlock`) continue it — emitting each as a separate
+    /// pseudo-entry would split one logical attribute into fragments.
     fn index_attrs(&mut self) {
         let Some(attr) = &self.attr else { return };
-        let mut found: Vec<(u32, Xattr)> = Vec::new();
+        // Raw pass: (key, data-disk-offset, record-disk-offset, data).
+        type RawAttr = (attrs::AttrKey, u64, u64, AttrData);
+        let mut raw: Vec<RawAttr> = Vec::new();
         let res = attr.for_each_leaf(self.src.as_ref(), |n, node| {
             let base = attr.node_offset(n).unwrap_or(0);
             for i in 0..node.num_recs as usize {
@@ -584,48 +662,133 @@ impl HfsFs {
                 };
                 let rec_disk = base + node.offsets[i] as u64;
                 let data_disk = rec_disk + key.total_len as u64;
-                let (ranges, size, storage) = match a {
-                    AttrData::Inline { data_off, len } => (
-                        vec![(data_disk + data_off as u64, len as u64)],
-                        len as u64,
-                        "inline".to_string(),
-                    ),
-                    AttrData::ForkData(fork) => (
-                        self.extents_to_ranges(&VolumeHeader::extents_of(&fork), fork.logical_size),
-                        fork.logical_size,
-                        "fork".to_string(),
-                    ),
-                    AttrData::Extents(e) => (
-                        vec![(
-                            self.vh.block_off(e.start),
-                            e.count as u64 * self.vh.block_size as u64,
-                        )],
-                        e.count as u64 * self.vh.block_size as u64,
-                        "extents".to_string(),
-                    ),
-                    AttrData::Other(t) => {
-                        (Vec::new(), 0, format!("unknown type {t:#x}"))
-                    }
-                };
-                found.push((
-                    key.cnid,
-                    Xattr {
-                        name: key.name,
-                        disk_off: rec_disk,
-                        ranges,
-                        size,
-                        storage,
-                        start_block: key.start_block,
-                    },
-                ));
+                raw.push((key, data_disk, rec_disk, a));
             }
             Ok(())
         });
         if let Err(e) = res {
             self.note(e);
         }
-        for (cnid, x) in found {
-            self.xattrs.entry(cnid).or_default().push(x);
+        // Group records by (cnid, name); iterate in sorted order so the
+        // pseudo-entry sequence is deterministic across runs.
+        let mut groups: HashMap<(u32, String), Vec<RawAttr>> = HashMap::new();
+        for item in raw {
+            groups
+                .entry((item.0.cnid, item.0.name.clone()))
+                .or_default()
+                .push(item);
+        }
+        let mut gkeys: Vec<(u32, String)> = groups.keys().cloned().collect();
+        gkeys.sort();
+        for gk in gkeys {
+            let (cnid, name) = (gk.0, gk.1);
+            let mut recs = groups.remove(&(cnid, name.clone())).unwrap_or_default();
+            // Order by startBlock so continuation extents sort correctly.
+            recs.sort_by_key(|(k, _, _, _)| k.start_block);
+            // (start_block, rec_disk, data_off_abs, len) — a multi-record
+            // inline attr stores successive chunks keyed by startBlock.
+            let mut inline: Vec<(u32, u64, u64, u64)> = Vec::new();
+            let mut fork: Option<(ForkData, u64)> = None;
+            let mut extra_exts: Vec<(u32, Extent)> = Vec::new();
+            let mut exts_disk: u64 = u64::MAX; // earliest 0x30 record offset
+            let mut other: Option<(u32, u64)> = None;
+            for (key, data_disk, rec_disk, a) in recs {
+                match a {
+                    AttrData::Inline { data_off, len } => {
+                        inline.push((key.start_block, rec_disk, data_disk + data_off as u64, len as u64));
+                    }
+                    AttrData::ForkData(f) => {
+                        fork.get_or_insert((f, rec_disk));
+                    }
+                    AttrData::Extents(e) => {
+                        exts_disk = exts_disk.min(rec_disk);
+                        extra_exts.push((key.start_block, e));
+                    }
+                    AttrData::Other(t) => {
+                        other.get_or_insert((t, rec_disk));
+                    }
+                }
+            }
+            let xa = if !inline.is_empty() && fork.is_none() && extra_exts.is_empty() {
+                inline.sort_by_key(|(sb, _, _, _)| *sb);
+                let rec_disk = inline[0].1;
+                let ranges: Vec<(u64, u64)> =
+                    inline.iter().map(|(_, _, off, len)| (*off, *len)).collect();
+                Xattr {
+                    name: name.clone(),
+                    disk_off: rec_disk,
+                    size: ranges.iter().map(|(_, l)| *l).sum(),
+                    ranges,
+                    storage: if inline.len() > 1 {
+                        "inline-fragmented".into()
+                    } else {
+                        "inline".into()
+                    },
+                    start_block: 0,
+                }
+            } else if !inline.is_empty() {
+                // Mixed inline + fork records — corrupt; report the inline
+                // chunks (their bytes are the most directly provenanced).
+                inline.sort_by_key(|(sb, _, _, _)| *sb);
+                let rec_disk = inline[0].1;
+                let ranges: Vec<(u64, u64)> =
+                    inline.iter().map(|(_, _, off, len)| (*off, *len)).collect();
+                Xattr {
+                    name: name.clone(),
+                    disk_off: rec_disk,
+                    size: ranges.iter().map(|(_, l)| *l).sum(),
+                    ranges,
+                    storage: "inline".into(),
+                    start_block: 0,
+                }
+            } else if fork.is_some() || !extra_exts.is_empty() {
+                // Reassemble: the 0x20 fork record's inline 8 extents,
+                // then each 0x30 continuation extent in startBlock order.
+                extra_exts.sort_by_key(|(sb, _)| *sb);
+                let (logical_size, rec_disk, mut all) = match &fork {
+                    Some((f, d)) => (f.logical_size, *d, VolumeHeader::extents_of(f)),
+                    // No 0x20 anchor — provenance is the earliest 0x30
+                    // record; total size is whatever the extents cover.
+                    None => (0, exts_disk, Vec::new()),
+                };
+                all.extend(
+                    extra_exts
+                        .iter()
+                        .map(|(_, e)| *e)
+                        .filter(|e| e.count != 0),
+                );
+                let ranges =
+                    self.extents_to_ranges(&all, if logical_size > 0 { logical_size } else { u64::MAX });
+                let size = if logical_size > 0 {
+                    logical_size
+                } else {
+                    ranges.iter().map(|(_, l)| *l).sum()
+                };
+                Xattr {
+                    name: name.clone(),
+                    disk_off: rec_disk,
+                    ranges,
+                    size,
+                    storage: if fork.is_some() {
+                        "fork".into()
+                    } else {
+                        "extents".into()
+                    },
+                    start_block: 0,
+                }
+            } else if let Some((t, rec_disk)) = other {
+                Xattr {
+                    name: name.clone(),
+                    disk_off: rec_disk,
+                    ranges: Vec::new(),
+                    size: 0,
+                    storage: format!("unknown type {t:#x}"),
+                    start_block: 0,
+                }
+            } else {
+                continue;
+            };
+            self.xattrs.entry(cnid).or_default().push(xa);
         }
     }
 
@@ -648,8 +811,10 @@ impl HfsFs {
     }
 
     /// Read the allocation-file bitmap (bounded by total_blocks/8 + slack).
+    /// Overflow extents are honoured — the allocation file can fragment
+    /// past its inline eight like any other fork.
     fn read_bitmap(&mut self) {
-        let ranges = self.fork_byte_ranges(&self.vh.alloc_fork.clone(), &[]);
+        let ranges = self.fork_ranges_for(catalog::CNID_ALLOC, extents::FORK_DATA);
         let need = (self.vh.total_blocks as u64).div_ceil(8).min(64 << 20);
         let mut bits = Vec::with_capacity(need as usize);
         let mut got = 0u64;
@@ -699,17 +864,26 @@ impl HfsFs {
             return (RecoveryState::Unrecoverable, Vec::new(), notes);
         }
         let expected_blocks = size.div_ceil(bs).max(1);
+        // Scan cap: a hostile extent list can describe billions of blocks;
+        // past ~64 GiB of block coverage the assessment stops being useful
+        // anyway — note the truncation instead of burning CPU.
+        const MAX_SCAN_BLOCKS: u64 = 16 << 20;
+        let total = self.vh.total_blocks;
         let mut have_blocks = 0u64;
+        let mut scanned = 0u64;
         let mut surviving_runs: Vec<(u32, u32)> = Vec::new();
         let mut lost = 0u64;
         let mut lost_to: Vec<String> = Vec::new();
         'exts: for e in extents {
-            for b in e.start..e.start.saturating_add(e.count) {
-                if have_blocks >= expected_blocks {
+            // Blocks at/past `total_blocks` are off-volume by definition.
+            let run_end = e.start.saturating_add(e.count).min(total);
+            for b in e.start.min(total)..run_end {
+                if have_blocks >= expected_blocks || scanned >= MAX_SCAN_BLOCKS {
                     break 'exts;
                 }
+                scanned += 1;
                 have_blocks += 1;
-                match self.live_blocks.get(&b) {
+                match self.block_owner(b) {
                     Some(owner) => {
                         lost += 1;
                         if lost_to.len() < 4 {
@@ -732,6 +906,11 @@ impl HfsFs {
                     }
                 }
             }
+        }
+        if scanned >= MAX_SCAN_BLOCKS {
+            notes.push(format!(
+                "recovery scan truncated at {MAX_SCAN_BLOCKS} blocks"
+            ));
         }
         if !lost_to.is_empty() {
             notes.push(format!(
@@ -940,8 +1119,14 @@ impl FileSystem for HfsFs {
                 .get("decmpfs_uncompressed_size")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(entry.size);
+            // Never read more than the allocated ranges actually hold —
+            // a corrupt `uncompressed_size` can't inflate the read bound.
+            let range_bytes: u64 = entry.allocated_ranges.iter().map(|(_, l)| *l).sum();
+            let cap = usize_hint
+                .saturating_mul(4)
+                .clamp(1 << 20, 512 << 20)
+                .min(range_bytes);
             let mut blob = Vec::new();
-            let cap = usize_hint.saturating_mul(4).clamp(1 << 20, 512 << 20);
             let mut rdr = ExtentReader {
                 src: self.src.clone(),
                 ranges: entry.allocated_ranges.clone(),
@@ -960,9 +1145,10 @@ impl FileSystem for HfsFs {
                     break;
                 }
             }
-            // Inline types carry the 16-byte decmpfs header at the front of
-            // the stored bytes; resource-fork types need only the size hint.
-            let is_inline = !matches!(compression_type, 4 | 8 | 10 | 12);
+            // Inline (odd) types carry the 16-byte decmpfs header at the
+            // front of the stored bytes; resource-fork (even) types need
+            // only the size hint.
+            let is_inline = !attrs::decmpfs_is_rsrc(compression_type);
             let (hdr, rsrc) = if is_inline {
                 (attrs::parse_decmpfs(&blob)?, None)
             } else {
@@ -988,15 +1174,18 @@ impl FileSystem for HfsFs {
     }
 
     /// Free allocation blocks as byte ranges — the carving ground.
-    /// Only meaningful when the allocation file was readable.
+    /// Only meaningful when the allocation file was readable. Blocks
+    /// beyond the bitmap actually read are **not** reported free —
+    /// their state is unknown, not "unallocated".
     fn unallocated_ranges(&self) -> Vec<(u64, u64)> {
         let Some(bits) = &self.alloc_bitmap else {
             return Vec::new();
         };
         let bs = self.vh.block_size as u64;
+        let covered = (bits.len() as u64 * 8).min(self.vh.total_blocks as u64) as u32;
         let mut out = Vec::new();
         let mut run_start: Option<u32> = None;
-        for b in 0..self.vh.total_blocks {
+        for b in 0..covered {
             let byte = bits.get((b / 8) as usize).copied().unwrap_or(0);
             let free = byte & (0x80 >> (b % 8)) == 0;
             match (free, run_start) {
@@ -1009,7 +1198,7 @@ impl FileSystem for HfsFs {
             }
         }
         if let Some(s) = run_start {
-            out.push((self.vh.block_off(s), (self.vh.total_blocks - s) as u64 * bs));
+            out.push((self.vh.block_off(s), (covered - s) as u64 * bs));
         }
         out
     }

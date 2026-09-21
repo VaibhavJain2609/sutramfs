@@ -128,9 +128,11 @@ pub(crate) struct VolumeHeader {
 }
 
 impl VolumeHeader {
-    /// Absolute byte offset of allocation block `n`.
+    /// Absolute byte offset of allocation block `n`. Saturates: a bogus
+    /// extent pointing past the volume must not wrap into low offsets.
     pub(crate) fn block_off(&self, n: u32) -> u64 {
-        self.block0_offset + n as u64 * self.block_size as u64
+        self.block0_offset
+            .saturating_add(n as u64 * self.block_size as u64)
     }
 
     /// Expand a fork's extent descriptors into `(block, count)` pairs,

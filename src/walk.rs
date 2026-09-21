@@ -223,6 +223,7 @@ impl<'m> Walk<'m> {
 
         // Hard link (`hlnk`): extents live on `iNode<special>` (CNID 18's dir).
         let mut inode_fork: Option<ForkData> = None;
+        let mut inode_cnid = f.cnid;
         if f.is_hardlink() && f.special != 0 {
             meta.insert("hardlink".into(), "true".into());
             meta.insert("inode_ref".into(), format!("iNode{}", f.special));
@@ -238,6 +239,9 @@ impl<'m> Walk<'m> {
                     );
                     size = inode.data_fork.logical_size;
                     inode_fork = Some(inode.data_fork);
+                    // Overflow extents are keyed under the *inode file's*
+                    // CNID, not the hardlink's.
+                    inode_cnid = inode.cnid;
                 }
             }
         }
@@ -261,7 +265,7 @@ impl<'m> Walk<'m> {
 
         let ranges = override_ranges.or(stored_ranges).unwrap_or_else(|| {
             let fork = inode_fork.as_ref().unwrap_or(&f.data_fork);
-            let exts = self.fs.fork_extents(fork, f.cnid, extents::FORK_DATA);
+            let exts = self.fs.fork_extents(fork, inode_cnid, extents::FORK_DATA);
             self.fs.extents_to_ranges(&exts, size)
         });
 
@@ -368,8 +372,8 @@ impl<'m> Walk<'m> {
             hdr.uncompressed_size.to_string(),
         );
         *size = hdr.uncompressed_size;
-        // Where the stored bytes live.
-        *stored_ranges = if matches!(hdr.compression_type, 4 | 8 | 10 | 12) {
+        // Where the stored bytes live (even types → resource fork).
+        *stored_ranges = if attrs::decmpfs_is_rsrc(hdr.compression_type) {
             let re = self
                 .fs
                 .fork_extents(&f.rsrc_fork, f.cnid, extents::FORK_RSRC);
@@ -554,7 +558,6 @@ impl<'m> Walk<'m> {
             return None;
         }
         let record = catalog::parse_record(data)?;
-        self.residue_seen.insert((key.parent, name.clone()));
         let r = RecRef {
             node: 0,
             rec_off: 0,
@@ -569,8 +572,12 @@ impl<'m> Walk<'m> {
             cnid: 0,
         };
         Some(match record {
-            CatRecord::File(f) => self.deleted_file_entry(&r, &f, kind),
+            CatRecord::File(f) => {
+                self.residue_seen.insert((key.parent, r.name.clone()));
+                self.deleted_file_entry(&r, &f, kind)
+            }
             CatRecord::Folder(f) => {
+                self.residue_seen.insert((key.parent, r.name.clone()));
                 let parent_path = self
                     .fs
                     .path_of(key.parent)
@@ -638,7 +645,13 @@ impl<'m> Walk<'m> {
     /// Phase D: B-tree nodes outside the leaf chain that still parse as
     /// leaf nodes — freed during compaction, full of deleted records.
     fn scan_dead_nodes(&mut self) -> Option<Result<FsEntry>> {
-        while self.dead_node < self.fs.cat.hdr.total_nodes {
+        // A hostile header can claim billions of nodes; only node indexes
+        // the catalog file can actually hold are scannable (a node past
+        // the file's extents can't exist).
+        let file_bytes: u64 = self.fs.cat.ranges.iter().map(|(_, l)| *l).sum();
+        let capacity = file_bytes / self.fs.cat.hdr.node_size.max(1) as u64;
+        let max = (self.fs.cat.hdr.total_nodes as u64).min(capacity) as u32;
+        while self.dead_node < max {
             let n = self.dead_node;
             self.dead_node += 1;
             if n == 0 || self.fs.leaf_nodes.contains(&n) {

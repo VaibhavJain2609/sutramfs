@@ -168,8 +168,18 @@ pub(crate) fn decmpfs_type_name(t: u32) -> &'static str {
         10 => "uncompressed-resource-fork",
         11 => "lzfse-inline",
         12 => "lzfse-resource-fork",
+        13 => "lzbitmap-inline",
+        14 => "lzbitmap-resource-fork",
         _ => "unknown",
     }
+}
+
+/// Storage-location parity rule: **even** `compression_type`s keep their
+/// payload in the file's resource fork (block table), **odd** types inline
+/// it after the xattr header. Used for provenance (`allocated_ranges`) even
+/// when the codec itself is unsupported.
+pub(crate) fn decmpfs_is_rsrc(t: u32) -> bool {
+    t != 0 && t % 2 == 0
 }
 
 /// Inflate a zlib/DEFLATE stream, capped at `cap` output bytes.

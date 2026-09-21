@@ -262,13 +262,16 @@ impl Node {
 }
 
 /// Map a logical file offset through an extent list to an absolute offset.
+/// Accumulators saturate: corrupt extent lists must not wrap to `Some` on
+/// an absurd logical offset.
 pub(crate) fn map_logical(ranges: &[(u64, u64)], logical: u64) -> Option<u64> {
     let mut acc = 0u64;
     for &(off, len) in ranges {
-        if logical < acc + len {
-            return Some(off + (logical - acc));
+        let end = acc.saturating_add(len);
+        if logical < end {
+            return Some(off.saturating_add(logical - acc));
         }
-        acc += len;
+        acc = end;
     }
     None
 }
@@ -286,11 +289,12 @@ pub(crate) fn read_range_span(
     let mut acc = 0u64;
     let mut idx = ranges.len();
     for (i, &(_, l)) in ranges.iter().enumerate() {
-        if logical < acc + l {
+        let end = acc.saturating_add(l);
+        if logical < end {
             idx = i;
             break;
         }
-        acc += l;
+        acc = end;
     }
     if idx == ranges.len() {
         return None;
@@ -298,13 +302,10 @@ pub(crate) fn read_range_span(
     let mut out = Vec::with_capacity(len.min(1 << 20));
     let mut pos = logical;
     let mut i = idx;
+    let mut ext_logical_start = acc;
     while out.len() < len && i < ranges.len() {
         let (off, l) = ranges[i];
-        let mut ext_logical_start = 0u64;
-        for &(_, l2) in &ranges[..i] {
-            ext_logical_start += l2;
-        }
-        if pos < ext_logical_start || pos >= ext_logical_start + l {
+        if pos < ext_logical_start || pos >= ext_logical_start.saturating_add(l) {
             break;
         }
         let in_ext = pos - ext_logical_start;
@@ -315,6 +316,7 @@ pub(crate) fn read_range_span(
         }
         pos += chunk.len() as u64;
         out.extend_from_slice(&chunk);
+        ext_logical_start = ext_logical_start.saturating_add(l);
         i += 1;
     }
     Some(out)

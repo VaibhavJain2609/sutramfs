@@ -1528,10 +1528,303 @@ fn tiny_xattr_pseudo_entries() {
     assert!(names.iter().any(|n| n.contains("xattr:com.apple.decmpfs")));
     assert!(names.iter().any(|n| n.contains("xattr:big.attr")));
     assert!(names.iter().any(|n| n.contains("xattr:cont.attr")));
-    // 续块记录在 meta 中标记。
+    // Continuation records are reassembled into the attribute: the
+    // decmpfs xattr (startBlock 0 + 1) merges to one entry whose
+    // allocated_ranges hold both chunks in startBlock order.
+    let merged = fs
+        .walk()
+        .filter_map(|i| i.ok())
+        .find(|e| e.name.contains("xattr:com.apple.decmpfs"))
+        .expect("decmpfs xattr pseudo-entry");
+    assert_eq!(merged.meta["xattr_storage"], "inline-fragmented");
+    assert_eq!(merged.allocated_ranges.len(), 2);
+    assert!(merged.allocated_ranges[0].0 < merged.allocated_ranges[1].0);
+    // `cont.attr` had only a 0x30 extents record — assembled as "extents".
     let cont = fs
         .walk()
         .filter_map(|i| i.ok())
-        .find(|e| e.name.contains("xattr:com.apple.decmpfs") && e.meta.contains_key("xattr_continuation"));
-    assert!(cont.is_some());
+        .find(|e| e.name.contains("xattr:cont.attr"))
+        .expect("cont.attr pseudo-entry");
+    assert_eq!(cont.meta["xattr_storage"], "extents");
+    assert_eq!(cont.allocated_ranges.len(), 1);
+}
+
+// ---- 回归测试：验证/修复轮 --------------------------------------------------
+
+#[test]
+fn map_logical_saturates_huge_extents() {
+    // 超大 extent 列表曾使 acc+len 溢出 → 逻辑偏移映射错乱/恐慌。
+    let ranges = vec![(0u64, u64::MAX), (0u64, u64::MAX)];
+    assert_eq!(super::btree::map_logical(&ranges, u64::MAX - 1), Some(u64::MAX - 1));
+    assert_eq!(super::btree::map_logical(&ranges, u64::MAX), None);
+    // 第二个 extent 溢出后不应映射。
+    let ranges = vec![(0u64, 16), (4096u64, u64::MAX - 8)];
+    assert_eq!(super::btree::map_logical(&ranges, 20), Some(4100));
+}
+
+#[test]
+fn extents_to_ranges_saturates_on_hostile_counts() {
+    // 几千个 count≈u32::MAX 的 extent 曾使逻辑累加器 u64 溢出（debug 恐慌）。
+    let fs = tiny_fs();
+    let exts = vec![super::vh::Extent {
+        start: 12,
+        count: u32::MAX,
+    }; 3000];
+    let ranges = fs.extents_to_ranges(&exts, u64::MAX);
+    assert_eq!(ranges.len(), 3000);
+    // 所有范围都应位于块 12（截断映射之外不重要 —— 关键是不恐慌）。
+    assert!(ranges.iter().all(|(o, l)| *o >= 12 * TB as u64 && *l > 0));
+}
+
+#[test]
+fn block_owner_and_interval_coalescing() {
+    let fs = tiny_fs();
+    // 元数据块：0 = volume header, 4 = alloc, 5..8 = catalog。
+    assert_eq!(fs.block_owner(0), Some("$Metadata/volume-header"));
+    assert_eq!(fs.block_owner(4), Some("$Metadata/allocation"));
+    assert_eq!(fs.block_owner(6), Some("$Metadata/catalog"));
+    // F.TXT 拥有块 12（inline）和 19（overflow 记录）。
+    assert_eq!(fs.block_owner(12), Some("/F.TXT"));
+    assert_eq!(fs.block_owner(19), Some("/F.TXT"));
+    // 块 13 只属于死记录残留 —— 无 live 拥有者。
+    assert_eq!(fs.block_owner(13), None);
+    // 越界块。
+    assert_eq!(fs.block_owner(10_000), None);
+}
+
+#[test]
+fn decmpfs_is_rsrc_parity_rule() {
+    use super::attrs;
+    for t in [4u32, 8, 10, 12, 14] {
+        assert!(attrs::decmpfs_is_rsrc(t), "type {t} must map to resource fork");
+    }
+    for t in [1u32, 3, 5, 7, 9, 11, 13] {
+        assert!(!attrs::decmpfs_is_rsrc(t), "type {t} must map to xattr");
+    }
+    assert!(!attrs::decmpfs_is_rsrc(0));
+    assert_eq!(attrs::decmpfs_type_name(13), "lzbitmap-inline");
+    assert_eq!(attrs::decmpfs_type_name(14), "lzbitmap-resource-fork");
+}
+
+#[test]
+fn reserved_cnid_extents_not_orphaned() {
+    use sutram_fs::FileSystem;
+    // 为保留 CNID 4（目录文件自身）添加 extents 记录 —— 不得成为孤儿。
+    let mut img = tiny_image();
+    let e1 = ext_rec(0, 20, 1, &[(19, 1)]);
+    let e2 = ext_rec(0xFF, 99, 0, &[(18, 1)]);
+    let e3 = ext_rec(0, 4, 0, &[(22, 1)]);
+    let eleaf = leaf_residue(&[e1, e2, e3], &[]);
+    img[10 * TB + TNODE..10 * TB + TNODE * 2].copy_from_slice(&eleaf);
+    let fs = super::fs::HfsFs::mount(
+        std::sync::Arc::new(img) as std::sync::Arc<dyn sutram_io::ByteSource>,
+        sutram_fs::MountOptions::default(),
+    )
+    .unwrap();
+    let names: Vec<String> = fs.walk().filter_map(|i| i.ok()).map(|e| e.name).collect();
+    assert!(names.iter().any(|n| n == "extents_99"), "user orphan kept");
+    assert!(!names.iter().any(|n| n == "extents_4"), "reserved cnid must not orphan");
+}
+
+#[test]
+fn hostile_total_nodes_does_not_hang() {
+    use sutram_fs::FileSystem;
+    // catalog 头声称 u32::MAX 个节点 —— 死节点扫描须按文件容量截断。
+    let mut img = tiny_image();
+    img[5 * TB + 14 + 22..5 * TB + 14 + 26].copy_from_slice(&u32::MAX.to_be_bytes());
+    let fs = super::fs::HfsFs::mount(
+        std::sync::Arc::new(img) as std::sync::Arc<dyn sutram_io::ByteSource>,
+        sutram_fs::MountOptions::default(),
+    )
+    .unwrap();
+    let n = fs.walk().count();
+    assert!(n > 0);
+}
+
+#[test]
+fn unallocated_ranges_bounded_by_bitmap_read() {
+    use sutram_fs::FileSystem;
+    // total_blocks 远超 alloc 文件能容纳的位图 → 未覆盖块不得报空闲。
+    let mut img = tiny_image();
+    img[1024 + 44..1024 + 48].copy_from_slice(&100_000u32.to_be_bytes());
+    let fs = super::fs::HfsFs::mount(
+        std::sync::Arc::new(img) as std::sync::Arc<dyn sutram_io::ByteSource>,
+        sutram_fs::MountOptions::default(),
+    )
+    .unwrap();
+    let ranges = fs.unallocated_ranges();
+    let covered_blocks = 4096u64 * 8; // alloc fork 只读到一个块
+    for (off, len) in &ranges {
+        assert!(
+            *off + *len <= covered_blocks * 4096,
+            "unallocated range past bitmap: ({off:#x}, {len:#x})"
+        );
+    }
+    assert!(!ranges.is_empty());
+}
+
+// ---- 边界/错误路径补充覆盖 --------------------------------------------------
+
+#[test]
+fn decoder_edge_paths() {
+    use super::{attrs, catalog, extents};
+    // attr key：key_len<14；nlen>127；key_len 与名字长度不一致。
+    let mut k = vec![0u8; 16];
+    k[0..2].copy_from_slice(&13u16.to_be_bytes());
+    assert!(attrs::parse_key(&k).is_none());
+    k[0..2].copy_from_slice(&14u16.to_be_bytes());
+    k[12..14].copy_from_slice(&200u16.to_be_bytes()); // nlen>127
+    assert!(attrs::parse_key(&k).is_none());
+    k[12..14].copy_from_slice(&2u16.to_be_bytes()); // nlen=2 → key_len 应 16
+    assert!(attrs::parse_key(&k).is_none());
+    // extents key：key_len≠10。
+    let mut e = vec![0u8; 12];
+    e[0..2].copy_from_slice(&9u16.to_be_bytes());
+    assert!(extents::parse_key(&e).is_none());
+    // unistr 超 max_units / 截断。
+    assert!(catalog::unistr(&[0, 9, 0, 65], 0, 2).is_none());
+    assert!(catalog::unistr(&[0, 2, 0, 65], 0, 255).is_none());
+    // parse_key：key_len 越界 / 不匹配。
+    assert!(catalog::parse_key(&[0, 4, 0, 0, 0, 0]).is_none());
+    let mut rec = cat_key(2, "AB");
+    rec[0..2].copy_from_slice(&12u16.to_be_bytes()); // key_len ≠ 4+name_len
+    assert!(catalog::parse_key(&rec).is_none());
+    // folder/file 记录体过短。
+    let mut d = vec![0u8; 40];
+    d[0..2].copy_from_slice(&1i16.to_be_bytes());
+    assert!(catalog::parse_record(&d).is_none());
+    let mut d = vec![0u8; 100];
+    d[0..2].copy_from_slice(&2i16.to_be_bytes());
+    assert!(catalog::parse_record(&d).is_none());
+    // thread 记录 unistr 截断 → None。
+    let mut d = vec![0u8; 10];
+    d[0..2].copy_from_slice(&3i16.to_be_bytes());
+    d[8..10].copy_from_slice(&99u16.to_be_bytes());
+    assert!(catalog::parse_record(&d).is_none());
+    // 未知类型 → Other。
+    let mut d = vec![0u8; 8];
+    d[0..2].copy_from_slice(&9i16.to_be_bytes());
+    assert!(matches!(
+        catalog::parse_record(&d),
+        Some(super::catalog::CatRecord::Other(9))
+    ));
+}
+
+#[test]
+fn sniff_record_short_bodies() {
+    use super::catalog;
+    // 合法 key + 过短 file 体 → None。
+    let mut r = cat_key(2, "x");
+    r.extend_from_slice(&2i16.to_be_bytes());
+    r.extend_from_slice(&[0u8; 10]);
+    assert!(catalog::sniff_record(&r, 0).is_none());
+    // folder 体 <88。
+    let mut r = cat_key(2, "x");
+    r.extend_from_slice(&1i16.to_be_bytes());
+    r.extend_from_slice(&[0u8; 10]);
+    assert!(catalog::sniff_record(&r, 0).is_none());
+    // thread 体 <10。
+    let mut r = cat_key(2, "x");
+    r.extend_from_slice(&3i16.to_be_bytes());
+    r.extend_from_slice(&[0u8; 2]);
+    assert!(catalog::sniff_record(&r, 0).is_none());
+    // 未知类型 → None。
+    let mut r = cat_key(2, "x");
+    r.extend_from_slice(&9i16.to_be_bytes());
+    r.extend_from_slice(&[0u8; 300]);
+    assert!(catalog::sniff_record(&r, 0).is_none());
+    // parent==0 的合法外形 → None。
+    let mut r = cat_key(0, "x");
+    r.extend_from_slice(&file248(9, &[(1, 1)], 5));
+    assert!(catalog::sniff_record(&r, 0).is_none());
+}
+
+#[test]
+fn vh_alternate_too_small_volume() {
+    // 主签名坏 + 卷太小放不下备用头 → 回主错误。
+    let img = vec![0u8; 2000];
+    assert!(VolumeHeader::parse(&img).is_err());
+}
+
+#[test]
+fn btree_read_node_bounds() {
+    let img = vec![0u8; 2048];
+    let t = Btree::open(&img, vec![(0, 2048)], 0).unwrap_err();
+    let _ = t;
+    // 合法头 + n>=total_nodes。
+    let mut hdr = vec![0u8; 2048];
+    hdr[8] = 1;
+    hdr[14 + 18..14 + 20].copy_from_slice(&512u16.to_be_bytes());
+    hdr[14 + 22..14 + 26].copy_from_slice(&4u32.to_be_bytes());
+    let t = Btree::open(&hdr, vec![(0, 2048)], 0).unwrap();
+    assert!(t.read_node(&hdr, 4).is_err());
+    // 节点在 extents 之外：total=4 但只映射 2 个节点。
+    let t = Btree::open(&hdr, vec![(0, 1024)], 0).unwrap();
+    assert!(t.read_node(&hdr, 2).is_err());
+}
+
+#[test]
+fn node_parse_and_free_space_edges() {
+    // 缓冲区过短。
+    assert!(super::btree::Node::parse(vec![0u8; 10], 0).is_err());
+    // 记录填满节点 → 无空闲区。
+    let rec = vec![0u8; 512 - 14 - 4];
+    let n = leaf_node512(&[&rec]);
+    let node = super::btree::Node::parse(n, 0).unwrap();
+    assert!(node.free_space().is_none());
+}
+
+#[test]
+fn read_range_span_short_read_end() {
+    // 第二个 extent 指向源外 → 读空 → 提前 break，返回已有数据。
+    let img = vec![0xABu8; 4];
+    let out = super::btree::read_range_span(&img, &[(0, 4), (4, 100)], 0, 50);
+    assert_eq!(out.as_deref(), Some(&[0xAB; 4][..]));
+    // 起始 logical 超出映射 → None。
+    assert!(super::btree::read_range_span(&img, &[(0, 4)], 10, 4).is_none());
+}
+
+#[test]
+fn decmpfs_bad_magic_and_short() {
+    use super::attrs;
+    assert!(attrs::parse_decmpfs(&[0u8; 4]).is_err());
+    let mut v = vec![0u8; 16];
+    v[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+    assert!(attrs::parse_decmpfs(&v).is_err());
+}
+
+#[test]
+fn decmpfs_type10_bounds() {
+    use super::attrs;
+    // header_size 越界 → Corrupt。
+    let mut rsrc = vec![0u8; 40];
+    rsrc[0..4].copy_from_slice(&4u32.to_be_bytes());
+    let hdr = DecmpfsHeader {
+        compression_type: 10,
+        uncompressed_size: 8,
+        inline: Vec::new(),
+    };
+    assert!(attrs::decompress(&hdr, Some(&rsrc)).is_err());
+    // numBlocks 越界。
+    let mut rsrc = vec![0u8; 64];
+    rsrc[0..4].copy_from_slice(&16u32.to_be_bytes());
+    rsrc[20..24].copy_from_slice(&1_000_001u32.to_le_bytes());
+    assert!(attrs::decompress(&hdr, Some(&rsrc)).is_err());
+}
+
+#[test]
+fn read_file_returns_only_surviving_ranges() {
+    use std::io::Read;
+    use sutram_fs::FileSystem;
+    // 死记录 GONE2.TXT（dead_node_free_space）：块 20 被 ORPH.TXT 占用?
+    // 无 live 占用者 → Intact;read_file 读回存续字节。
+    let fs = tiny_fs();
+    let e = fs
+        .walk()
+        .filter_map(|i| i.ok())
+        .find(|e| e.name == "GONE2.TXT")
+        .unwrap();
+    let mut buf = Vec::new();
+    fs.read_file(&e).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"DEAD2-DATA"));
 }
