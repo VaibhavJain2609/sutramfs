@@ -1,0 +1,21 @@
+# cargo-fuzz scaffolding — a *dev tool*, not a dependency of the crate.
+# Build/run with:  cargo +nightly fuzz run parse_image
+# (requires `cargo install cargo-fuzz`; normal `cargo test` does NOT need
+# libfuzzer and never touches this directory).
+[package]
+name = "sutram-fat-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sutram-fat = { path = ".." }
+sutram-io = { path = "../../sutram-io" }
+sutram-fs = { path = "../../sutram-fs" }
+
+[workspace]
+members = ["."]
