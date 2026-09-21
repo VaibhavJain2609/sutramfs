@@ -24,6 +24,9 @@ between a raw acquisition and a filesystem parser:
   reader: single- and multi-segment (`.E02`+) images, zlib-compressed and
   raw chunks, `table`/`table2` chunk maps, `error2` acquisition-error
   ranges, and stored MD5/SHA-1 integrity hashes. Never FFI to libewf.
+- `vhd::VhdSource` — VHD and VHDX virtual-disk reader: fixed and
+  dynamic VHD (BAT + sector bitmaps), non-differencing VHDX (region
+  table + u64 BAT, CRC-32C-checked headers).
 
 ## Forensic guarantees
 
@@ -116,6 +119,43 @@ for w in img.warnings() { eprintln!("ewf: {w}"); }
   not interpreted. Section-internal checksums beyond the descriptor's are
   recorded but not yet verified.
 
+## VHD / VHDX support
+
+`vhd::VhdSource::open` auto-detects the format (`vhdxfile` signature →
+VHDX, else the `conectix` footer) and exposes the virtual disk as a
+`ByteSource`:
+
+```rust,no_run
+use sutram_io::{into_arc, ByteSource, FileSource};
+use sutram_io::vhd::VhdSource;
+
+let file = into_arc(FileSource::open("disk.vhd")?);
+let img = VhdSource::open(file)?;
+println!("{:?} {} bytes", img.info().format, img.len());
+for w in img.warnings() { eprintln!("vhd: {w}"); }
+# Ok::<(), sutram_io::Error>(())
+```
+
+- VHD: fixed (type 2) and dynamic (type 3) disks. Dynamic blocks are
+  dispatched through the BAT (u32 sector offsets, `0xFFFFFFFF` =
+  unallocated → zeros); each block's sector bitmap is honoured so
+  unwritten sectors read as zeros. A footer hidden behind trailing
+  garbage is recovered by a bounded tail scan.
+- VHDX: the checksum-valid header and region-table copies are picked per
+  the format's redundancy rules; BAT states `NOT_PRESENT`/`UNDEFINED`/
+  `ZERO`/`UNMAPPED` read as zeros, `FULLY_PRESENT` reads payload.
+- Differencing images (VHD type 4, VHDX `HasParent`/parent-locator) need
+  their parent to resolve blocks → `Error::Unsupported`.
+
+### VHD / VHDX limitations
+
+- **No differencing chains** — supply the flattened/base image.
+- VHDX log regions are not replayed (a non-empty log produces a warning;
+  the view may be slightly stale).
+- Corrupt stored payload is returned as-is or zero-filled where the
+  allocation map says unallocated; CRC failures on VHDX headers/region
+  tables fail open only if the redundant copy validates.
+
 ## Deleted / recovery semantics
 
 This crate is below the filesystem layer and therefore reports no file
@@ -127,7 +167,8 @@ regions — nothing is filtered).
 
 - EWF support covers E01 segments (single- and multi-segment `.E02`+);
   EWF2 (`.Ex01`), L01 and SMART `.s01` variants return `Unsupported`.
-  qcow2/VMDK/VHD are not yet decoded.
+- VHD/VHDX: no differencing/parent chains; qcow2 and VMDK are not yet
+  decoded.
 - Partition parsing assumes 512-byte sectors, probing 4096 only for GPT.
 - BSD disklabels, APM and dynamic (LDM) disks are not parsed.
 

@@ -52,6 +52,15 @@ mod views;
 /// libewf — decompression is pure Rust via `miniz_oxide`.
 pub mod ewf;
 
+/// Read-only VHD (`*.vhd`) and VHDX (`*.vhdx`) virtual-disk readers.
+///
+/// [`vhd::VhdSource`] auto-detects the format and exposes fixed and
+/// dynamic VHD (sector-bitmap blocks, BAT of sector offsets) and
+/// non-differencing VHDX (region table + u64 BAT) as a [`ByteSource`].
+/// Differencing images — which need a parent file to resolve blocks —
+/// are reported as [`Error::Unsupported`].
+pub mod vhd;
+
 pub use error::{Error, Result};
 pub use partition::{
     open_partitions, partitions, Partition, PartitionSource, TableKind,

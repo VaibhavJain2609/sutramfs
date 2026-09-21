@@ -1197,3 +1197,412 @@ fn ewf_open_segments_from_paths() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// VHD / VHDX synthetic-image corpus
+// ---------------------------------------------------------------------------
+
+/// Build a VHD footer (512 bytes, big-endian fields, valid checksum).
+fn vhd_footer(disk_type: u32, current_size: u64, data_offset: u64) -> Vec<u8> {
+    let mut f = vec![0u8; 512];
+    f[..8].copy_from_slice(b"conectix");
+    f[8..12].copy_from_slice(&2u32.to_be_bytes()); // features
+    f[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // version
+    f[16..24].copy_from_slice(&data_offset.to_be_bytes());
+    f[28..32].copy_from_slice(&0x7769_6E32u32.to_be_bytes()); // "win2"
+    f[40..48].copy_from_slice(&current_size.to_be_bytes()); // original size
+    f[48..56].copy_from_slice(&current_size.to_be_bytes()); // current size
+    f[56..58].copy_from_slice(&4u16.to_be_bytes()); // cylinders
+    f[58] = 16; // heads
+    f[59] = 63; // sectors/track
+    f[60..64].copy_from_slice(&disk_type.to_be_bytes());
+    let sum: u64 = f
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(64..68).contains(i))
+        .map(|(_, &b)| b as u64)
+        .sum();
+    f[64..68].copy_from_slice(&(!(sum as u32)).to_be_bytes());
+    f
+}
+
+#[test]
+fn vhd_fixed_roundtrip() {
+    let media: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let mut img = media.clone();
+    img.extend_from_slice(&vhd_footer(2, media.len() as u64, u64::MAX));
+    assert!(vhd::VhdSource::is_vhd(&img.as_slice()));
+    assert!(!vhd::VhdSource::is_vhdx(&img.as_slice()));
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    assert_eq!(v.info().format, vhd::VhdFormat::Vhd);
+    assert_eq!(v.info().disk_type, 2);
+    assert_eq!(v.len(), media.len() as u64);
+    assert_eq!(v.read_slice(0, media.len()).unwrap(), media);
+    assert!(v.read_slice(media.len() as u64, 10).unwrap().is_empty());
+}
+
+#[test]
+fn vhd_fixed_trailing_garbage() {
+    // Footer not at EOF: appended garbage must not hide it.
+    let media: Vec<u8> = (0..1500u32).map(|i| (i % 97) as u8).collect();
+    let mut img = media.clone();
+    img.extend_from_slice(&vhd_footer(2, media.len() as u64, u64::MAX));
+    img.extend_from_slice(&[0xAB; 600]); // trailing garbage
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    assert_eq!(v.len(), media.len() as u64);
+    assert_eq!(v.read_slice(0, media.len()).unwrap(), media);
+    assert!(v.warnings().iter().any(|w| w.contains("trailing garbage")));
+}
+
+/// Build a dynamic VHD. `blocks[i]` is `Some(data)` for allocated blocks
+/// or `None` for an unallocated BAT entry; `absent_sectors` lists
+/// (block, sector-in-block) bitmap bits to clear on allocated blocks.
+fn build_vhd_dynamic(
+    block_size: usize,
+    blocks: &[Option<Vec<u8>>],
+    absent_sectors: &[(usize, usize)],
+) -> Vec<u8> {
+    let vsize = (block_size * blocks.len()) as u64;
+    let mut img = Vec::new();
+    // footer copy at 0
+    img.extend_from_slice(&vhd_footer(3, vsize, 512));
+    // dynamic header at 512
+    // Blocks = [bitmap][data], written right after the dynamic header;
+    // the BAT follows them (its offset is declared, so order is free).
+    let spb = block_size / 512;
+    let bm_bytes = spb.div_ceil(8).div_ceil(512) * 512;
+    let n_alloc = blocks.iter().filter(|b| b.is_some()).count();
+    let bat_off = (1536 + n_alloc * (bm_bytes + block_size)) as u64;
+
+    let mut dh = vec![0u8; 1024];
+    dh[..8].copy_from_slice(b"cxsparse");
+    dh[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+    dh[16..24].copy_from_slice(&bat_off.to_be_bytes());
+    dh[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+    dh[28..32].copy_from_slice(&(blocks.len() as u32).to_be_bytes());
+    dh[32..36].copy_from_slice(&(block_size as u32).to_be_bytes());
+    let sum: u64 = dh
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(36..40).contains(i))
+        .map(|(_, &b)| b as u64)
+        .sum();
+    dh[36..40].copy_from_slice(&(!(sum as u32)).to_be_bytes());
+    img.extend_from_slice(&dh);
+    debug_assert_eq!(img.len(), 1536);
+
+    // Blocks first, recording each one's sector offset for the BAT.
+    let mut sectors = vec![0xFFFF_FFFFu32; blocks.len()];
+    for (i, b) in blocks.iter().enumerate() {
+        let Some(data) = b else { continue };
+        assert_eq!(data.len(), block_size);
+        debug_assert_eq!(img.len() % 512, 0);
+        sectors[i] = (img.len() / 512) as u32;
+        let mut bitmap = vec![0xFFu8; bm_bytes];
+        for &(b_i, s) in absent_sectors {
+            if b_i == i {
+                bitmap[s / 8] &= !(0x80 >> (s % 8));
+            }
+        }
+        img.extend_from_slice(&bitmap);
+        img.extend_from_slice(data);
+    }
+    debug_assert_eq!(img.len(), bat_off as usize);
+    for &s in &sectors {
+        img.extend_from_slice(&s.to_be_bytes());
+    }
+    // real footer at EOF
+    img.extend_from_slice(&vhd_footer(3, vsize, 512));
+    img
+}
+
+#[test]
+fn vhd_dynamic_roundtrip_and_unallocated() {
+    let bs = 4096usize; // small but legal power-of-two block size
+    let b0: Vec<u8> = (0..bs).map(|i| (i % 64) as u8).collect();
+    let b2: Vec<u8> = (0..bs).map(|i| 0xC0 | (i % 16) as u8).collect();
+    let img = build_vhd_dynamic(bs, &[Some(b0.clone()), None, Some(b2.clone())], &[]);
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    assert_eq!(v.info().format, vhd::VhdFormat::Vhd);
+    assert_eq!(v.info().disk_type, 3);
+    assert_eq!(v.info().block_size, Some(bs as u32));
+    assert_eq!(v.len(), 3 * bs as u64);
+    assert_eq!(v.read_slice(0, bs).unwrap(), b0);
+    assert!(v.read_slice(bs as u64, bs).unwrap().iter().all(|&b| b == 0));
+    assert_eq!(v.read_slice(2 * bs as u64, bs).unwrap(), b2);
+    // cross-block read
+    let mut expected = b0[bs - 100..].to_vec();
+    expected.extend_from_slice(&vec![0u8; bs]);
+    expected.extend_from_slice(&b2[..100]);
+    assert_eq!(
+        v.read_slice((bs - 100) as u64, bs + 200).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn vhd_dynamic_sector_bitmap_honoured() {
+    // Block 0 present but its sector bitmap marks sector 2 absent →
+    // that sector reads as zeros while neighbours keep stored data.
+    let bs = 4096usize;
+    let b0: Vec<u8> = vec![0x55; bs];
+    let img = build_vhd_dynamic(bs, &[Some(b0)], &[(0, 2)]);
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    let out = v.read_slice(0, bs).unwrap();
+    assert!(out[..1024].iter().all(|&b| b == 0x55));
+    assert!(out[1024..1536].iter().all(|&b| b == 0));
+    assert!(out[1536..].iter().all(|&b| b == 0x55));
+}
+
+#[test]
+fn vhd_differencing_unsupported() {
+    let mut img = vec![0u8; 4096];
+    img.extend_from_slice(&vhd_footer(4, 8192, 512));
+    let res = vhd::VhdSource::open(vec_src(img));
+    match res {
+        Err(Error::Unsupported { msg }) => assert!(msg.contains("differencing")),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("expected Unsupported, got an opened image"),
+    }
+}
+
+#[test]
+fn vhd_truncated_bat_zero_fills() {
+    // Dynamic VHD whose file ends mid-BAT: opens leniently (the footer
+    // copy at offset 0 is found by the tail scan), tail blocks read as
+    // zeros with a warning.
+    let bs = 4096usize;
+    let b0: Vec<u8> = (0..bs).map(|i| (i % 32) as u8).collect();
+    let mut img = build_vhd_dynamic(bs, &[Some(b0.clone()), Some(vec![0xEE; bs])], &[]);
+    // Blocks occupy 1536..1536+2*(512+bs); the BAT starts after them.
+    let bat_off = 1536 + 2 * (512 + bs);
+    img.truncate(bat_off + 4); // keep only the first BAT entry
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    assert!(v.warnings().iter().any(|w| w.contains("truncated")));
+    assert_eq!(v.read_slice(0, bs).unwrap(), b0);
+    assert!(v.read_slice(bs as u64, bs).unwrap().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn vhd_no_footer_is_corrupt() {
+    let res = vhd::VhdSource::open(vec_src(vec![0u8; 8192]));
+    assert!(matches!(res, Err(Error::Corrupt { .. })));
+    let res = vhd::VhdSource::open(vec_src(vec![0u8; 100]));
+    assert!(matches!(res, Err(Error::Truncated { .. })));
+}
+
+// ---- VHDX corpus -----------------------------------------------------------
+
+/// Write a checksum-valid VHDX header at `off` in `img` (already sized).
+fn vhdx_header(img: &mut [u8], off: usize, seq: u64) {
+    img[off..off + 4].copy_from_slice(b"head");
+    img[off + 8..off + 16].copy_from_slice(&seq.to_le_bytes());
+    img[off + 34..off + 36].copy_from_slice(&1u16.to_le_bytes()); // version
+    let sum = vhd::crc32c_zeroed(&img[off..off + 4096], 4);
+    img[off + 4..off + 8].copy_from_slice(&sum.to_le_bytes());
+}
+
+/// Write a checksum-valid region table at `off`.
+fn vhdx_region_table(img: &mut [u8], off: usize, entries: &[([u8; 16], u64, u64)]) {
+    img[off..off + 4].copy_from_slice(b"regi");
+    img[off + 8..off + 12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (i, (guid, file_off, len)) in entries.iter().enumerate() {
+        let e = off + 16 + i * 32;
+        img[e..e + 16].copy_from_slice(guid);
+        img[e + 16..e + 24].copy_from_slice(&file_off.to_le_bytes());
+        img[e + 24..e + 32].copy_from_slice(&len.to_le_bytes());
+    }
+    let sum = vhd::crc32c_zeroed(&img[off..off + 65536], 4);
+    img[off + 4..off + 8].copy_from_slice(&sum.to_le_bytes());
+}
+
+const VHDX_GUID_BAT_T: [u8; 16] = [
+    0x66, 0x77, 0xC2, 0x2D, 0x23, 0xF6, 0x00, 0x42, 0x9D, 0x64, 0x11, 0x5E, 0x9B, 0xFD, 0x4A, 0x08,
+];
+const VHDX_GUID_META_T: [u8; 16] = [
+    0x06, 0xA2, 0x7C, 0x8B, 0x90, 0x47, 0x9A, 0x4B, 0xB8, 0xFE, 0x57, 0x5F, 0x05, 0x0F, 0x88, 0x6E,
+];
+const VHDX_ITEM_FILE_PARAMS_T: [u8; 16] = [
+    0x37, 0x67, 0xA1, 0xCA, 0x36, 0xFA, 0x43, 0x4D, 0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44, 0xE7, 0x6B,
+];
+const VHDX_ITEM_VSIZE_T: [u8; 16] = [
+    0x24, 0x42, 0xA5, 0x2F, 0x1B, 0xCD, 0x76, 0x48, 0xB2, 0x11, 0x5D, 0xBE, 0xD8, 0x3B, 0xF4, 0xB8,
+];
+const VHDX_ITEM_LSS_T: [u8; 16] = [
+    0x1D, 0xBF, 0x41, 0x81, 0x6F, 0xA9, 0x09, 0x47, 0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA, 0xAB, 0x5F,
+];
+const VHDX_ITEM_PARENT_T: [u8; 16] = [
+    0x2D, 0x5F, 0xD3, 0xA8, 0x0B, 0xB3, 0x4D, 0x45, 0xAB, 0xF7, 0xD3, 0xD8, 0x48, 0x34, 0xAB, 0x0C,
+];
+
+/// Minimal VHDX: BAT region at 1 MiB, metadata at 2 MiB, payload blocks
+/// at 3 MiB+. `blocks[i]` = BAT payload state+offset written by caller.
+/// block_size = 1 MiB, lss = 512 → chunk_ratio = 4096.
+fn build_vhdx(
+    vsize: u64,
+    block_size: u32,
+    bat_entries: &[(usize, u64)], // (bat_index, entry) pairs
+    has_parent: bool,
+) -> Vec<u8> {
+    let mut img = vec![0u8; 5 << 20];
+    img[..8].copy_from_slice(b"vhdxfile");
+    vhdx_header(&mut img, 64 << 10, 1);
+    vhdx_header(&mut img, 128 << 10, 1);
+    vhdx_region_table(
+        &mut img,
+        192 << 10,
+        &[(VHDX_GUID_BAT_T, 1 << 20, 1 << 20), (VHDX_GUID_META_T, 2 << 20, 1 << 20)],
+    );
+    vhdx_region_table(
+        &mut img,
+        256 << 10,
+        &[(VHDX_GUID_BAT_T, 1 << 20, 1 << 20), (VHDX_GUID_META_T, 2 << 20, 1 << 20)],
+    );
+    // metadata region at 2 MiB
+    let m = 2 << 20;
+    img[m..m + 8].copy_from_slice(b"metadata");
+    let items = if has_parent { 4u16 } else { 3u16 };
+    img[m + 10..m + 12].copy_from_slice(&items.to_le_bytes());
+    // item table at m+32; item data at m + 64KiB +
+    let mut item_off = (64usize) << 10;
+    let mut put_item = |img: &mut Vec<u8>, i: usize, id: &[u8; 16], data: &[u8]| {
+        let e = m + 32 + i * 32;
+        img[e..e + 16].copy_from_slice(id);
+        img[e + 16..e + 20].copy_from_slice(&(item_off as u32).to_le_bytes());
+        img[e + 20..e + 24].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        img[m + item_off..m + item_off + data.len()].copy_from_slice(data);
+        item_off += data.len().max(64); // keep items separated
+    };
+    let mut fp = [0u8; 8];
+    fp[..4].copy_from_slice(&block_size.to_le_bytes());
+    if has_parent {
+        fp[4..8].copy_from_slice(&2u32.to_le_bytes()); // HasParent
+    }
+    put_item(&mut img, 0, &VHDX_ITEM_FILE_PARAMS_T, &fp);
+    put_item(&mut img, 1, &VHDX_ITEM_VSIZE_T, &vsize.to_le_bytes());
+    put_item(&mut img, 2, &VHDX_ITEM_LSS_T, &512u32.to_le_bytes());
+    if has_parent {
+        put_item(&mut img, 3, &VHDX_ITEM_PARENT_T, &[0u8; 24]);
+    }
+    // BAT entries
+    let b = 1 << 20;
+    for &(idx, entry) in bat_entries {
+        img[b + idx * 8..b + idx * 8 + 8].copy_from_slice(&entry.to_le_bytes());
+    }
+    img
+}
+
+/// BAT payload entry: state | file offset in MiB.
+fn vhdx_bat_entry(state: u64, off_mb: u64) -> u64 {
+    state | (off_mb << 20)
+}
+
+#[test]
+fn vhdx_roundtrip() {
+    // vsize 3 MiB, block_size 1 MiB → 3 payload blocks, chunk_ratio 4096.
+    // bat[0] → block0 at 3 MiB (present), bat[1] not present, bat[2] → 4 MiB.
+    let bs = 1usize << 20;
+    let b0: Vec<u8> = (0..bs).map(|i| (i % 211) as u8).collect();
+    let b2: Vec<u8> = (0..bs).map(|i| 0x80 ^ (i % 99) as u8).collect();
+    let mut img = build_vhdx(
+        3 * bs as u64,
+        bs as u32,
+        &[
+            (0, vhdx_bat_entry(6, 3)),
+            (2, vhdx_bat_entry(6, 4)),
+        ],
+        false,
+    );
+    img[3 * bs..4 * bs].copy_from_slice(&b0);
+    img[4 * bs..].copy_from_slice(&b2);
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    assert_eq!(v.info().format, vhd::VhdFormat::Vhdx);
+    assert_eq!(v.info().virtual_size, 3 * bs as u64);
+    assert_eq!(v.info().block_size, Some(bs as u32));
+    assert_eq!(v.info().logical_sector_size, 512);
+    assert_eq!(v.len(), 3 * bs as u64);
+    assert_eq!(v.read_slice(0, bs).unwrap(), b0);
+    assert!(v.read_slice(bs as u64, bs).unwrap().iter().all(|&b| b == 0));
+    assert_eq!(v.read_slice(2 * bs as u64, bs).unwrap(), b2);
+    // cross-block read spanning a hole
+    let mut expected = b0[bs - 64..].to_vec();
+    expected.extend_from_slice(&vec![0u8; bs]);
+    expected.extend_from_slice(&b2[..64]);
+    assert_eq!(v.read_slice((bs - 64) as u64, bs + 128).unwrap(), expected);
+    // past EOF
+    assert!(v.read_slice(3 * bs as u64, 16).unwrap().is_empty());
+}
+
+#[test]
+fn vhdx_zero_and_undefined_states() {
+    let bs = 1usize << 20;
+    let img = build_vhdx(
+        2 * bs as u64,
+        bs as u32,
+        &[(0, vhdx_bat_entry(2, 9)), (1, vhdx_bat_entry(1, 0))],
+        false,
+    );
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    let out = v.read_slice(0, 2 * bs).unwrap();
+    assert!(out.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn vhdx_differencing_unsupported() {
+    let bs = 1usize << 20;
+    let img = build_vhdx(bs as u64, bs as u32, &[(0, vhdx_bat_entry(6, 3))], true);
+    let res = vhd::VhdSource::open(vec_src(img));
+    match res {
+        Err(Error::Unsupported { msg }) => assert!(msg.contains("differencing")),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("expected Unsupported, got an opened image"),
+    }
+}
+
+#[test]
+fn vhdx_corrupt_headers_and_tables() {
+    let bs = 1usize << 20;
+    let good = build_vhdx(bs as u64, bs as u32, &[(0, vhdx_bat_entry(6, 3))], false);
+
+    // Corrupt both headers → Corrupt.
+    let mut img = good.clone();
+    img[64 << 10] ^= 0xFF;
+    img[128 << 10] ^= 0xFF;
+    assert!(matches!(
+        vhd::VhdSource::open(vec_src(img)),
+        Err(Error::Corrupt { .. })
+    ));
+
+    // Corrupt only header 1 → header 2 wins, still opens.
+    let mut img = good.clone();
+    img[(64 << 10) + 20] ^= 0xFF;
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    assert_eq!(v.len(), bs as u64);
+    assert!(v.warnings().iter().any(|w| w.contains("CRC")));
+
+    // Corrupt both region tables → Corrupt.
+    let mut img = good.clone();
+    img[(192 << 10) + 4] ^= 0xFF; // break checksum
+    img[(256 << 10) + 4] ^= 0xFF;
+    assert!(matches!(
+        vhd::VhdSource::open(vec_src(img)),
+        Err(Error::Corrupt { .. })
+    ));
+
+    // Truncated image → Truncated.
+    let img = good[..100 << 10].to_vec();
+    assert!(matches!(
+        vhd::VhdSource::open(vec_src(img)),
+        Err(Error::Truncated { .. })
+    ));
+}
+
+#[test]
+fn vhdx_reserved_bat_state_io_errors() {
+    let bs = 1usize << 20;
+    let img = build_vhdx(bs as u64, bs as u32, &[(0, vhdx_bat_entry(4, 3))], false);
+    let v = vhd::VhdSource::open(vec_src(img)).unwrap();
+    let mut buf = vec![0u8; 512];
+    let e = v.read_at(0, &mut buf).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+}
