@@ -30,9 +30,7 @@ pub const DOS_TIME: u16 = 12 << 11 | 30 << 5;
 pub const METHOD_STORE: u16 = 0;
 pub const METHOD_DEFLATE: u16 = 8;
 pub const FLAG_DD: u16 = 0x0008;
-#[allow(dead_code)]
 pub const FLAG_UTF8: u16 = 0x0800;
-#[allow(dead_code)]
 pub const FLAG_ENCRYPTED: u16 = 0x0001;
 
 fn w16(v: &mut Vec<u8>, x: u16) {
@@ -80,7 +78,6 @@ impl ZipBuilder {
 
     /// Pretend a self-extracting stub — all member offsets shift.
     /// (Tests prepend stubs manually post-build; kept for callers.)
-    #[allow(dead_code)]
     pub fn add_stub(&mut self, stub: &[u8]) {
         self.buf.extend_from_slice(stub);
     }

@@ -4,4 +4,8 @@
 //! stream. No fixture files, no network; corruption cases are produced by
 //! deliberately writing bad bytes.
 
+// Each test binary only uses the builders it needs.
+#![allow(dead_code)]
+
+pub mod tar;
 pub mod zip;
