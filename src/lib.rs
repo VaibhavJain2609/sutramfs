@@ -20,9 +20,14 @@
 //! * **Timestamps** — ext4 nanosecond extension fields (`i_*_extra`,
 //!   30-bit ns + 2-bit epoch extension) and `i_crtime` birth time, plus
 //!   `i_dtime` deletion time; raw encodings preserved.
-//! * **Journal awareness** — the jbd2 superblock is parsed into
-//!   `FsInfo.meta` (`jbd2_needs_replay` etc.); transaction replay is a
-//!   documented TODO (see `journal` module).
+//! * **Journal forensics** — the jbd2 journal (inode 8) is parsed into
+//!   [`JournalEvent`]s: superblock, descriptor, commit and revocation
+//!   blocks plus one record per journaled metadata copy. `journal_events()`
+//!   streams the typed records; `FileSystem::journal_entries()` emits them
+//!   as pseudo-entries whose `allocated_ranges` read back the journaled
+//!   payload — prior-state evidence for inode tables, bitmaps and freed
+//!   blocks. `FsInfo.meta` carries `jbd2_*` counts; transaction replay is
+//!   a documented TODO (see `journal` module).
 //! * **Provenance** — `disk_offset` = dirent or inode offset;
 //!   `allocated_ranges` = absolute byte extents; slack and xattrs are
 //!   surfaced in `meta`.
@@ -45,6 +50,7 @@ mod superblock;
 mod walk;
 
 pub use fs::{Ext4Fs, Ext4Parser};
+pub use journal::{JournalEvent, JournalEventKind, JournalTag, JournalTarget};
 
 #[cfg(test)]
 mod tests;

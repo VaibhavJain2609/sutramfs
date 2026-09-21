@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use sutram_fs::util;
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntry, FsError, FsInfo, FsParser, FileSystem, MountOptions,
-    RecoveryState, Result,
+    DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser, FsTimestamp,
+    FileSystem, MountOptions, RecoveryState, Result, Timestamps,
 };
 use sutram_io::ByteSource;
 
@@ -17,7 +17,7 @@ use crate::dirent;
 use crate::extent::{self, BlockMap, BlockRun};
 use crate::gdt::{self, GroupDesc, BG_BLOCK_UNINIT};
 use crate::inode::{self, Inode};
-use crate::journal::JournalInfo;
+use crate::journal::{self, JournalEvent, JournalInfo};
 use crate::superblock::{self, Superblock};
 use crate::walk::Walk;
 
@@ -83,7 +83,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl Ext4Fs {
-    pub(crate) fn mount(src: Arc<dyn ByteSource>, opts: MountOptions) -> Result<Self> {
+    /// Mount the volume directly — the concrete handle exposes
+    /// journal forensics ([`Self::journal_events`]) beyond the
+    /// `dyn FileSystem` surface.
+    pub fn mount(src: Arc<dyn ByteSource>, opts: MountOptions) -> Result<Self> {
         let sb = Superblock::parse(src.as_ref())?;
         let groups = gdt::read_gdt(src.as_ref(), &sb)?;
         let mut fs = Ext4Fs {
@@ -623,8 +626,178 @@ impl Ext4Fs {
         let inode = self.read_inode(self.sb.journal_inum).ok()?;
         let runs = self.runs_of(&inode).ok()?;
         let first = runs.first()?;
-        JournalInfo::parse(self.src.as_ref(), self.block_off(first.phys))
+        let mut info = JournalInfo::parse(self.src.as_ref(), self.block_off(first.phys))?;
+        if info.block_size == 0 || info.block_size > (16 << 20) {
+            info.block_size = self.sb.block_size as u32;
+        }
+        info.ranges = self.run_ranges(&runs);
+        Some(info)
     }
+
+    /// Metadata-block layout for journal tag-target classification.
+    fn journal_layout(&self) -> journal::MetaLayout {
+        let sb = &self.sb;
+        let gdt_start = sb.gdt_offset() / sb.block_size;
+        let gdt_blocks = (sb.groups_count as u64 * sb.desc_size as u64).div_ceil(sb.block_size);
+        let itable_blocks =
+            (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(sb.block_size);
+        journal::MetaLayout {
+            blocks_count: sb.blocks_count,
+            superblock: sb.first_data_block as u64,
+            backups: sb.backup_sb_blocks(),
+            gdt: (gdt_start, gdt_start + gdt_blocks),
+            tables: self
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(i, g)| {
+                    (
+                        i as u32,
+                        g.block_bitmap,
+                        g.inode_bitmap,
+                        g.inode_table,
+                        g.inode_table.saturating_add(itable_blocks),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Stream the parsed jbd2 journal as [`JournalEvent`]s — descriptor,
+    /// commit, revoke and per-tag journaled-block records. Each
+    /// `JournaledBlock` is prior-state evidence: its tag names the
+    /// filesystem block the copy belongs to, classified against today's
+    /// metadata layout ([`JournalTag::prior_state`] flags inode-table,
+    /// bitmap, GDT and since-freed targets). The journal is **parsed**,
+    /// not replayed. Empty when the volume has no journal.
+    pub fn journal_events(&self) -> Box<dyn Iterator<Item = Result<JournalEvent>> + Send + '_> {
+        let Some(info) = &self.journal else {
+            return Box::new(std::iter::empty());
+        };
+        Box::new(journal::JournalScan::new(
+            self.src.clone(),
+            info,
+            self.journal_layout(),
+            Box::new(|b| self.block_allocated(b).ok()),
+            self.opts.strict,
+        ))
+    }
+}
+
+/// Render one journal event as a forensic `FsEntry` — journaled data
+/// copies become pseudo-entries whose `allocated_ranges` read back the
+/// journaled payload (prior metadata state, `Deleted{Intact}`); revoke
+/// and commit records are metadata-only (`Deleted{Unknown}`).
+fn journal_entry(ev: &JournalEvent, block_size: u64) -> Option<FsEntry> {
+    use crate::journal::JournalEventKind;
+    let mut meta = HashMap::new();
+    meta.insert("journal".into(), "jbd2".into());
+    meta.insert("jbd2_transid".into(), ev.transid.to_string());
+    meta.insert(
+        "jbd2_journal_block".into(),
+        ev.journal_block.to_string(),
+    );
+    let mut timestamps = Timestamps::default();
+    let (name, kind, status, ranges, disk_offset, size) = match &ev.kind {
+        JournalEventKind::JournaledBlock(tag) => {
+            meta.insert("jbd2_fs_block".into(), tag.fs_block.to_string());
+            meta.insert("jbd2_tag_flags".into(), format!("{:#x}", tag.flags));
+            meta.insert("jbd2_target".into(), tag.target.name());
+            if tag.escaped {
+                meta.insert("jbd2_escaped".into(), "true".into());
+            }
+            if tag.deleted {
+                meta.insert("jbd2_tag_deleted".into(), "true".into());
+            }
+            if tag.uuid_present {
+                meta.insert("jbd2_tag_uuid".into(), "true".into());
+            }
+            if let Some(a) = tag.target_allocated {
+                meta.insert("jbd2_target_allocated".into(), a.to_string());
+            }
+            if tag.prior_state() {
+                meta.insert(
+                    "note".into(),
+                    "journaled copy of prior filesystem metadata state".into(),
+                );
+            }
+            let ranges: Vec<(u64, u64)> = tag
+                .data_offset
+                .map(|o| vec![(o, block_size)])
+                .unwrap_or_default();
+            let status = if ranges.is_empty() {
+                RecoveryState::Unrecoverable
+            } else {
+                RecoveryState::Intact
+            };
+            (
+                format!("block_{}", tag.fs_block),
+                EntryKind::Other,
+                FsEntryStatus::Deleted { recovery: status },
+                ranges,
+                tag.tag_offset,
+                block_size,
+            )
+        }
+        JournalEventKind::Revoke { blocks } => {
+            meta.insert("jbd2_revoked_count".into(), blocks.len().to_string());
+            let shown: Vec<String> = blocks.iter().take(64).map(u64::to_string).collect();
+            let mut list = shown.join(",");
+            if blocks.len() > 64 {
+                list.push_str(",…");
+            }
+            meta.insert("jbd2_revoked_blocks".into(), list);
+            meta.insert(
+                "note".into(),
+                "revocation: transaction cancelled replay of these blocks".into(),
+            );
+            (
+                format!("revoke_{}", ev.journal_block),
+                EntryKind::Other,
+                FsEntryStatus::Deleted {
+                    recovery: RecoveryState::Unknown,
+                },
+                Vec::new(),
+                ev.disk_offset,
+                0,
+            )
+        }
+        JournalEventKind::Commit { sec, nsec } => {
+            meta.insert("jbd2_commit_time".into(), format!("{sec}.{nsec:09}"));
+            timestamps.changed = Some(FsTimestamp {
+                value: (*sec as i64)
+                    .checked_mul(1_000_000_000)
+                    .and_then(|v| v.checked_add(*nsec as i64)),
+                raw_value: *sec,
+                raw_encoding: "jbd2-commit-time",
+                granularity: std::time::Duration::from_nanos(1),
+            });
+            (
+                format!("commit_{}", ev.transid),
+                EntryKind::Other,
+                FsEntryStatus::Deleted {
+                    recovery: RecoveryState::Unknown,
+                },
+                Vec::new(),
+                ev.disk_offset,
+                0,
+            )
+        }
+        _ => return None,
+    };
+    Some(FsEntry {
+        path: format!("/$JOURNAL/tx_{}/{}", ev.transid, name),
+        name,
+        entry_id: ev.journal_block,
+        kind,
+        size,
+        disk_offset,
+        allocated_ranges: ranges,
+        timestamps,
+        status,
+        meta,
+        magic: None,
+    })
 }
 
 impl FileSystem for Ext4Fs {
@@ -710,6 +883,64 @@ impl FileSystem for Ext4Fs {
                 "jbd2_needs_replay".into(),
                 (j.start != 0).to_string(),
             );
+            meta.insert(
+                "jbd2_feature_compat".into(),
+                format!("{:#x}", j.feature_compat),
+            );
+            meta.insert(
+                "jbd2_feature_incompat".into(),
+                format!("{:#x}", j.feature_incompat),
+            );
+            if !j.feature_names().is_empty() {
+                meta.insert("jbd2_features".into(), j.feature_names().join(","));
+            }
+            if j.maxlen as u64 <= journal::MAX_SUMMARY_BLOCKS {
+                let mut descriptors = 0u64;
+                let mut commits = 0u64;
+                let mut revokes = 0u64;
+                let mut revoked = 0u64;
+                let mut journaled = 0u64;
+                let mut prior = 0u64;
+                let mut errs = 0u64;
+                let mut last_transid = 0u32;
+                for item in self.journal_events() {
+                    match item {
+                        Ok(ev) => {
+                            last_transid = last_transid.max(ev.transid);
+                            match ev.kind {
+                                journal::JournalEventKind::Descriptor { .. } => descriptors += 1,
+                                journal::JournalEventKind::Commit { .. } => commits += 1,
+                                journal::JournalEventKind::Revoke { ref blocks } => {
+                                    revokes += 1;
+                                    revoked += blocks.len() as u64;
+                                }
+                                journal::JournalEventKind::JournaledBlock(ref tag) => {
+                                    journaled += 1;
+                                    if tag.prior_state() {
+                                        prior += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(_) => errs += 1,
+                    }
+                }
+                meta.insert("jbd2_descriptor_blocks".into(), descriptors.to_string());
+                meta.insert("jbd2_commit_blocks".into(), commits.to_string());
+                meta.insert("jbd2_revoke_blocks".into(), revokes.to_string());
+                meta.insert("jbd2_revoked_blocks".into(), revoked.to_string());
+                meta.insert("jbd2_journaled_blocks".into(), journaled.to_string());
+                meta.insert("jbd2_prior_metadata_copies".into(), prior.to_string());
+                meta.insert("jbd2_transactions".into(), commits.to_string());
+                meta.insert("jbd2_parse_errors".into(), errs.to_string());
+                meta.insert("jbd2_last_transid".into(), last_transid.to_string());
+            } else {
+                meta.insert(
+                    "jbd2_summary".into(),
+                    format!("journal exceeds summary bound ({} blocks)", journal::MAX_SUMMARY_BLOCKS),
+                );
+            }
         }
         if let Some(g0) = self.groups.first() {
             meta.insert("gdt_offset".into(), format!("{:#x}", g0.disk_offset));
@@ -736,6 +967,24 @@ impl FileSystem for Ext4Fs {
 
     fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
         Box::new(Walk::new(self))
+    }
+
+    /// jbd2 artefacts as pseudo-entries: each journaled data copy is a
+    /// readable snapshot of prior filesystem state; revoke and commit
+    /// records are metadata-only transaction evidence.
+    fn journal_entries(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        let block_size = self
+            .journal
+            .as_ref()
+            .map(|j| j.block_size as u64)
+            .unwrap_or(0);
+        Box::new(
+            self.journal_events()
+                .filter_map(move |item| match item {
+                    Err(e) => Some(Err(e)),
+                    Ok(ev) => journal_entry(&ev, block_size).map(Ok),
+                }),
+        )
     }
 
     /// `read_file` resolves the inode afresh (`entry_id` = inode number)

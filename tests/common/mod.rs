@@ -17,7 +17,7 @@
 //! | ino | name          | blocks | state                                   |
 //! |-----|---------------|--------|------------------------------------------|
 //! | 2   | /             | 40     | live root dir                            |
-//! | 8   | (journal)     | 30-33  | allocated, unreferenced → orphan+journal |
+//! | 8   | (journal)     | 30-37  | allocated, unreferenced → orphan+journal |
 //! | 11  | hello.txt     | 41     | live, hardlinked, xattrs, crtime+nsec    |
 //! | 12  | subdir        | 42     | live dir (inner.txt, buried.tmp slack)   |
 //! | 13  | gone.dat      | 43     | DELETED inode, block free → Intact       |
@@ -333,18 +333,78 @@ fn write_xattrs(img: &mut [u8]) {
     img[b + 48..b + 48 + 7].copy_from_slice(b"comment"); // e_name @ +16
 }
 
-/// jbd2 superblock at block 30 (all big-endian).
-fn write_journal_sb(img: &mut [u8]) {
+// ---- jbd2 journal writers (all big-endian) --------------------------------
+
+const JBD2_MAGIC: u32 = 0xC03B_3998;
+
+fn wj(img: &mut [u8], off: usize, v: u32) {
+    img[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// Common 12-byte journal block header.
+fn jbd2_header(img: &mut [u8], blk: u32, blocktype: u32, seq: u32) {
+    let b = blk_off(blk);
+    wj(img, b, JBD2_MAGIC);
+    wj(img, b + 4, blocktype);
+    wj(img, b + 8, seq);
+}
+
+/// One 8-byte journal_block_tag (32-bit tags): blocknr be32 + flags be32.
+fn jbd2_tag(img: &mut [u8], blk: u32, pos: usize, fs_block: u32, flags: u32) {
+    let o = blk_off(blk) + pos;
+    wj(img, o, fs_block);
+    wj(img, o + 4, flags);
+}
+
+/// jbd2 superblock at block 30 (all big-endian) plus a small transaction
+/// history in the log region (blocks 31..37):
+///
+/// ```text
+/// 31 descriptor tx 0x100: tags → fs 5 (inode table), fs 43 (free data)
+/// 32 data: prior inode-table copy     33 data: prior copy of block 43
+/// 34 revoke tx 0x100: fs block 44     35 commit tx 0x100 (seals it)
+/// 36 descriptor tx 0x101: tag → fs 3 (block bitmap)
+/// 37 data: prior block-bitmap copy    (no commit → incomplete tail tx)
+/// ```
+fn write_journal(img: &mut [u8]) {
     let b = blk_off(30);
-    img[b..b + 4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
-    img[b + 4..b + 8].copy_from_slice(&4u32.to_be_bytes()); // superblock v2
-    img[b + 8..b + 12].copy_from_slice(&0u32.to_be_bytes()); // h_sequence
-    img[b + 12..b + 16].copy_from_slice(&1024u32.to_be_bytes()); // s_blocksize
-    img[b + 16..b + 20].copy_from_slice(&4u32.to_be_bytes()); // s_maxlen
-    img[b + 20..b + 24].copy_from_slice(&1u32.to_be_bytes()); // s_first
-    img[b + 24..b + 28].copy_from_slice(&0x100u32.to_be_bytes()); // s_sequence
-    img[b + 28..b + 32].copy_from_slice(&0u32.to_be_bytes()); // s_start = clean
-    img[b + 0x40..b + 0x44].copy_from_slice(&1u32.to_be_bytes()); // s_nr_users
+    wj(img, b, JBD2_MAGIC);
+    wj(img, b + 4, 4); // superblock v2
+    wj(img, b + 8, 0); // h_sequence
+    wj(img, b + 12, 1024); // s_blocksize
+    wj(img, b + 16, 8); // s_maxlen
+    wj(img, b + 20, 1); // s_first
+    wj(img, b + 24, 0x102); // s_sequence
+    wj(img, b + 28, 1); // s_start = replay pending
+    wj(img, b + 0x28, 1); // s_feature_incompat = revoke
+    wj(img, b + 0x40, 1); // s_nr_users
+
+    // Descriptor tx 0x100: tag 5 (uuid follows — no SAME_UUID) then
+    // tag 43 (SAME_UUID|LAST).
+    jbd2_header(img, 31, 1, 0x100);
+    jbd2_tag(img, 31, 12, 5, 0x0);
+    // 16-byte journal uuid after the first tag.
+    img[blk_off(31) + 20..blk_off(31) + 36].copy_from_slice(b"0123456789abcdef");
+    jbd2_tag(img, 31, 36, 43, 0xA); // SAME_UUID(0x2)|LAST(0x8)
+    put_data(img, 32, b"JOURNALED-INODE-TABLE-BLOCK-5-PRIOR-STATE");
+    put_data(img, 33, b"JOURNALED-COPY-OF-BLOCK-43");
+
+    // Revocation tx 0x100: r_count = 16 + 4 bytes of block numbers.
+    jbd2_header(img, 34, 5, 0x100);
+    wj(img, blk_off(34) + 12, 20); // r_count (bytes used)
+    wj(img, blk_off(34) + 16, 44); // revoked fs block 44
+
+    // Commit tx 0x100: timestamp at 0x30/0x38.
+    jbd2_header(img, 35, 2, 0x100);
+    img[blk_off(35) + 0x30..blk_off(35) + 0x38]
+        .copy_from_slice(&1_705_315_000u64.to_be_bytes());
+    wj(img, blk_off(35) + 0x38, 123_456_789);
+
+    // Descriptor tx 0x101: single tag → block bitmap (fs 3). The trailing
+    // commit never landed — an incomplete transaction.
+    jbd2_header(img, 36, 1, 0x101);
+    jbd2_tag(img, 36, 12, 3, 0xA); // SAME_UUID|LAST
+    put_data(img, 37, b"JOURNALED-BLOCK-BITMAP-3-PRIOR-STATE");
 }
 
 /// Build the ext4 corpus image (256 KiB).
@@ -356,7 +416,7 @@ pub fn build_ext4() -> Vec<u8> {
     w32(&mut img, 1024 + 0xE0, 8); // s_journal_inum
 
     // ---- allocated data blocks ----------------------------------------
-    for b in [30u32, 31, 32, 33, 40, 41, 42, 44, 45, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64] {
+    for b in [30u32, 31, 32, 33, 34, 35, 36, 37, 40, 41, 42, 44, 45, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64] {
         set_block(&mut img, b);
     }
     // Allocated inodes (beyond reserved 1..=8).
@@ -370,8 +430,8 @@ pub fn build_ext4() -> Vec<u8> {
     let half_sec = 500_000_000u32 << 2;
     // ino 2: root dir → block 40
     put_inode(&mut img, 2, 0o40755, 1024, 3, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 40)]), 0, t, 0, None, 0);
-    // ino 8: journal → blocks 30-33
-    put_inode(&mut img, 8, 0o100600, 4096, 1, 8, EXT4_EXTENTS_FL, extent_root(&[(0, 4, 30)]), 0, t, 0, None, 0);
+    // ino 8: journal → blocks 30-37
+    put_inode(&mut img, 8, 0o100600, 8192, 1, 16, EXT4_EXTENTS_FL, extent_root(&[(0, 8, 30)]), 0, t, 0, None, 0);
     // ino 11: hello.txt → 41, hardlinked (2), xattr block 59, nsec+crtime
     put_inode(&mut img, 11, 0o100644, 12, 2, 2, EXT4_EXTENTS_FL, extent_root(&[(0, 1, 41)]), 0, t, half_sec, Some((1_705_310_000, 250_000_000 << 2)), 59);
     // ino 12: subdir → 42
@@ -538,7 +598,7 @@ pub fn build_ext4() -> Vec<u8> {
     put_data(&mut img, 62, b"SPARSE-DATA!");
     put_data(&mut img, 63, b"PHANTOM");
 
-    write_journal_sb(&mut img);
+    write_journal(&mut img);
     write_xattrs(&mut img);
     finalize_counts(&mut img);
     img

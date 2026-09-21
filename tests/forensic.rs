@@ -77,9 +77,22 @@ fn info_reports_volume() {
     assert_eq!(info.meta["incompat_encrypt"], "false");
     assert_eq!(info.meta["journal_inode"], "8");
     assert_eq!(info.meta["last_orphan"], "26");
-    // jbd2 awareness: clean journal (s_start == 0).
-    assert_eq!(info.meta["jbd2_needs_replay"], "false");
-    assert_eq!(info.meta["jbd2_journal_blocks"], "4");
+    // jbd2 awareness: s_start != 0 → replay pending, parsed log counts.
+    assert_eq!(info.meta["jbd2_needs_replay"], "true");
+    assert_eq!(info.meta["jbd2_journal_blocks"], "8");
+    assert_eq!(info.meta["jbd2_feature_incompat"], "0x1");
+    assert_eq!(info.meta["jbd2_features"], "revoke");
+    // Log contents: 2 descriptors, 1 commit, 1 revoke, 3 journaled copies.
+    assert_eq!(info.meta["jbd2_descriptor_blocks"], "2");
+    assert_eq!(info.meta["jbd2_commit_blocks"], "1");
+    assert_eq!(info.meta["jbd2_revoke_blocks"], "1");
+    assert_eq!(info.meta["jbd2_revoked_blocks"], "1");
+    assert_eq!(info.meta["jbd2_journaled_blocks"], "3");
+    assert_eq!(info.meta["jbd2_transactions"], "1");
+    assert_eq!(info.meta["jbd2_parse_errors"], "0");
+    assert_eq!(info.meta["jbd2_last_transid"], "258"); // 0x102 (superblock sequence)
+    // Prior-metadata copies: inode table (5), freed data (43), bitmap (3).
+    assert_eq!(info.meta["jbd2_prior_metadata_copies"], "3");
 }
 
 #[test]
@@ -356,6 +369,115 @@ fn orphan_inodes_and_journal() {
     // Journal inode 8.
     let j = find(&entries, "ino_8");
     assert_eq!(j.meta["journal"], "true");
+}
+
+#[test]
+fn journal_entries_surface_prior_state() {
+    let fs = mount();
+    let entries: Vec<FsEntry> = fs
+        .journal_entries()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("journal parse should not error on the corpus");
+    // 3 journaled copies + 1 revoke + 1 commit = 5 entries.
+    assert_eq!(entries.len(), 5, "{:?}", entries.iter().map(|e| &e.path).collect::<Vec<_>>());
+
+    // The inode-table copy (fs block 5) is prior metadata state — its
+    // payload reads back the journaled bytes.
+    let it = find(&entries, "block_5");
+    assert_eq!(it.path, "/$JOURNAL/tx_256/block_5");
+    assert_eq!(it.kind, EntryKind::Other);
+    assert!(it.is_deleted());
+    assert_eq!(it.meta["journal"], "jbd2");
+    assert_eq!(it.meta["jbd2_transid"], "256");
+    assert_eq!(it.meta["jbd2_target"], "inode_table_g0");
+    assert_eq!(it.meta["jbd2_tag_uuid"], "true");
+    assert_eq!(
+        it.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    );
+    assert_eq!(it.disk_offset, common::blk_off(31) as u64 + 12); // tag offset
+    assert_eq!(it.allocated_ranges, vec![(common::blk_off(32) as u64, 1024)]);
+    let mut buf = Vec::new();
+    fs.read_file(it).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"JOURNALED-INODE-TABLE-BLOCK-5"));
+
+    // The freed data block (fs 43) is also prior-state evidence.
+    let freed = find(&entries, "block_43");
+    assert_eq!(freed.meta["jbd2_target"], "data");
+    assert_eq!(freed.meta["jbd2_target_allocated"], "false");
+
+    // The block-bitmap copy from the uncommitted tail transaction.
+    let bbm = find(&entries, "block_3");
+    assert_eq!(bbm.path, "/$JOURNAL/tx_257/block_3");
+    assert_eq!(bbm.meta["jbd2_target"], "block_bitmap_g0");
+
+    // Revoke + commit records are metadata-only evidence.
+    let rv = find(&entries, "revoke_4");
+    assert_eq!(rv.meta["jbd2_revoked_blocks"], "44");
+    let cm = find(&entries, "commit_256");
+    assert_eq!(cm.meta["jbd2_commit_time"], "1705315000.123456789");
+    assert!(cm.timestamps.changed.as_ref().unwrap().value.is_some());
+
+    // Journal evidence must not leak into the normal walk.
+    let walked = all_entries();
+    assert!(!walked.iter().any(|e| e.path.starts_with("/$JOURNAL/")));
+}
+
+#[test]
+fn journal_events_typed_stream() {
+    use sutram_ext4::{Ext4Fs, JournalEventKind};
+    let fs = Ext4Fs::mount(image(), MountOptions::default()).unwrap();
+    let events = fs
+        .journal_events()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    // superblock + desc + 2 tags + revoke + commit + desc + 1 tag = 8.
+    assert_eq!(events.len(), 8);
+    assert!(matches!(
+        events[0].kind,
+        JournalEventKind::Superblock { version: 2 }
+    ));
+    assert!(matches!(
+        events[1].kind,
+        JournalEventKind::Descriptor { tags: 2 }
+    ));
+    let JournalEventKind::JournaledBlock(tag) = &events[2].kind else {
+        panic!("event 2 should be a journaled block: {:?}", events[2].kind)
+    };
+    assert_eq!(tag.fs_block, 5);
+    assert!(tag.prior_state());
+    let JournalEventKind::Revoke { blocks } = &events[4].kind else {
+        panic!("event 4 should be a revoke: {:?}", events[4].kind)
+    };
+    assert_eq!(blocks, &[44]);
+}
+
+#[test]
+fn journal_corruption_lenient_and_strict() {
+    let mut img = common::build_ext4();
+    // Overwrite the data copy at journal block 37 with a valid header:
+    // descriptor 36's tag claims it as data, so the scan must flag the
+    // collision and resynchronise onto the block as a structure.
+    let b = common::blk_off(37);
+    img[b..b + 4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+    img[b + 4..b + 8].copy_from_slice(&2u32.to_be_bytes()); // commit
+    img[b + 8..b + 12].copy_from_slice(&0x101u32.to_be_bytes());
+
+    // Lenient: one error record interleaved; parsing continues.
+    let fs = Ext4Parser.mount(Arc::new(img.clone())).unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert_eq!(items.iter().filter(|i| i.is_err()).count(), 1);
+    assert!(items.iter().any(|i| i.is_ok()));
+
+    // Strict: the first error is terminal — the stream ends on it.
+    let fs = Ext4Parser
+        .mount_with(Arc::new(img), &MountOptions::strict())
+        .unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert!(items.last().unwrap().is_err());
+    assert_eq!(items.iter().filter(|i| i.is_err()).count(), 1);
 }
 
 #[test]

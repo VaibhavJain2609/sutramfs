@@ -54,9 +54,17 @@ cleared but inode bodies — including the extent tree root inside
   `value: None` — never fabricated.
 - **xattrs** — in-inode body region and `i_file_acl` block names listed in
   `meta["xattrs"]` (SELinux, ACLs, `user.*`, `trusted.*`).
-- **jbd2 awareness** — the journal superblock is parsed into
-  `FsInfo.meta` (`jbd2_needs_replay`, `jbd2_sequence`, `jbd2_journal_blocks`,
-  …); the journal inode itself is emitted as an orphan artefact.
+- **jbd2 journal forensics** — inode 8's log is parsed as evidence:
+  the big-endian superblock plus descriptor, commit and revocation
+  blocks. `Ext4Fs::journal_events()` streams typed `JournalEvent`s
+  (transaction id, target fs block, tag flags); `journal_entries()`
+  emits them as `/$JOURNAL/tx_<id>/…` pseudo-entries whose
+  `allocated_ranges` read back each journaled copy — a snapshot of an
+  inode-table block, bitmap, or freed data block as it was when the
+  transaction committed (`jbd2_prior_metadata_copies` counts these).
+  `FsInfo.meta` summarises the log (`jbd2_needs_replay`,
+  `jbd2_descriptor_blocks`, `jbd2_revoked_blocks`, `jbd2_transactions`, …).
+  The journal inode itself is also emitted as an orphan artefact.
 - **Hardlinks** — `links_count` > 1 aliases get `meta["hardlink_of"]`
   pointing at the first-seen path.
 - **Provenance** — `disk_offset` is the dirent (live/carved) or inode
@@ -119,11 +127,15 @@ unreliable.
 - **No checksum verification** — `metadata_csum`/`metadata_csum_seed`,
   GDT, inode and journal crc32c checksums are reported as feature flags but
   never verified (no crc32c dependency; intentional).
-- **jbd2 transaction replay is not implemented** — the journal superblock
-  is parsed and `jbd2_needs_replay` reported, but descriptor/revoke/commit
-  blocks are not walked. A future pass over the `s_start..s_maxlen` region
-  would recover recently-modified inodes/dirents that never hit the disk —
-  the richest deleted-file source ext4 offers (see `src/journal.rs` TODO).
+- **jbd2 transaction replay is not implemented** — the journal is parsed
+  as evidence (descriptor/commit/revoke blocks, per-tag journaled copies)
+  but never applied to live filesystem state: a journaled inode table or
+  dirent block is surfaced via `journal_events()`/`journal_entries()` for
+  the examiner to interpret, not folded back into the walk. Journal
+  checksums are not verified; fast-commit (TLV) blocks are surfaced as
+  `JournalEventKind::FastCommit` without decoding their log entries; the
+  `FsInfo.meta` summary scan is capped at 65536 journal blocks (the typed
+  stream itself is unbounded).
 - **HTree directories are parsed linearly** — hash-indexed directories
   still store dirents linearly inside leaf blocks, so results are correct,
   just not accelerated; `dx_node` interior blocks are skipped. Deleted
