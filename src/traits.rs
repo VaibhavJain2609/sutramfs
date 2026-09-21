@@ -189,7 +189,8 @@ impl Iterator for CarveIter {
         while self.pos < self.end {
             let pos = self.pos;
             self.pos = self.pos.saturating_add(self.align);
-            let probe_len = HEADER_PROBE.min((self.end - pos) as usize);
+            let remain = usize::try_from(self.end - pos).unwrap_or(usize::MAX);
+            let probe_len = HEADER_PROBE.min(remain);
             let header = match self.src.read_slice(pos, probe_len) {
                 Ok(h) => h,
                 Err(e) => return Some(Err(FsError::Io(e))),

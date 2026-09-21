@@ -67,6 +67,27 @@ pub fn unix_nanos(
     {
         return None;
     }
+    // Impossible calendar dates (Feb 30, Apr 31, Feb 29 on a common year)
+    // must yield None — silently rolling into the next month would
+    // misreport the evidence.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(month - 1) as usize];
+    if day > dim {
+        return None;
+    }
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
