@@ -37,6 +37,12 @@
 //! * **Provenance** — `disk_offset` is the MFT record's absolute offset;
 //!   `meta["mft_record"]`, `attr_offsets`, and `allocated_ranges` (absolute
 //!   byte extents, resident content included) pin every byte.
+//! * **Journal forensics** — `$UsnJrnl:$J` USN change records (filename,
+//!   file/parent references, reason flags, timestamp) and `$LogFile`
+//!   LFS pages (RSTR restart areas, RCRD log-record headers, CHKD
+//!   checkpoints, BAAD torn pages) stream via `NtfsFs::journal_events()`
+//!   and `FileSystem::journal_entries()` under `/$USN_JRNL/` and
+//!   `/$LOGFILE/`. Parsed, never replayed.
 //! * Lenient by default; `MountOptions::strict` makes the first error
 //!   terminal. No panics on untrusted input.
 
@@ -46,10 +52,12 @@ mod attr;
 mod boot;
 mod fs;
 mod indx;
+mod journal;
 mod record;
 mod walk;
 
 pub use fs::{NtfsFs, NtfsParser};
+pub use journal::{JournalEvent, LogRecord, RestartArea, UsnRecord};
 
 #[cfg(test)]
 mod tests;

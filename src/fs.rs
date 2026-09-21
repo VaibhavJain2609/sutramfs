@@ -7,13 +7,14 @@ use std::io::Read;
 use std::sync::Arc;
 
 use sutram_fs::{
-    DetectConfidence, EntryKind, FsEntry, FsError, FsInfo, FsParser, FileSystem, MountOptions,
-    Result,
+    DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser, FileSystem,
+    MountOptions, RecoveryState, Result, Timestamps,
 };
 use sutram_io::ByteSource;
 
 use crate::attr::{self, Attr, DataRun, FileName};
 use crate::boot::BootSector;
+use crate::journal::{self, JournalEvent};
 use crate::record::{self, FileRecord};
 use crate::walk::Walk;
 
@@ -164,7 +165,10 @@ const MAX_EXT_RECORDS: usize = 64;
 const MAX_ATTRS: usize = 512;
 
 impl NtfsFs {
-    pub(crate) fn mount(src: Arc<dyn ByteSource>, opts: MountOptions) -> Result<Self> {
+    /// Mount the volume directly — the concrete handle exposes journal
+    /// forensics ([`Self::journal_events`]) beyond the `dyn FileSystem`
+    /// surface.
+    pub fn mount(src: Arc<dyn ByteSource>, opts: MountOptions) -> Result<Self> {
         let bs = BootSector::parse(src.as_ref())?;
         let rec_size = bs.file_record_size;
         let csz = bs.cluster_size;
@@ -735,6 +739,241 @@ impl NtfsFs {
             msg: format!("data stream {idx} no longer present in record {rec_no}"),
         })
     }
+
+    // ---- journal forensics ($UsnJrnl + $LogFile) ------------------------
+
+    /// Locate record `rec_no`'s `$DATA` stream named `name` (`None` =
+    /// unnamed). Used for `$UsnJrnl:$J` and `$LogFile`.
+    fn journal_stream(&self, rec_no: u64, name: Option<&str>) -> Option<Stream> {
+        let rec = self.parse_record(rec_no).ok()?;
+        let (attrs, _) = Self::collect_attrs(&rec);
+        Self::group_streams(&attrs, attr::T_DATA)
+            .into_iter()
+            .find(|s| s.name.as_deref() == name)
+    }
+
+    /// `(logical_off, disk_off, len)` regions covering a stream's
+    /// *allocated* bytes — sparse holes omitted so logical offsets stay
+    /// honest.
+    fn stream_regions(&self, s: &Stream) -> Vec<(u64, u64, u64)> {
+        if let Some((off, len)) = s.resident {
+            return vec![(0, off, len as u64)];
+        }
+        let csz = self.bs.cluster_size;
+        s.runs
+            .iter()
+            .filter_map(|r| {
+                r.lcn.map(|l| {
+                    (
+                        r.vcn.saturating_mul(csz),
+                        l.saturating_mul(csz),
+                        r.len.saturating_mul(csz),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Read a stream's logical bytes (sparse holes → zeros), bounded by
+    /// `cap`.
+    fn stream_bytes(&self, s: &Stream, cap: u64) -> Result<Vec<u8>> {
+        if let Some((off, len)) = s.resident {
+            return self
+                .src
+                .read_slice(off, (len as u64).min(cap) as usize)
+                .map_err(FsError::Io);
+        }
+        Self::read_stream_bytes(
+            &self.src,
+            &s.runs,
+            self.bs.cluster_size,
+            s.real_size.min(cap),
+        )
+    }
+
+    /// Stream the parsed journals as typed [`JournalEvent`]s: USN change
+    /// records from `$UsnJrnl:$J` (record 12), then `$LogFile` (record 2)
+    /// restart areas, log-record headers, checkpoints and torn pages.
+    /// Journals are **parsed, never replayed** — a USN record is evidence
+    /// a file changed, not a view of its contents. Each stream is scanned
+    /// over at most `MAX_JOURNAL_BYTES` (64 MiB) of materialised bytes.
+    /// Empty when neither journal stream exists.
+    pub fn journal_events(&self) -> Box<dyn Iterator<Item = Result<JournalEvent>> + Send + '_> {
+        let usn = self
+            .journal_stream(12, Some("$J"))
+            .and_then(|s| {
+                self.stream_bytes(&s, journal::MAX_JOURNAL_BYTES)
+                    .ok()
+                    .map(|b| {
+                        journal::UsnIter::new(b, self.stream_regions(&s), self.opts.strict)
+                    })
+            })
+            .into_iter()
+            .flatten()
+            .map(|r| r.map(JournalEvent::Usn));
+        let log = self
+            .journal_stream(2, None)
+            .and_then(|s| {
+                self.stream_bytes(&s, journal::MAX_JOURNAL_BYTES)
+                    .ok()
+                    .map(|b| {
+                        journal::LogIter::new(
+                            b,
+                            self.stream_regions(&s),
+                            self.bs.bytes_per_sector as usize,
+                            self.opts.strict,
+                        )
+                    })
+            })
+            .into_iter()
+            .flatten()
+            .map(|r| r.map(JournalEvent::from));
+        // Strict mode: the first error ends the whole journal stream —
+        // not just whichever sub-iterator produced it.
+        let strict = self.opts.strict;
+        let mut done = false;
+        Box::new(usn.chain(log).map_while(move |item| {
+            if done {
+                return None;
+            }
+            if strict && item.is_err() {
+                done = true;
+            }
+            Some(item)
+        }))
+    }
+
+    /// Render one journal event as a forensic `FsEntry`.
+    fn journal_entry(&self, ev: &JournalEvent) -> Option<FsEntry> {
+        let mut meta = HashMap::new();
+        meta.insert("journal".into(), "ntfs".into());
+        let mut timestamps = Timestamps::default();
+        let (name, path, kind, disk_offset) = match ev {
+            JournalEvent::Usn(r) => {
+                let recno = attr::file_ref_rec(r.file_ref);
+                meta.insert("usn".into(), r.usn.to_string());
+                meta.insert("usn_reason".into(), format!("{:#x}", r.reason));
+                let reasons = journal::reason_names(r.reason);
+                if !reasons.is_empty() {
+                    meta.insert("usn_reason_names".into(), reasons.join(","));
+                }
+                meta.insert("file_ref".into(), r.file_ref.to_string());
+                meta.insert("parent_ref".into(), r.parent_ref.to_string());
+                if let Some(slot) = self
+                    .slots
+                    .get(attr::file_ref_rec(r.parent_ref) as usize)
+                {
+                    if let Some(f) = slot.fns.first() {
+                        meta.insert("parent_name".into(), f.name.clone());
+                    }
+                }
+                meta.insert(
+                    "usn_version".into(),
+                    format!("{}.{}", r.major_version, r.minor_version),
+                );
+                meta.insert("source_info".into(), format!("{:#x}", r.source_info));
+                meta.insert("security_id".into(), r.security_id.to_string());
+                meta.insert(
+                    "file_attributes".into(),
+                    format!("{:#x}", r.file_attributes),
+                );
+                meta.insert(
+                    "usn_stream_offset".into(),
+                    format!("{:#x}", r.stream_offset),
+                );
+                timestamps.changed = Some(attr::filetime_ts(r.filetime));
+                let name = if r.name.is_empty() {
+                    format!("rec_{recno}")
+                } else {
+                    r.name.clone()
+                };
+                let path = format!("/$USN_JRNL/{:#x}/{name}", r.usn);
+                let kind = if r.file_attributes & 0x10 != 0 {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                (name, path, kind, r.disk_offset.unwrap_or(0))
+            }
+            JournalEvent::Restart(ra) => {
+                meta.insert("current_lsn".into(), format!("{:#x}", ra.current_lsn));
+                meta.insert("log_clients".into(), ra.log_clients.to_string());
+                meta.insert("seq_nr_bits".into(), ra.seq_nr_bits.to_string());
+                meta.insert("restart_area_len".into(), ra.restart_area_len.to_string());
+                meta.insert("logfile_size".into(), ra.file_size.to_string());
+                meta.insert("record_page_len".into(), ra.record_page_len.to_string());
+                (
+                    format!("restart_area_{:#x}", ra.disk_offset),
+                    format!("/$LOGFILE/restart_{:#x}", ra.disk_offset),
+                    EntryKind::Other,
+                    ra.disk_offset,
+                )
+            }
+            JournalEvent::LogRecord(lr) => {
+                meta.insert("lsn".into(), format!("{:#x}", lr.this_lsn));
+                meta.insert(
+                    "client_prev_lsn".into(),
+                    format!("{:#x}", lr.client_prev_lsn),
+                );
+                meta.insert(
+                    "client_undo_next_lsn".into(),
+                    format!("{:#x}", lr.client_undo_next_lsn),
+                );
+                meta.insert("record_type".into(), format!("{:#x}", lr.record_type));
+                meta.insert("transaction_id".into(), lr.transaction_id.to_string());
+                meta.insert("flags".into(), format!("{:#x}", lr.flags));
+                meta.insert("redo_op".into(), format!("{:#x}", lr.redo_op));
+                meta.insert("undo_op".into(), format!("{:#x}", lr.undo_op));
+                meta.insert("redo_len".into(), lr.redo_len.to_string());
+                meta.insert("undo_len".into(), lr.undo_len.to_string());
+                meta.insert("client_data_len".into(), lr.client_data_len.to_string());
+                let name = format!("lsn_{:#x}", lr.this_lsn);
+                (
+                    name.clone(),
+                    format!("/$LOGFILE/{name}"),
+                    EntryKind::Other,
+                    lr.disk_offset.unwrap_or(0),
+                )
+            }
+            JournalEvent::Checkpoint { lsn, disk_offset } => {
+                meta.insert("lsn".into(), format!("{lsn:#x}"));
+                meta.insert("note".into(), "$LogFile checkpoint page (CHKD)".into());
+                (
+                    format!("checkpoint_{disk_offset:#x}"),
+                    format!("/$LOGFILE/checkpoint_{disk_offset:#x}"),
+                    EntryKind::Other,
+                    *disk_offset,
+                )
+            }
+            JournalEvent::TornPage { disk_offset } => {
+                meta.insert(
+                    "note".into(),
+                    "torn log page (BAAD) — evidence of the last in-flight write".into(),
+                );
+                (
+                    format!("torn_{disk_offset:#x}"),
+                    format!("/$LOGFILE/torn_{disk_offset:#x}"),
+                    EntryKind::Other,
+                    *disk_offset,
+                )
+            }
+        };
+        Some(FsEntry {
+            path,
+            name,
+            entry_id: 0,
+            kind,
+            size: 0,
+            disk_offset,
+            allocated_ranges: Vec::new(),
+            timestamps,
+            status: FsEntryStatus::Deleted {
+                recovery: RecoveryState::Unknown,
+            },
+            meta,
+            magic: None,
+        })
+    }
 }
 
 /// Merge sorted `(start, len)` cluster ranges.
@@ -781,8 +1020,8 @@ impl FileSystem for NtfsFs {
             meta.insert("ntfs_version".into(), format!("{maj}.{min}"));
         }
         // Journal artefacts: $LogFile is record 2; $UsnJrnl is located by
-        // name under $Extend. Parsing them is the platform's job — flag
-        // their presence.
+        // name under $Extend. Their contents are parsed (bounded) —
+        // counts summarise the scan.
         if self.slots.get(2).map(|s| s.in_use).unwrap_or(false) {
             meta.insert("logfile_present".into(), "true".into());
         }
@@ -792,6 +1031,42 @@ impl FileSystem for NtfsFs {
             .any(|s| s.in_use && s.fns.iter().any(|f| f.name == "$UsnJrnl"))
         {
             meta.insert("usn_journal_present".into(), "true".into());
+        }
+        if let Some(s) = self.journal_stream(12, Some("$J")) {
+            meta.insert("usn_stream_size".into(), s.real_size.to_string());
+            if s.real_size > journal::MAX_JOURNAL_BYTES {
+                meta.insert("usn_scan_truncated".into(), "true".into());
+            }
+        }
+        if let Some(s) = self.journal_stream(2, None) {
+            meta.insert("logfile_size".into(), s.real_size.to_string());
+            if s.real_size > journal::MAX_JOURNAL_BYTES {
+                meta.insert("logfile_scan_truncated".into(), "true".into());
+            }
+        }
+        if meta.contains_key("usn_journal_present") || meta.contains_key("logfile_present") {
+            let mut usn = 0u64;
+            let mut restarts = 0u64;
+            let mut records = 0u64;
+            let mut checkpoints = 0u64;
+            let mut torn = 0u64;
+            let mut errs = 0u64;
+            for item in self.journal_events() {
+                match item {
+                    Ok(JournalEvent::Usn(_)) => usn += 1,
+                    Ok(JournalEvent::Restart(_)) => restarts += 1,
+                    Ok(JournalEvent::LogRecord(_)) => records += 1,
+                    Ok(JournalEvent::Checkpoint { .. }) => checkpoints += 1,
+                    Ok(JournalEvent::TornPage { .. }) => torn += 1,
+                    Err(_) => errs += 1,
+                }
+            }
+            meta.insert("usn_records".into(), usn.to_string());
+            meta.insert("logfile_restart_areas".into(), restarts.to_string());
+            meta.insert("logfile_records".into(), records.to_string());
+            meta.insert("logfile_checkpoints".into(), checkpoints.to_string());
+            meta.insert("logfile_torn_pages".into(), torn.to_string());
+            meta.insert("journal_parse_errors".into(), errs.to_string());
         }
         let free = self.bitmap.as_ref().map(|bm| {
             // Bound the scan: a hostile BPB can declare astronomic cluster
@@ -824,6 +1099,19 @@ impl FileSystem for NtfsFs {
 
     fn source(&self) -> Arc<dyn ByteSource> {
         self.src.clone()
+    }
+
+    /// Journal artefacts as pseudo-entries: `$UsnJrnl` change records
+    /// under `/$USN_JRNL/` and `$LogFile` structures under `/$LOGFILE/`.
+    /// These sit alongside — never inside — the `walk()` tree.
+    fn journal_entries(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        Box::new(
+            self.journal_events()
+                .filter_map(|item| match item {
+                    Err(e) => Some(Err(e)),
+                    Ok(ev) => self.journal_entry(&ev).map(Ok),
+                }),
+        )
     }
 
     fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {

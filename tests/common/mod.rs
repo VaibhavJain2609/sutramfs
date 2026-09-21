@@ -15,8 +15,8 @@
 //! | 0        | boot sector                                          |
 //! | 4–23     | $MFT (4–19 used records, 20–23 slack w/ fragment @70)  |
 //! | 30       | $Bitmap data                                         |
-//! | 31–32    | $LogFile                                             |
-//! | 33       | $UsnJrnl:$J                                          |
+//! | 31–34    | $LogFile (RSTR/RCRD/CHKD pages)                                             |
+//! | 35       | $UsnJrnl:$J (USN records)                                          |
 //! | 40–43    | BIG.BIN                                              |
 //! | 44–45,46–47 | SPARSE.BIN (hole between)                       |
 //! | 50–51    | DELETED1.TXT (freed, intact)                          |
@@ -222,6 +222,88 @@ pub fn attr_nonresident(
     a[name_off..name_off + nb.len()].copy_from_slice(&nb);
     a[runs_off..runs_off + rl.len()].copy_from_slice(&rl);
     a
+}
+
+// ---- journal payloads ($LogFile LFS pages, $UsnJrnl USN records) -----------
+
+/// Build a 4 KiB LFS page (`RSTR`/`RCRD`/`CHKD`/`BAAD`): multisig header,
+/// USA at offset 8, `data` = `(offset, bytes)` patches applied pre-fixup.
+pub fn lfs_page(sig: &[u8; 4], data: &[(usize, Vec<u8>)]) -> Vec<u8> {
+    const SEQ: u16 = 0xA5A5;
+    let mut page = vec![0u8; CSZ];
+    page[0..4].copy_from_slice(sig);
+    let sectors = CSZ / BPS;
+    let usa_off = 8usize;
+    w16(&mut page, 4, usa_off as u16);
+    w16(&mut page, 6, (sectors + 1) as u16);
+    for (off, bytes) in data {
+        page[*off..*off + bytes.len()].copy_from_slice(bytes);
+    }
+    w16(&mut page, usa_off, SEQ);
+    for i in 0..sectors {
+        let trailer = (i + 1) * BPS - 2;
+        let orig = u16::from_le_bytes([page[trailer], page[trailer + 1]]);
+        w16(&mut page, usa_off + 2 + i * 2, orig);
+        w16(&mut page, trailer, SEQ);
+    }
+    page
+}
+
+/// RESTART_AREA body (written at offset 0x30 of an RSTR page).
+pub fn restart_area() -> Vec<u8> {
+    let mut a = vec![0u8; 0x36];
+    w64(&mut a, 0x00, 0x4A00); // current_lsn
+    w16(&mut a, 0x08, 1); // log_clients
+    w32(&mut a, 0x1A, 34); // seq_nr_bits
+    w16(&mut a, 0x1E, 0x36); // restart_area_len
+    w64(&mut a, 0x24, 0x4000); // file_size
+    w32(&mut a, 0x2C, 0x48); // last_lsn_data_len
+    w16(&mut a, 0x30, 0x1000); // record_page_len
+    a
+}
+
+/// LOG_RECORD header + client data (extent = 0x48 + data, 8-aligned).
+pub fn log_record(lsn: u64, rtype: u32, tid: u32, client_data: &[u8]) -> Vec<u8> {
+    let mut r = vec![0u8; 0x48 + client_data.len()];
+    w64(&mut r, 0x00, lsn); // this_lsn
+    w64(&mut r, 0x08, lsn.saturating_sub(0x40)); // client_prev_lsn
+    w16(&mut r, 0x18, client_data.len() as u16); // client_data_len
+    w32(&mut r, 0x1C, rtype); // record_type
+    w32(&mut r, 0x20, tid); // transaction_id
+    w16(&mut r, 0x28, 0x01); // redo_op
+    w16(&mut r, 0x2A, 0x02); // undo_op
+    w16(&mut r, 0x2E, client_data.len() as u16); // redo_len
+    w16(&mut r, 0x32, 0x10); // undo_len
+    r[0x48..].copy_from_slice(client_data);
+    r
+}
+
+/// A USN_RECORD_V2 body (8-aligned, fixed header + UTF-16 filename).
+#[allow(clippy::too_many_arguments)]
+pub fn usn_record(
+    file_ref: u64,
+    parent_ref: u64,
+    usn: i64,
+    ts: u64,
+    reason: u32,
+    attrs: u32,
+    name: &str,
+) -> Vec<u8> {
+    let nb = utf16(name);
+    let len = (0x3C + nb.len() + 7) & !7;
+    let mut r = vec![0u8; len];
+    w32(&mut r, 0, len as u32);
+    w16(&mut r, 4, 2); // major_version
+    w64(&mut r, 8, file_ref);
+    w64(&mut r, 0x10, parent_ref);
+    w64(&mut r, 0x18, usn as u64);
+    w64(&mut r, 0x20, ts);
+    w32(&mut r, 0x28, reason);
+    w32(&mut r, 0x34, attrs);
+    w16(&mut r, 0x38, nb.len() as u16);
+    w16(&mut r, 0x3A, 0x3C);
+    r[0x3C..0x3C + nb.len()].copy_from_slice(&nb);
+    r
 }
 
 /// $STANDARD_INFORMATION content.
@@ -547,10 +629,25 @@ pub fn build_ntfs() -> Vec<u8> {
         &[
             attr_resident(T_SI, "", &si_body(t, t, t, t, 0x06), 0),
             attr_resident(T_FN, "", &fn_body(5, "$LogFile", 1, 0x06, 8192, [t; 4]), 1),
-            attr_nonresident(T_DATA, "", &[(2, Some(31))], 0, 8192, 8192, 8192, 0, 0, 2),
+            attr_nonresident(T_DATA, "", &[(4, Some(31))], 0, 16384, 16384, 16384, 0, 0, 2),
         ],
     );
-    put(&mut img, 31, b"RSTR-logfile-restart-area");
+    // $LogFile stream, clusters 31-34 = four LFS pages: two restart areas,
+    // one record page (two LOG_RECORDs), one checkpoint.
+    put(&mut img, 31, &lfs_page(b"RSTR", &[(0x30, restart_area())]));
+    put(&mut img, 32, &lfs_page(b"RSTR", &[(0x30, restart_area())]));
+    let rec1 = log_record(0x4A80, 1, 7, b"redo-undo-payload!");
+    let rec2 = log_record(0x4AE0, 1, 7, b"");
+    put(
+        &mut img,
+        33,
+        &lfs_page(b"RCRD", &[(0x40, rec1), (0x40 + 0x60, rec2)]),
+    );
+    put(
+        &mut img,
+        34,
+        &lfs_page(b"CHKD", &[(0x30, 0x4A00u64.to_le_bytes().to_vec())]),
+    );
 
     // ---- record 3: $Volume ----------------------------------------------
     file_record(
@@ -684,10 +781,32 @@ pub fn build_ntfs() -> Vec<u8> {
             attr_resident(T_SI, "", &si_body(t, t, t, t, 0x06), 0),
             attr_resident(T_FN, "", &fn_body(11, "$UsnJrnl", 1, 0x06, 0, [t; 4]), 1),
             attr_resident(T_DATA, "$Max", &32u64.to_le_bytes(), 2),
-            attr_nonresident(T_DATA, "$J", &[(1, Some(33))], 0, CSZ as u64, 128, 128, 0, 0, 3),
+            attr_nonresident(T_DATA, "$J", &[(1, Some(35))], 0, CSZ as u64, 256, 256, AFLAG_SPARSE, 0, 3),
         ],
     );
-    put(&mut img, 33, b"USN-JOURNAL-DATA");
+    // $UsnJrnl:$J at cluster 35 — two USN_RECORD_V2 change records:
+    // BIG.BIN written (rec 17), DELETED1.TXT deleted (rec 20).
+    let usn1 = usn_record(
+        17 | (1u64 << 48),
+        5 | (1u64 << 48),
+        0x1000,
+        ft(1_705_300_000),
+        0x8000_0101, // data_overwrite|file_create|close
+        0x20,
+        "BIG.BIN",
+    );
+    let usn2 = usn_record(
+        20 | (3u64 << 48),
+        5 | (1u64 << 48),
+        0x1080,
+        ft(1_705_300_100),
+        0x8000_0200, // file_delete|close
+        0x20,
+        "DELETED1.TXT",
+    );
+    let mut jdata = usn1;
+    jdata.extend_from_slice(&usn2);
+    put(&mut img, 35, &jdata);
 
     // ---- record 16: HELLO.TXT (resident data) -------------------------------
     file_record(
@@ -1435,14 +1554,14 @@ pub fn build_ntfs() -> Vec<u8> {
     );
 
     // ---- volume cluster bitmap at cluster 30 -----------------------------------------------------
-    // mark allocated: 0-3 (boot/rsvd), 4-23 (MFT), 30-33, 40-47, 52-53,
+    // mark allocated: 0-3 (boot/rsvd), 4-23 (MFT), 30-35, 40-47, 52-53,
     // 60-61, 64, 70-73, 80, plus the live extents of the extra records.
     // 62 is marked although only the *deleted* BITDEL.TXT points at it —
     // the "deallocation never committed" anomaly the parser reports.
     for c in 0..TOTAL_CLUSTERS {
         let used = matches!(
             c,
-            0..=3 | 4..=23 | 30..=33 | 40..=47 | 52..=53 | 60..=64 | 70..=73 | 80
+            0..=3 | 4..=23 | 30..=35 | 40..=47 | 52..=53 | 60..=64 | 70..=73 | 80
                 | 84..=85 | 96..=111 | 120..=123
         );
         bitmap_set(&mut img, c, used);

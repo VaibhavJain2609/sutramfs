@@ -62,7 +62,139 @@ fn info_reports_ntfs() {
     assert_eq!(info.meta["mft_lcn"], "4");
     assert_eq!(info.meta["logfile_present"], "true");
     assert_eq!(info.meta["usn_journal_present"], "true");
+    // Journal contents are parsed: 2 USN records, 2 restart areas,
+    // 2 log-record headers, 1 checkpoint page, no torn pages.
+    assert_eq!(info.meta["usn_records"], "2");
+    assert_eq!(info.meta["logfile_restart_areas"], "2");
+    assert_eq!(info.meta["logfile_records"], "2");
+    assert_eq!(info.meta["logfile_checkpoints"], "1");
+    assert_eq!(info.meta["logfile_torn_pages"], "0");
+    assert_eq!(info.meta["journal_parse_errors"], "0");
     assert!(info.free_blocks.unwrap() > 0);
+}
+
+#[test]
+fn journal_entries_usn_and_logfile() {
+    let fs = mount();
+    let entries: Vec<FsEntry> = fs
+        .journal_entries()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("journal parse should not error on the corpus");
+    // 2 USN + 2 restart areas + 2 log records + 1 checkpoint.
+    assert_eq!(
+        entries.len(),
+        7,
+        "{:?}",
+        entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+    );
+
+    // USN record: BIG.BIN written, parent root.
+    let u = find(&entries, "BIG.BIN");
+    assert_eq!(u.path, "/$USN_JRNL/0x1000/BIG.BIN");
+    assert!(u.is_deleted());
+    assert_eq!(u.meta["journal"], "ntfs");
+    assert_eq!(u.meta["usn"], "4096");
+    assert_eq!(u.meta["usn_reason"], "0x80000101");
+    assert!(u.meta["usn_reason_names"].contains("file_create"));
+    assert!(u.meta["usn_reason_names"].contains("close"));
+    assert_eq!(u.meta["file_ref"], (17u64 | (1u64 << 48)).to_string());
+    assert_eq!(u.meta["parent_name"], ".");
+    assert_eq!(u.meta["usn_version"], "2.0");
+    assert_eq!(u.kind, sutram_fs::EntryKind::File);
+    assert!(u.timestamps.changed.as_ref().unwrap().value.is_some());
+    // Provenance: the record's absolute offset inside the $J cluster.
+    assert_eq!(u.disk_offset, common::clus_off(35) as u64);
+
+    // The file_delete event on the actually-deleted record 20.
+    let d = find(&entries, "DELETED1.TXT");
+    assert_eq!(d.meta["usn_reason"], "0x80000200");
+    assert!(d.meta["usn_reason_names"].contains("file_delete"));
+
+    // Restart areas and log records carry their LFS anchors.
+    let ra = entries
+        .iter()
+        .find(|e| e.path.starts_with("/$LOGFILE/restart_"))
+        .expect("restart area entry");
+    assert_eq!(ra.meta["current_lsn"], "0x4a00");
+    assert_eq!(ra.meta["record_page_len"], "4096");
+    let lr = find(&entries, "lsn_0x4a80");
+    assert_eq!(lr.meta["record_type"], "0x1");
+    assert_eq!(lr.meta["transaction_id"], "7");
+    assert_eq!(lr.meta["client_data_len"], "18");
+    find(&entries, "lsn_0x4ae0");
+    let ck = entries
+        .iter()
+        .find(|e| e.path.starts_with("/$LOGFILE/checkpoint_"))
+        .expect("checkpoint entry");
+    assert_eq!(ck.meta["lsn"], "0x4a00");
+
+    // Journal evidence must not leak into the normal walk.
+    let walked = all_entries();
+    assert!(!walked.iter().any(|e| e.path.starts_with("/$USN_JRNL/")));
+    assert!(!walked.iter().any(|e| e.path.starts_with("/$LOGFILE/")));
+}
+
+#[test]
+fn journal_events_typed_stream() {
+    use sutram_ntfs::{JournalEvent, NtfsFs};
+    let fs = NtfsFs::mount(image(), MountOptions::default()).unwrap();
+    let events = fs.journal_events().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(events.len(), 7);
+    let JournalEvent::Usn(u) = &events[0] else {
+        panic!("first event should be a USN record: {:?}", events[0])
+    };
+    assert_eq!(u.usn, 0x1000);
+    assert_eq!(u.name, "BIG.BIN");
+    let JournalEvent::Restart(ra) = &events[2] else {
+        panic!("event 2 should be a restart area: {:?}", events[2])
+    };
+    assert_eq!(ra.current_lsn, 0x4A00);
+    let JournalEvent::LogRecord(lr) = &events[4] else {
+        panic!("event 4 should be a log record: {:?}", events[4])
+    };
+    assert_eq!(lr.this_lsn, 0x4A80);
+    assert_eq!(lr.redo_op, 1);
+    assert_eq!(lr.undo_op, 2);
+}
+
+#[test]
+fn journal_lenient_and_strict_on_corruption() {
+    // Corrupt the first USN record's length — hostile value, not a record.
+    let mut img = common::build_ntfs();
+    img[common::clus_off(35)..common::clus_off(35) + 4]
+        .copy_from_slice(&7u32.to_le_bytes()); // record_len 7 < USN_MIN
+    let fs = NtfsParser.mount(Arc::new(img.clone())).unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert!(items.iter().any(|i| i.is_err()));
+    // Lenient resynchronises at the next 8-byte boundary and still finds
+    // the second USN record plus all $LogFile artefacts.
+    let ok = items.iter().filter(|i| i.is_ok()).count();
+    assert!(ok >= 6, "expected surviving artefacts, got {ok}");
+
+    // Strict: the first error is terminal.
+    let fs = NtfsParser
+        .mount_with(Arc::new(img), &MountOptions::strict())
+        .unwrap();
+    let items: Vec<_> = fs.journal_entries().collect();
+    assert_eq!(items.iter().filter(|i| i.is_err()).count(), 1);
+    assert!(items.last().unwrap().is_err());
+}
+
+#[test]
+fn logfile_torn_page_is_evidence() {
+    // A torn write at the checkpoint page must surface as BAAD evidence.
+    let mut img = common::build_ntfs();
+    img[common::clus_off(34)..common::clus_off(34) + 4].copy_from_slice(b"BAAD");
+    let fs = NtfsParser.mount(Arc::new(img)).unwrap();
+    let entries: Vec<FsEntry> = fs
+        .journal_entries()
+        .filter_map(|i| i.ok())
+        .collect();
+    let torn = entries
+        .iter()
+        .find(|e| e.path.starts_with("/$LOGFILE/torn_"))
+        .expect("torn page evidence");
+    assert!(torn.meta["note"].contains("torn"));
 }
 
 #[test]

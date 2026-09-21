@@ -48,6 +48,17 @@ battleground.
 - **ADS** — every named `$DATA` stream is its own entry
   (`/file.txt:stream`); `$UsnJrnl:$J`/`$Max` are exposed the same way and
   `$LogFile`/`$UsnJrnl` presence is flagged in `FsInfo::meta`.
+- **Journal forensics** — the change journal and LFS log are parsed as
+  evidence: `$UsnJrnl:$J` USN records (filename, file/parent references,
+  reason flags with decoded names, event timestamp) stream under
+  `/$USN_JRNL/<usn>/`, and `$LogFile` 4 KiB LFS pages are decoded as
+  restart areas (`RSTR`), log-record headers (`RCRD`), checkpoints
+  (`CHKD`) and torn-write evidence (`BAAD`) under `/$LOGFILE/`.
+  `NtfsFs::journal_events()` gives the typed stream;
+  `journal_entries()` the `FsEntry` view; `FsInfo::meta` carries
+  `usn_records`, `logfile_records`, `logfile_torn_pages`, etc. Journals
+  are **parsed, never replayed** — a USN record says a file changed, a
+  log record witnesses a transaction; neither modifies the walk.
 - **$ATTRIBUTE_LIST** — extension records are merged into their base
   record, so split runlists produce one coherent extent list;
   `meta["extension_records"]` lists the contributors.
@@ -115,9 +126,15 @@ marked allocated in $MFT's bitmap), $BITMAP-allocated surviving clusters
 
 ## Known limitations
 
-- **$LogFile and $UsnJrnl are exposed, not parsed.** They appear as normal
-  files (plus `logfile_present`/`usn_journal_present` in `FsInfo::meta`);
-  journal-semantic analysis is the platform's job.
+- **Journal contents are parsed, not replayed.** `$UsnJrnl:$J` USN
+  records (v2 fully, v3/v4 with low-64-bit file references) and
+  `$LogFile` LFS pages (restart areas, log-record headers, checkpoints,
+  `BAAD` torn pages) stream via `journal_events()`/`journal_entries()`
+  as evidence. Log-record *payloads* (redo/undo buffers) are located via
+  computed extents but not interpreted; each journal stream is scanned
+  over at most 64 MiB of materialised bytes (`*_scan_truncated` meta
+  notes larger streams). The streams also remain ordinary files in the
+  walk (`$LogFile`, `$UsnJrnl:$J`) for raw extraction.
 - **Non-resident $ATTRIBUTE_LIST is untested territory** — resident lists
   (the common case) merge correctly; a fragmented attribute *list* is
   read via its runs but multi-level pathologies may truncate.
