@@ -34,9 +34,19 @@
 //! | 16       | RESUME.DOCX — PK bytes (container-consistent)       |
 //! | 17       | EVIL.DOC — MZ bytes (masquerade)                    |
 //! | 18–19    | orphan chain — bitmap-allocated, no entry set       |
-//! | 20,21,33 | BIGDIR — 12 files + a stray secondary run           |
+//! | 20,21,33 | BIGDIR — 12 files + stray secondary runs            |
 //! | 23–24    | DELCHAIN.BIN — deleted, FAT chain survives          |
 //! | 25       | STRAYBIN's cluster (bitmap clear)                   |
+//! | 26–28    | TRUNCBIN.BIN — deleted; chain truncated vs declared |
+//! | 34       | STRAYCHN's cluster (bitmap clear, FAT link alive)   |
+//! | 35       | bitmap-allocated but FAT-free — unlinked orphan     |
+//! | 36       | STRAYNONAME's cluster (bitmap clear)                |
+//! | 41       | CFDIR — live NoFatChain directory (COFILE.TXT)      |
+//! | 42       | COFILE.TXT data                                     |
+//! | 44       | BADCLUS.BIN — FAT link is 0xFFFFFFF7 (bad cluster)  |
+//! | 45       | ATTRFLG.BIN — RO+hidden+system+archive              |
+//! | 46–49    | WEIRDSZ.BIN — ValidDataLength > DataLength          |
+//! | 50       | VENDORX.BIN — set carries a vendor secondary        |
 
 pub const BPS: usize = 512;
 pub const FAT_SECTOR: usize = 24;
@@ -47,7 +57,7 @@ pub const VOLUME_SECTORS: usize = HEAP_SECTOR + CLUSTER_COUNT as usize; // 228
 pub const EOC: u32 = 0xFFFF_FFFF;
 /// Slots per cluster = 512 / 32.
 pub const SLOTS_PER_CLUSTER: usize = 16;
-pub const ROOT_CLUSTERS: [u32; 3] = [2, 31, 32];
+pub const ROOT_CLUSTERS: [u32; 4] = [2, 31, 32, 51];
 pub const DIR1_CLUSTERS: [u32; 1] = [6];
 pub const BIGDIR_CLUSTERS: [u32; 3] = [20, 21, 33];
 
@@ -69,6 +79,13 @@ fn w32(img: &mut [u8], off: usize, v: u32) {
 }
 fn w64(img: &mut [u8], off: usize, v: u64) {
     img[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+/// Test-facing writers (the bare helpers stay private to this module).
+pub fn w32_pub(img: &mut [u8], off: usize, v: u32) {
+    w32(img, off, v)
+}
+pub fn w64_pub(img: &mut [u8], off: usize, v: u64) {
+    w64(img, off, v)
 }
 
 /// Set a FAT entry.
@@ -216,6 +233,7 @@ pub fn ent_label(img: &mut [u8], off: usize, label: &str) {
 
 /// Write a stray deleted secondary run (stream `0x40` + name `0x41`) with
 /// no primary — as left behind when a deleted set's primary was reused.
+#[allow(clippy::too_many_arguments)]
 pub fn stray_secondary(
     img: &mut [u8],
     clus: &[u32],
@@ -239,6 +257,85 @@ pub fn stray_secondary(
     for (j, u) in units.iter().take(15).enumerate() {
         w16(img, noff + 2 + j * 2, *u);
     }
+}
+
+/// Write a deleted file set whose secondaries are a *vendor* secondary and
+/// a name entry — no stream extension survives (checksum stays valid).
+pub fn deleted_set_no_stream(img: &mut [u8], clus: &[u32], slot: usize, name: &str) {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    assert!(units.len() <= 15);
+    let poff = doff(clus, slot);
+    img[poff] = 0x85;
+    img[poff + 1] = 2; // two secondaries
+    w16(img, poff + 4, 0x20);
+    let voff = doff(clus, slot + 1);
+    img[voff] = 0xE0; // vendor-defined secondary, in-use
+    img[voff + 1] = 0xAB;
+    let noff = doff(clus, slot + 2);
+    img[noff] = 0xC1;
+    for (j, u) in units.iter().enumerate() {
+        w16(img, noff + 2 + j * 2, *u);
+    }
+    let mut bytes = Vec::with_capacity(96);
+    for i in 0..3 {
+        let o = doff(clus, slot + i);
+        bytes.extend_from_slice(&img[o..o + 32]);
+    }
+    w16(img, poff + 2, set_checksum(&bytes));
+    // Deletion clears every in-use bit.
+    for i in 0..3 {
+        let o = doff(clus, slot + i);
+        img[o] &= 0x7F;
+    }
+}
+
+/// Write a live file set that carries an extra vendor-defined secondary
+/// (type `0xE0`) between the stream extension and the name entry.
+pub fn file_set_with_vendor(
+    img: &mut [u8],
+    clus: &[u32],
+    slot: usize,
+    name: &str,
+    fc: u32,
+    valid: u64,
+    dlen: u64,
+) {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    assert!(units.len() <= 15);
+    let poff = doff(clus, slot);
+    img[poff] = 0x85;
+    img[poff + 1] = 3; // stream + vendor + name
+    w16(img, poff + 4, 0x20);
+    let soff = doff(clus, slot + 1);
+    img[soff] = 0xC0;
+    img[soff + 3] = units.len() as u8;
+    w64(img, soff + 8, valid);
+    w32(img, soff + 20, fc);
+    w64(img, soff + 24, dlen);
+    let voff = doff(clus, slot + 2);
+    img[voff] = 0xE0; // vendor-defined secondary — parser must skip it
+    img[voff + 1] = 0xCD;
+    let noff = doff(clus, slot + 3);
+    img[noff] = 0xC1;
+    for (j, u) in units.iter().enumerate() {
+        w16(img, noff + 2 + j * 2, *u);
+    }
+    let mut bytes = Vec::with_capacity(128);
+    for i in 0..4 {
+        let o = doff(clus, slot + i);
+        bytes.extend_from_slice(&img[o..o + 32]);
+    }
+    w16(img, poff + 2, set_checksum(&bytes));
+}
+
+/// Write a single stray deleted secondary (stream only — no name entry).
+pub fn stray_stream_only(img: &mut [u8], clus: &[u32], slot: usize, fc: u32, valid: u64, dlen: u64) {
+    let soff = doff(clus, slot);
+    img[soff] = 0x40;
+    img[soff + 1] = 0x02; // NoFatChain
+    w64(img, soff + 8, valid);
+    w32(img, soff + 20, fc);
+    w64(img, soff + 24, dlen);
 }
 
 /// Bitmap byte value for a set of allocated cluster numbers.
@@ -324,10 +421,21 @@ pub fn build_exfat() -> Vec<u8> {
     set_fat(&mut img, 33, EOC);
     set_fat(&mut img, 23, 24); // DELCHAIN.BIN deleted — links survive
     set_fat(&mut img, 24, EOC);
+    set_fat(&mut img, 26, EOC); // TRUNCBIN.BIN — chain shorter than declared
+    set_fat(&mut img, 34, EOC); // STRAYCHN link survives
+    set_fat(&mut img, 41, EOC); // CFDIR
+    set_fat(&mut img, 42, EOC); // COFILE.TXT
+    set_fat(&mut img, 44, 0xFFFF_FFF7); // BADCLUS.BIN — bad-cluster marker
+    set_fat(&mut img, 45, EOC); // ATTRFLG.BIN
+    set_fat(&mut img, 50, EOC); // VENDORX.BIN
+    set_fat(&mut img, 32, 51); // root dir chain gains a 4th cluster
+    set_fat(&mut img, 51, EOC);
 
     // ---- allocation bitmap (cluster 3) ------------------------------------
     let allocated: &[u32] = &[
         2, 3, 4, 5, 6, 7, 8, 9, 12, 14, 16, 17, 18, 19, 20, 21, 30, 31, 32, 33,
+        35, // allocated but FAT-free — unlinked orphan
+        41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
     ];
     let bm = bitmap_bytes(allocated);
     put_data(&mut img, 3, &bm);
@@ -359,6 +467,16 @@ pub fn build_exfat() -> Vec<u8> {
     put_data(&mut img, 23, b"deleted chain head");
     put_data(&mut img, 24, b"deleted chain tail");
     put_data(&mut img, 25, b"stray secondary data");
+    put_data(&mut img, 26, b"trunccbin surviving head");
+    put_data(&mut img, 27, b"trunccbin contiguous tail A");
+    put_data(&mut img, 28, b"trunccbin contiguous tail B");
+    put_data(&mut img, 34, b"stray chained data");
+    put_data(&mut img, 36, b"noname stray data");
+    put_data(&mut img, 42, b"file inside a contiguous directory");
+    put_data(&mut img, 44, b"bad cluster link data");
+    put_data(&mut img, 45, b"attr flags file");
+    put_data(&mut img, 46, b"weirdsize");
+    put_data(&mut img, 50, b"vendor secondary file");
 
     // ---- root directory (clusters 2, 31, 32) -------------------------------
     let root = &ROOT_CLUSTERS;
@@ -382,13 +500,24 @@ pub fn build_exfat() -> Vec<u8> {
     file_set(&mut img, root, 28, "RESUME.DOCX", 0x20, 16, 32, 512, true, ts, [0, 0], tz, false);
     file_set(&mut img, root, 31, "EVIL.DOC", 0x20, 17, 60, 512, true, ts, [0, 0], tz, false);
     file_set(&mut img, root, 34, "BIGDIR", 0x10, 20, 1536, 1536, false, ts, [0, 0], tz, false);
-    // slot 37: 0x00 end-of-directory marker (already zero)
-    file_set(&mut img, root, 38, "GHOST.TMP", 0x20, 15, 8, 512, true, ts, [0, 0], tz, true);
+    // slot 37 was the end-of-directory marker; live entries now continue
+    // into cluster 51 (slots 38–56), with the EOD at slot 57.
+    file_set(&mut img, root, 38, "ATTRFLG.BIN", 0x27, 45, 15, 512, true, ts, [0, 0], tz, false);
+    file_set(&mut img, root, 41, "WEIRDSZ.BIN", 0x20, 46, 2048, 512, true, ts, [0, 0], tz, false);
+    file_set(&mut img, root, 44, "BADCLUS.BIN", 0x20, 44, 512, 512, false, ts, [0, 0], tz, false);
+    file_set(&mut img, root, 47, "CFDIR", 0x10, 41, 512, 512, true, ts, [0, 0], tz, false);
+    file_set(&mut img, root, 50, "DUPFC", 0x10, 6, 512, 512, false, ts, [0, 0], tz, false);
+    file_set_with_vendor(&mut img, root, 53, "VENDORX.BIN", 50, 22, 512);
+    // slot 57: 0x00 end-of-directory marker (already zero)
+    file_set(&mut img, root, 58, "GHOST.TMP", 0x20, 15, 8, 512, true, ts, [0, 0], tz, true);
+    deleted_set_no_stream(&mut img, root, 61, "NOSTREAM.BIN");
 
     // ---- DIR1 (cluster 6) ---------------------------------------------------
     let d1 = &DIR1_CLUSTERS;
     file_set(&mut img, d1, 0, "INNER.TXT", 0x20, 7, 4, 512, false, ts, [0, 0], tz, false);
     file_set(&mut img, d1, 3, "DELCHAIN.BIN", 0x20, 23, 700, 1024, false, ts, [0, 0], tz, true);
+    file_set(&mut img, d1, 6, "TRUNCBIN.BIN", 0x20, 26, 1500, 1536, false, ts, [0, 0], tz, true);
+    file_set(&mut img, d1, 9, "ZEROFC.BIN", 0x20, 0, 100, 512, true, ts, [0, 0], tz, true);
 
     // ---- BIGDIR (clusters 20, 21, 33) ---------------------------------------
     let bd = &BIGDIR_CLUSTERS;
@@ -402,6 +531,17 @@ pub fn build_exfat() -> Vec<u8> {
     // slot 36: EOD marker (zero)
     // slots 40–41: stray deleted secondary run — primary overwritten
     stray_secondary(&mut img, bd, 40, "STRAYBIN", 25, 64, 512, true);
+    // slots 43–45: stray run with a vendor secondary + FAT-chained stream
+    let voff = doff(bd, 43);
+    img[voff] = 0x60; // stray vendor secondary — salvage skips it
+    img[voff + 1] = 0x77;
+    stray_secondary(&mut img, bd, 44, "STRAYCHN", 34, 19, 512, false);
+    // slot 47: stray stream entry with no name → NONAME fallback
+    stray_stream_only(&mut img, bd, 47, 36, 17, 512);
+
+    // ---- CFDIR (cluster 41, contiguous) ------------------------------------
+    let cf = &[41u32];
+    file_set(&mut img, cf, 0, "COFILE.TXT", 0x20, 42, 35, 512, true, ts, [0, 0], tz, false);
 
     img
 }

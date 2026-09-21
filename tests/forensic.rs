@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use sutram_exfat::ExFatParser;
 use sutram_fs::{
-    DetectConfidence, FsEntry, FsEntryStatus, FsParser, MountOptions, RecoveryState,
+    DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsParser, MountOptions, RecoveryState,
 };
 use sutram_io::ByteSource;
 use sutram_magic::{MagicType, Severity};
@@ -69,7 +69,7 @@ fn info_reports_exfat() {
     assert_eq!(info.uuid.as_deref(), Some("1BAD-B002"));
     assert_eq!(info.block_size, 512);
     assert_eq!(info.total_blocks, 200);
-    assert_eq!(info.free_blocks, Some(180)); // 200 − 20 allocated
+    assert_eq!(info.free_blocks, Some(169)); // 200 − 31 allocated
     assert_eq!(info.meta["boot_checksum_ok"], "true");
     assert_eq!(info.meta["backup_boot_ok"], "true");
     assert_eq!(info.meta["bitmap_present"], "true");
@@ -252,9 +252,13 @@ fn orphans_emitted() {
         .iter()
         .filter(|e| e.path.starts_with("/$ORPHANED/"))
         .collect();
-    assert_eq!(orphans.len(), 1, "{:?}", orphans);
-    let o = orphans[0];
-    assert_eq!(o.name, "chain_18");
+    // chain_18 (linked), chain_35 (unlinked FAT-free), chain_44 (BAD link).
+    assert_eq!(orphans.len(), 3, "{:?}", orphans);
+    let o = orphans
+        .iter()
+        .copied()
+        .find(|e| e.name == "chain_18")
+        .expect("chain_18 orphan");
     // clusters 18,19 contiguous → one merged 1024 B range
     assert_eq!(
         o.allocated_ranges,
@@ -386,4 +390,268 @@ fn no_bitmap_degrades_gracefully() {
     ));
     // Orphans still found via FAT-nonzero fallback.
     assert!(entries.iter().any(|e| e.path.starts_with("/$ORPHANED/")));
+}
+
+#[test]
+fn contiguous_dir_walks() {
+    let entries = all_entries();
+    let e = find(&entries, "CFDIR");
+    assert_eq!(e.kind, EntryKind::Directory);
+    assert_eq!(e.meta["no_fat_chain"], "true");
+    let e = find(&entries, "COFILE.TXT");
+    assert_eq!(e.path, "/CFDIR/COFILE.TXT");
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"file inside a contiguous directory"));
+}
+
+#[test]
+fn attr_flag_meta() {
+    let entries = all_entries();
+    let e = find(&entries, "ATTRFLG.BIN");
+    assert_eq!(e.meta["readonly"], "true");
+    assert_eq!(e.meta["hidden"], "true");
+    assert_eq!(e.meta["system"], "true");
+    assert_eq!(e.meta["archive"], "true");
+}
+
+#[test]
+fn valid_exceeds_data_length_noted() {
+    let entries = all_entries();
+    let e = find(&entries, "WEIRDSZ.BIN");
+    assert_eq!(
+        e.meta["size_note"],
+        "valid_data_length exceeds data_length (corrupt)"
+    );
+}
+
+#[test]
+fn vendor_secondary_skipped() {
+    let entries = all_entries();
+    let e = find(&entries, "VENDORX.BIN");
+    assert_eq!(e.meta["checksum_ok"], "true");
+    assert_eq!(e.name, "VENDORX.BIN");
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"vendor secondary file"));
+}
+
+#[test]
+fn bad_cluster_link_yields_empty_ranges() {
+    let entries = all_entries();
+    let e = find(&entries, "BADCLUS.BIN");
+    // FAT[44] = 0xFFFFFFF7 → the chain is empty; the file reports no extents.
+    assert!(e.allocated_ranges.is_empty());
+}
+
+#[test]
+fn duplicate_dir_first_cluster_scanned_once() {
+    let entries = all_entries();
+    // DUPFC claims DIR1's cluster — it is emitted but not re-scanned.
+    let e = find(&entries, "DUPFC");
+    assert_eq!(e.kind, EntryKind::Directory);
+    let inner: Vec<_> = entries.iter().filter(|e| e.path.contains("INNER.TXT")).collect();
+    assert_eq!(inner.len(), 1);
+    assert_eq!(inner[0].path, "/DIR1/INNER.TXT");
+}
+
+#[test]
+fn deleted_truncated_chain_extends_contiguous() {
+    let entries = all_entries();
+    let e = find(&entries, "TRUNCBIN.BIN");
+    // Declared 3 clusters, FAT chain has 1 → truncation note + contiguous
+    // tail assumption; all three are bitmap-free → Intact.
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    ));
+    let notes: Vec<String> = e
+        .meta
+        .iter()
+        .filter(|(k, _)| k.starts_with("recovery_note"))
+        .map(|(_, v)| v.clone())
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.contains("truncated")),
+        "notes: {notes:?}"
+    );
+    let mut buf = Vec::new();
+    mount().read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), 1500);
+}
+
+#[test]
+fn deleted_no_start_cluster_unrecoverable() {
+    let entries = all_entries();
+    let e = find(&entries, "ZEROFC.BIN");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unrecoverable
+        }
+    ));
+    assert!(e.allocated_ranges.is_empty());
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("no usable start cluster")));
+}
+
+#[test]
+fn deleted_without_stream_unknown() {
+    let entries = all_entries();
+    // Without the stream extension, NameLength is unknown — the entry is
+    // emitted under the conservative NONAME_<offset> fallback.
+    let e = entries
+        .iter()
+        .find(|e| e.meta.get("note").map(|n| n.as_str())
+            == Some("no stream extension survives"))
+        .expect("deleted set without a stream");
+    assert!(e.name.starts_with("NONAME_"));
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unknown
+        }
+    ));
+}
+
+#[test]
+fn stray_chained_and_noname_salvage() {
+    let entries = all_entries();
+    // Stray run with a FAT-chained (not contiguous) stream.
+    let e = find(&entries, "STRAYCHN");
+    assert_eq!(e.path, "/BIGDIR/STRAYCHN");
+    assert!(e.is_deleted());
+    // Stray stream entry with no name → NONAME_<offset> inside BIGDIR.
+    let noname: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name.starts_with("NONAME_") && e.path.starts_with("/BIGDIR/"))
+        .collect();
+    assert_eq!(noname.len(), 1);
+    assert_eq!(noname[0].size, 17);
+}
+
+#[test]
+fn unlinked_allocated_cluster_orphaned() {
+    let entries = all_entries();
+    let o = entries
+        .iter()
+        .find(|e| e.name == "chain_35")
+        .expect("unlinked orphan cluster 35");
+    // FAT[35] = 0 → chain has just this cluster.
+    assert_eq!(
+        o.allocated_ranges,
+        vec![(common::clus_off(35) as u64, 512)]
+    );
+}
+
+#[test]
+fn include_orphans_disabled() {
+    let opts = MountOptions {
+        include_orphans: false,
+        ..MountOptions::default()
+    };
+    let fs = ExFatParser.mount_with(image(), &opts).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(!entries.iter().any(|e| e.path.starts_with("/$ORPHANED/")));
+}
+
+#[test]
+fn mount_rejects_corrupt_bpb() {
+    type Mut = fn(&mut Vec<u8>);
+    let cases: [(&str, Mut); 16] = [
+        ("bad name", |i: &mut Vec<u8>| i[3] = b'X'),
+        ("mustbezero nonzero", |i: &mut Vec<u8>| i[0x0B] = 1),
+        ("bad bps shift", |i: &mut Vec<u8>| i[0x6C] = 8),
+        ("cluster too big", |i: &mut Vec<u8>| i[0x6D] = 20),
+        ("missing 55AA", |i: &mut Vec<u8>| i[510] = 0),
+        ("bad fat count", |i: &mut Vec<u8>| i[0x6E] = 3),
+        ("zero volume", |i: &mut Vec<u8>| common::w64_pub(i, 0x48, 0)),
+        ("fat offset low", |i: &mut Vec<u8>| common::w32_pub(i, 0x50, 10)),
+        ("fat len zero", |i: &mut Vec<u8>| common::w32_pub(i, 0x54, 0)),
+        ("fat too short", |i: &mut Vec<u8>| common::w32_pub(i, 0x54, 1)),
+        ("heap overlaps fat", |i: &mut Vec<u8>| common::w32_pub(i, 0x58, 10)),
+        ("zero clusters", |i: &mut Vec<u8>| common::w32_pub(i, 0x5C, 0)),
+        ("cluster count max", |i: &mut Vec<u8>| common::w32_pub(i, 0x5C, 0xFFFF_FFF6)),
+        ("heap beyond volume", |i: &mut Vec<u8>| common::w64_pub(i, 0x48, 100)),
+        ("root cluster 0", |i: &mut Vec<u8>| common::w32_pub(i, 0x60, 0)),
+        ("root cluster high", |i: &mut Vec<u8>| common::w32_pub(i, 0x60, 202)),
+    ];
+    for (name, mutate) in cases {
+        let mut img = common::build_exfat();
+        mutate(&mut img);
+        let src: Arc<dyn ByteSource> = Arc::new(img);
+        assert!(
+            ExFatParser.mount(src).is_err(),
+            "mount should reject: {name}"
+        );
+    }
+}
+
+#[test]
+fn mount_truncated_image() {
+    // Image cut before the cluster heap → truncated, not a panic.
+    let img = common::build_exfat()[..common::HEAP_SECTOR * common::BPS - 1].to_vec();
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(ExFatParser.mount(src).is_err());
+    // Tiny image → truncated boot read.
+    let src: Arc<dyn ByteSource> = Arc::new(vec![0u8; 100]);
+    assert!(ExFatParser.mount(src).is_err());
+}
+
+#[test]
+fn truncated_heap_walks_partial() {
+    // Cut the image mid-way through HELLO's second cluster: directory
+    // parsing still works, reads emit what is present.
+    let mut img = common::build_exfat();
+    img.truncate(common::clus_off(30) + 256);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    let e = find(&entries, "HELLO.TXT");
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    // The surviving 256 bytes of cluster 30 still serve the 700-byte file.
+    assert_eq!(buf.len(), 700);
+    assert!(buf[512..].starts_with(b"the tail of hello".as_slice()));
+}
+
+#[test]
+fn oversized_bitmap_entry_capped() {
+    let mut img = common::build_exfat();
+    // Bitmap DataLength claims 1 GiB — the loader must cap it.
+    let off = common::doff(&common::ROOT_CLUSTERS, 1);
+    img[off + 24..off + 32].copy_from_slice(&1_000_000_000u64.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    assert_eq!(fs.info().meta["bitmap_present"], "true");
+}
+
+#[test]
+fn bitmap_extension_via_fat_damage() {
+    let mut img = common::build_exfat();
+    // Bitmap claims 2 clusters but FAT[3] = EOC → contiguous extension.
+    let off = common::doff(&common::ROOT_CLUSTERS, 1);
+    img[off + 24..off + 32].copy_from_slice(&1024u64.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    assert_eq!(fs.info().meta["bitmap_present"], "true");
+    // Cluster 4 (upcase) is bitmap-marked allocated in the "extension" —
+    // read whatever the loader produced without panicking.
+    let _ = fs.unallocated_ranges();
+}
+
+#[test]
+fn detect_handles_degenerate_inputs() {
+    // EXFAT name but truncated before the checksum sector.
+    let img = common::build_exfat()[..11 * common::BPS + 100].to_vec();
+    let _ = ExFatParser.detect(&img.as_slice());
+    // EXFAT name, valid bps shift, but no 0x55AA → weak score.
+    let mut img = common::build_exfat();
+    img[510] = 0;
+    let c = ExFatParser.detect(&img.as_slice());
+    assert!(c < DetectConfidence::Certain);
 }

@@ -45,6 +45,13 @@ pub(crate) struct BootSector {
     pub fat_offset: u64,
     /// Byte offset of cluster 2 (cluster-heap start).
     pub heap_offset: u64,
+    /// Total byte length of the mounted source — clamps cluster extents.
+    pub src_len: u64,
+    /// Clusters whose first byte lies inside the source:
+    /// `min(cluster_count, ceil((src_len - heap_offset) / cluster_size))`.
+    /// Bounds allocation sizes and cluster scans — a cluster that does not
+    /// exist in the image can never be read or carved.
+    pub present_clusters: u64,
     /// Backup boot sector (sector 12) carries the exFAT name + signature.
     pub backup_ok: bool,
     /// Main boot-region checksum sector (11) verified.
@@ -55,11 +62,14 @@ pub(crate) struct BootSector {
 
 impl BootSector {
     /// Absolute byte range of cluster `c`, or `None` when out of range.
+    /// The length is clamped to the end of the source, so a partially
+    /// imaged tail cluster reports only its present bytes.
     pub(crate) fn cluster_range(&self, c: u32) -> Option<(u64, u64)> {
         if !self.valid_cluster(c) {
             return None;
         }
-        Some((self.heap_offset + (c as u64 - 2) * self.cluster_size, self.cluster_size))
+        let off = self.heap_offset + (c as u64 - 2) * self.cluster_size;
+        Some((off, self.cluster_size.min(self.src_len.saturating_sub(off))))
     }
 
     /// Cluster index sanity: valid clusters are `2 ..= cluster_count + 1`.
@@ -137,6 +147,31 @@ impl BootSector {
         if cluster_count == 0 {
             return Err(FsError::corrupt(0x5C, "zero clusters"));
         }
+        // Spec §7.1.5: ClusterCount ≤ 2^32 − 11 (FAT addressing limit).
+        // Also keeps `cluster_count + 2` and `first_cluster + n` free of
+        // u32 overflow downstream.
+        if cluster_count > 0xFFFF_FFF5 {
+            return Err(FsError::corrupt(
+                0x5C,
+                format!("cluster count {cluster_count} exceeds the exFAT maximum"),
+            ));
+        }
+        // The FAT must hold ClusterCount + 2 entries (media + EOC marks).
+        if fat_len_s as u64 * bps / 4 < cluster_count as u64 + 2 {
+            return Err(FsError::corrupt(
+                0x54,
+                "FAT too short for the declared cluster count",
+            ));
+        }
+        let spc = 1u64 << spc_shift;
+        // The cluster heap must fit inside the declared volume
+        // (ClusterCount = floor((VolumeLength − ClusterHeapOffset)/spc)).
+        if heap_off_s as u64 + cluster_count as u64 * spc > volume_length {
+            return Err(FsError::corrupt(
+                0x5C,
+                "cluster heap extends beyond the volume length",
+            ));
+        }
         let root_cluster = le::u32(&b, 0x60).unwrap_or(0);
         if root_cluster < 2 || root_cluster as u64 >= cluster_count as u64 + 2 {
             return Err(FsError::corrupt(
@@ -144,7 +179,6 @@ impl BootSector {
                 format!("bad root cluster {root_cluster}"),
             ));
         }
-        let spc = 1u64 << spc_shift;
         let cluster_size = bps * spc;
         let heap_offset = heap_off_s as u64 * bps;
         if heap_offset >= src.len() {
@@ -174,6 +208,10 @@ impl BootSector {
             cluster_size,
             fat_offset: fat_off_s as u64 * bps,
             heap_offset,
+            src_len: src.len(),
+            present_clusters: (src.len() - heap_offset)
+                .div_ceil(cluster_size)
+                .min(cluster_count as u64),
             backup_ok: backup_sector_ok(src, 12, bps),
             checksum_ok: boot_checksum_ok(src, 0, bps),
             backup_checksum_ok: boot_checksum_ok(src, 12, bps),

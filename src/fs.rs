@@ -221,7 +221,9 @@ impl ExFatFs {
                 .saturating_mul(csz)
                 .min(MAX_DIR_BYTES);
             let heap_end = self.bs.heap_offset + self.bs.cluster_count as u64 * csz;
-            let want = want.min(heap_end.saturating_sub(off));
+            let want = want
+                .min(heap_end.saturating_sub(off))
+                .min(self.bs.src_len.saturating_sub(off));
             let chunk = self.src.read_slice(off, want as usize).map_err(FsError::Io)?;
             let got = chunk.len() as u64;
             return Ok((chunk, vec![(0, off, got)]));
@@ -363,9 +365,13 @@ impl ExFatFs {
                             .clone()
                             .map(|n| util::join_path(&path, &n))
                             .unwrap_or_else(|| path.clone());
+                        // Claim the same extent `extents_and_status` uses:
+                        // when ValidDataLength exceeds DataLength the file
+                        // still occupies the larger span — under-claiming
+                        // would report its tail clusters as orphans.
                         self.claim(
                             set.first_cluster,
-                            set.data_len,
+                            set.data_len.max(set.valid_len),
                             set.no_fat_chain,
                             set.is_dir(),
                             &child,
@@ -507,7 +513,10 @@ impl ExFatFs {
                 notes.push(format!("now owned by: {}", owners.join(", ")));
             }
         }
-        let recovered_bytes = (surviving.len() as u64 * csz).min(size.max(total));
+        // Recoverable bytes are capped at the *logical* size: bytes in
+        // surviving clusters beyond ValidDataLength are slack, not file
+        // content — and `recovered_bytes` must never exceed `total_bytes`.
+        let recovered_bytes = (surviving.len() as u64 * csz).min(size);
         let ranges = self.chain_ranges(&surviving);
         let state = if lost.is_empty() && surviving.len() >= needed {
             RecoveryState::Intact

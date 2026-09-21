@@ -451,8 +451,10 @@ impl<'m> Walk<'m> {
     /// Orphan pass: allocated clusters no live or deleted entry claimed.
     /// Each unclaimed chain becomes one entry under `/$ORPHANED/`.
     fn scan_orphans(&mut self) -> Option<Result<FsEntry>> {
-        let count = self.fs.bs.cluster_count;
-        while self.scan_cluster < count + 2 {
+        // Only clusters whose first byte is actually in the image can be
+        // read or carved — the declared count can exceed a partial image.
+        let count = (self.fs.bs.cluster_count as u64).min(self.fs.bs.present_clusters);
+        while (self.scan_cluster as u64) < count + 2 {
             let c = self.scan_cluster;
             self.scan_cluster += 1;
             if !self.fs.allocated(c) || self.claimed.contains(&c) {
