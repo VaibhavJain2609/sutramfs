@@ -7,5 +7,6 @@
 // Each test binary only uses the builders it needs.
 #![allow(dead_code)]
 
+pub mod cpio;
 pub mod tar;
 pub mod zip;

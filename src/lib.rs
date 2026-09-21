@@ -9,8 +9,10 @@
 #![forbid(unsafe_code)]
 
 mod reader;
+pub mod cpio;
 pub mod tar;
 pub mod zip;
 
+pub use cpio::{CpioFs, CpioParser};
 pub use tar::{TarFs, TarParser};
 pub use zip::{ZipFs, ZipParser};
