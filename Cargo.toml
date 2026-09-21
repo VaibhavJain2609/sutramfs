@@ -1,0 +1,28 @@
+[package]
+name = "sutram-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "sutramfs — CLI front-end for the SUTRAM-FS forensic parser family (detect, walk, carve, extract)"
+keywords = ["forensics", "filesystem", "dfir", "cli", "carving"]
+categories = ["command-line-utilities", "filesystem", "parsing"]
+
+[[bin]]
+name = "sutramfs"
+path = "src/main.rs"
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
+sutram-part = { path = "../sutram-part", version = "0.1" }
+sutram-fat = { path = "../sutram-fat", version = "0.1" }
+sutram-exfat = { path = "../sutram-exfat", version = "0.1" }
+sutram-ext4 = { path = "../sutram-ext4", version = "0.1" }
+sutram-btrfs = { path = "../sutram-btrfs", version = "0.1" }
+sutram-f2fs = { path = "../sutram-f2fs", version = "0.1" }
+sutram-xfs = { path = "../sutram-xfs", version = "0.1" }
+sutram-hfs = { path = "../sutram-hfs", version = "0.1" }
+sutram-ntfs = { path = "../sutram-ntfs", version = "0.1" }
+sutram-apfs = { path = "../sutram-apfs", version = "0.1" }

@@ -1,0 +1,26 @@
+sutramfs — SUTRAM-FS forensic filesystem parser CLI
+
+USAGE
+  sutramfs detect  <image> [-p N]                 probe all parsers, show confidences
+  sutramfs parts   <image>                        list MBR/GPT partitions
+  sutramfs android <image>                        Android layout (sparse/super.img/vbmeta/FBE)
+  sutramfs info    <image> [-p N] [-t FS]         mount + show volume summary
+  sutramfs ls      <image> [-p N] [-t FS] [-d] [-o FMT]
+                                                  walk entries (FMT: tree|json|csv|bodyfile)
+  sutramfs cat     <image> <path> [-p N] [-t FS]  extract recoverable data of a file
+  sutramfs carve   <image> [-p N] [-t FS] [--offset O --len L | --unallocated] [--align A]
+                                                  signature-carve free space or a byte range
+
+FLAGS
+  -p, --partition N   scope to partition N (0-based, from `parts`)
+  -t, --type FS       force parser: fat|exfat|ext4|btrfs|f2fs|xfs|hfs|ntfs|apfs
+  -d, --deleted       only deleted/recoverable entries
+  -o, --output FMT    tree (default) | json | csv | bodyfile (mactime)
+  --strict            abort walk on first corruption (default: lenient)
+
+EXAMPLES
+  sutramfs detect disk.dd
+  sutramfs parts disk.dd
+  sutramfs ls disk.dd -p 2 -d -o json > deleted.jsonl
+  sutramfs cat phone.img /data/user/0/com.whatsapp/databases/msgstore.db -p 5
+  sutramfs carve usb.img --unallocated
