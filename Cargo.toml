@@ -1,0 +1,32 @@
+[package]
+name = "sutram-compress"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust decompression codecs for forensic filesystem parsing (LZNT1, LZO1X, LZVN, LZ4, zlib; LZFSE/zstd optional)"
+keywords = ["compression", "decompression", "forensics", "lznt1", "lzvn"]
+categories = ["compression"]
+
+[features]
+default = ["zstd"]
+# Pure-Rust zstd via ruzstd. NOTE: ruzstd 0.9 requires Rust 1.87 — disable
+# default features to keep the strict 1.85 MSRV (zstd then returns
+# CompError::Unsupported).
+zstd = ["dep:ruzstd"]
+# LZFSE decoder — not yet implemented; the feature exists so callers can
+# detect/ask for it. With or without it, lzfse::decompress returns
+# CompError::Unsupported today. See README "Known limitations".
+lzfse = []
+
+[dependencies]
+# Pure-Rust DEFLATE/zlib (already used by sibling parser crates).
+miniz_oxide = "0.9"
+# Pure-Rust LZO1X decompression (btrfs, HFS+ decmpfs type 5/6 era codecs).
+lzokay = { version = "2.0", default-features = false, features = ["decompress", "std"] }
+# Pure-Rust Zstandard. Optional: rust-version 1.87.
+ruzstd = { version = "0.9", optional = true }
+
+[dev-dependencies]
+lzokay = { version = "2.0", default-features = false, features = ["compress", "decompress", "std"] }
+miniz_oxide = { version = "0.9", features = ["with-alloc"] }
