@@ -131,6 +131,21 @@ pub trait FileSystem: Send + Sync {
         r.read(buf).map_err(FsError::Io)
     }
 
+    /// Journal / change-log forensic artefacts as pseudo-entries:
+    /// journaled metadata copies (ext4 jbd2), USN change records (NTFS
+    /// `$UsnJrnl`), log-record headers (NTFS `$LogFile`), transaction
+    /// block-lists (HFS+ journal buffer). These are *prior-state
+    /// evidence* — they are not part of `walk()` and are typically
+    /// emitted with `status` `Deleted{..}` and format-defined meta keys
+    /// (`usn_*`, `jbd2_*`, `hfs_journal_*`, `journal`).
+    ///
+    /// Items are `Result`: corruption yields `Err` records interleaved
+    /// with entries (lenient mode); in strict mode the first error ends
+    /// the stream. Default: the parser exposes no journal — empty.
+    fn journal_entries(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        Box::new(std::iter::empty())
+    }
+
     /// Deleted entries only — a filtered view of `walk`.
     fn deleted_entries(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
         Box::new(self.walk().filter(|item| match item {
