@@ -22,12 +22,17 @@
 //! [`Report::to_markdown`], [`Report::to_html`] (self-contained, no JS,
 //! escaped).
 //!
+//! [`diff::diff`] compares two mounted filesystems keyed by path — added /
+//! removed / modified (size + timestamps + content hash) /
+//! recovery-state transitions — with JSON and plain-text renderings.
+//!
 //! Inherits the forensic contract from the parser layer: read-only,
 //! lenient (walk errors become anomaly records, not panics), and every
 //! number cites the bytes that produced it via `disk_offset`/extents.
 
 #![forbid(unsafe_code)]
 
+pub mod diff;
 mod html;
 pub(crate) mod json;
 mod json_render;
@@ -35,6 +40,7 @@ mod markdown;
 pub mod report;
 mod sha256;
 
+pub use diff::{diff, DeletedChange, DiffOptions, ImageDiff, ModifiedEntry};
 pub use report::{
     generate, Anomaly, Census, DeletedRow, DeletedSection, FileDetail, MagicMismatch, Report,
     ReportOptions, VolumeSummary,
