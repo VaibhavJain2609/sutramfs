@@ -162,8 +162,5 @@ impl SqliteCache {
 
 #[cfg(feature = "cache")]
 fn sqlite_err(e: rusqlite::Error) -> crate::RepError {
-    crate::RepError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        e.to_string(),
-    ))
+    crate::RepError::Io(std::io::Error::other(e.to_string()))
 }

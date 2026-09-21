@@ -356,7 +356,7 @@ impl ReputationService {
             Err(e) => {
                 self.record_pending(hash);
                 return self.report(
-                    &hash,
+                    hash,
                     None,
                     RepVerdict::NotQueried,
                     vec![format!("VT query failed ({e}) — queued for retry")],
@@ -365,17 +365,17 @@ impl ReputationService {
         };
 
         match status {
-            200 => match parse_vt_file_report(&bounded(&body)) {
+            200 => match parse_vt_file_report(bounded(&body)) {
                 Ok(vt) => {
                     self.cache_put(hash, Cached::Found(Box::new(vt.clone())));
                     let verdict = self.cfg.thresholds.classify(&vt);
-                    self.report(&hash, Some(vt), verdict, Vec::new())
+                    self.report(hash, Some(vt), verdict, Vec::new())
                 }
                 Err(e) => {
                     // Got a 200 we couldn't parse — the record exists but
                     // is unusable. Not pending-worthy; the query ran.
                     self.report(
-                        &hash,
+                        hash,
                         None,
                         RepVerdict::Unknown,
                         vec![format!("VT response did not parse: {e}")],
@@ -385,7 +385,7 @@ impl ReputationService {
             404 => {
                 self.cache_put(hash, Cached::NotFound);
                 self.report(
-                    &hash,
+                    hash,
                     None,
                     RepVerdict::Unknown,
                     vec!["VT has no record of this hash (HTTP 404)".to_string()],
@@ -394,7 +394,7 @@ impl ReputationService {
             401 | 403 => {
                 // Auth failure won't fix itself by re-try — not pending.
                 self.report(
-                    &hash,
+                    hash,
                     None,
                     RepVerdict::NotQueried,
                     vec![format!(
@@ -405,7 +405,7 @@ impl ReputationService {
             _ => {
                 self.record_pending(hash);
                 self.report(
-                    &hash,
+                    hash,
                     None,
                     RepVerdict::NotQueried,
                     vec![format!(
@@ -627,7 +627,7 @@ impl ReputationService {
                 body: crate::util::truncate(&resp.body, 2048),
             });
         }
-        let v: serde_json::Value = serde_json::from_str(&bounded(&resp.body))
+        let v: serde_json::Value = serde_json::from_str(bounded(&resp.body))
             .map_err(|e| RepError::Parse(format!("upload response: {e}")))?;
         v.get("data")
             .and_then(|d| d.get("id"))
@@ -693,10 +693,12 @@ pub fn parse_vt_file_report(body: &str) -> Result<VtResult, RepError> {
     let suspicious = as_u32(&stats, "suspicious");
     let malicious = as_u32(&stats, "malicious");
     let undetected = as_u32(&stats, "undetected");
+    // Saturating: hostile JSON can set each counter to u32::MAX — plain
+    // `+` overflows (debug panic / release wrap).
     let timeout = as_u32(&stats, "timeout")
-        + as_u32(&stats, "failure")
-        + as_u32(&stats, "type-unsupported")
-        + as_u32(&stats, "confirmed-timeout");
+        .saturating_add(as_u32(&stats, "failure"))
+        .saturating_add(as_u32(&stats, "type-unsupported"))
+        .saturating_add(as_u32(&stats, "confirmed-timeout"));
 
     let mut detections = Vec::new();
     if let Some(obj) = attrs
@@ -748,7 +750,11 @@ pub fn parse_vt_file_report(body: &str) -> Result<VtResult, RepError> {
         malicious,
         undetected,
         timeout,
-        total_engines: harmless + suspicious + malicious + undetected + timeout,
+        total_engines: harmless
+            .saturating_add(suspicious)
+            .saturating_add(malicious)
+            .saturating_add(undetected)
+            .saturating_add(timeout),
         threat_label,
         meaningful_name: attrs
             .get("meaningful_name")

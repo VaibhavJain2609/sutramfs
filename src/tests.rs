@@ -112,9 +112,11 @@ impl HttpTransport for MockTransport {
 }
 
 fn service_with(mock: MockTransport) -> ReputationService {
-    let mut cfg = RepConfig::default();
-    cfg.api_key = Some("test-key".to_string());
-    cfg.requests_per_minute = 0; // unlimited — tests shouldn't sleep
+    let cfg = RepConfig {
+        api_key: Some("test-key".to_string()),
+        requests_per_minute: 0, // unlimited — tests shouldn't sleep
+        ..RepConfig::default()
+    };
     ReputationService::with_transport(cfg, Box::new(mock))
 }
 
@@ -324,8 +326,10 @@ fn http_error_status_still_classified() {
             "err-status"
         }
     }
-    let mut cfg = RepConfig::default();
-    cfg.requests_per_minute = 0;
+    let cfg = RepConfig {
+        requests_per_minute: 0,
+        ..RepConfig::default()
+    };
     let svc = ReputationService::with_transport(cfg, Box::new(ErrStatus(404)));
     assert_eq!(svc.lookup(SHA).verdict, RepVerdict::Unknown);
     // And it was negatively cached.
@@ -349,8 +353,10 @@ fn transport_failure_records_pending() {
             "failing"
         }
     }
-    let mut cfg = RepConfig::default();
-    cfg.requests_per_minute = 0;
+    let cfg = RepConfig {
+        requests_per_minute: 0,
+        ..RepConfig::default()
+    };
     let svc = ReputationService::with_transport(cfg, Box::new(Failing));
     let rep = svc.lookup(SHA);
     assert_eq!(rep.verdict, RepVerdict::NotQueried);
@@ -642,8 +648,10 @@ fn submit_file_refused_without_allow_uploads() {
 
 #[test]
 fn submit_file_refused_offline_even_when_allowed() {
-    let mut cfg = RepConfig::default();
-    cfg.allow_uploads = true;
+    let cfg = RepConfig {
+        allow_uploads: true,
+        ..RepConfig::default()
+    };
     let svc = ReputationService::new(cfg); // no transport
     let err = svc.submit_file("evil.exe", b"MZ").unwrap_err();
     assert!(matches!(err, RepError::Unsupported(_)));
@@ -655,9 +663,11 @@ fn submit_file_happy_path_with_explicit_opt_in() {
         200,
         r#"{"data":{"id":"analysis-42","type":"analysis"}}"#.to_string(),
     ));
-    let mut cfg = RepConfig::default();
-    cfg.allow_uploads = true;
-    cfg.requests_per_minute = 0;
+    let cfg = RepConfig {
+        allow_uploads: true,
+        requests_per_minute: 0,
+        ..RepConfig::default()
+    };
     let svc = ReputationService::with_transport(cfg, Box::new(mock));
     let id = svc.submit_file("evil.exe", b"MZ").unwrap();
     assert_eq!(id, "analysis-42");
@@ -699,4 +709,226 @@ fn service_uses_disk_cache() {
     // Second lookup hits a cache layer (mem mirrors disk).
     let b = svc.lookup(SHA);
     assert_eq!(b.verdict, RepVerdict::Malicious);
+}
+
+#[test]
+fn vt_stats_counters_saturate_not_overflow() {
+    // Hostile JSON: every counter near u32::MAX — parse must not panic.
+    let body = r#"{"data":{"id":"aa","attributes":{"last_analysis_stats":{
+        "harmless":4294967295,"suspicious":4294967295,"malicious":4294967295,
+        "undetected":4294967295,"timeout":4294967295,"failure":4294967295,
+        "type-unsupported":4294967295,"confirmed-timeout":4294967295},
+        "sha256":"aa"}}}"#;
+    let vt = crate::vt::parse_vt_file_report(body).unwrap();
+    assert_eq!(vt.total_engines, u32::MAX);
+    assert_eq!(vt.timeout, u32::MAX);
+}
+
+#[test]
+fn null_sandbox_reports_unsupported() {
+    use crate::sandbox::{NullSandbox, SandboxProvider};
+    let sb = NullSandbox;
+    assert_eq!(sb.name(), "null");
+    assert!(matches!(sb.submit_hash(SHA), Err(RepError::Unsupported(_))));
+    assert!(matches!(
+        sb.submit_file("a.exe", b"MZ"),
+        Err(RepError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn rep_error_display_variants() {
+    assert!(RepError::Transport("t".into())
+        .to_string()
+        .contains("transport"));
+    assert!(RepError::Http {
+        status: 404,
+        body: "x".repeat(500)
+    }
+    .to_string()
+    .contains("HTTP 404"));
+    assert!(RepError::Parse("p".into()).to_string().contains("parse"));
+    assert!(RepError::Unsupported("u".into())
+        .to_string()
+        .contains("unsupported"));
+    assert!(RepError::InvalidInput("i".into())
+        .to_string()
+        .contains("invalid input"));
+    assert!(RepError::Io(std::io::Error::other("o"))
+        .to_string()
+        .contains("io error"));
+}
+
+#[test]
+fn util_helpers_edges() {
+    use crate::util::{normalize_hash, truncate};
+    assert_eq!(truncate("short", 10), "short");
+    assert_eq!(truncate("averylongstring", 5), "aver…");
+    assert_eq!(truncate("héllo wörld", 6), "héllo…");
+    // normalize: trim, lowercase, hex validation, MD5/SHA1/SHA256 lengths.
+    assert_eq!(normalize_hash(&SHA.to_uppercase()).as_deref(), Some(SHA));
+    assert_eq!(
+        normalize_hash("d41d8cd98f00b204e9800998ecf8427e").as_deref(),
+        Some("d41d8cd98f00b204e9800998ecf8427e")
+    );
+    assert_eq!(
+        normalize_hash("da39a3ee5e6b4b0d3255bfef95601890afd80709").as_deref(),
+        Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    );
+    assert!(normalize_hash("zz").is_none());
+    assert!(normalize_hash(&SHA[..63]).is_none());
+    assert!(normalize_hash("").is_none());
+}
+
+#[test]
+fn verdict_thresholds_and_tally() {
+    use crate::report::{VerdictThresholds, VtResult};
+    let mut vt = VtResult {
+        sha256: SHA.into(),
+        md5: None,
+        harmless: 60,
+        suspicious: 0,
+        malicious: 0,
+        undetected: 10,
+        timeout: 2,
+        total_engines: 72,
+        threat_label: None,
+        meaningful_name: None,
+        reputation_score: None,
+        first_submission: None,
+        last_analysis: None,
+        detections: Vec::new(),
+    };
+    assert_eq!(
+        VerdictThresholds::default().classify(&vt),
+        RepVerdict::Clean
+    );
+    vt.malicious = 5;
+    assert_eq!(
+        VerdictThresholds::default().classify(&vt),
+        RepVerdict::Malicious
+    );
+    vt.malicious = 0;
+    vt.suspicious = 1;
+    assert_eq!(
+        VerdictThresholds::default().classify(&vt),
+        RepVerdict::Suspicious
+    );
+    vt.total_engines = 0;
+    vt.suspicious = 0;
+    assert_eq!(
+        VerdictThresholds::default().classify(&vt),
+        RepVerdict::Unknown
+    );
+    // Display for verdicts.
+    assert_eq!(RepVerdict::NotQueried.to_string(), "not queried");
+}
+
+#[test]
+fn report_reason_phrases() {
+    // Each verdict/label combination yields a distinct, explainable phrase.
+    let mk = |mal: u32, sus: u32, label: Option<&str>| {
+        format!(
+            r#"{{"data":{{"id":"{SHA}","attributes":{{"sha256":"{SHA}",
+            "last_analysis_stats":{{"harmless":60,"suspicious":{sus},
+            "malicious":{mal},"undetected":10}}
+            {}}}}}}}"#,
+            label
+                .map(|l| format!(
+                    r#","popular_threat_classification":{{"suggested_threat_label":"{l}"}}"#
+                ))
+                .unwrap_or_default()
+        )
+    };
+    let svc = service_with(MockTransport::new((200, mk(10, 0, Some("trojan.x")))));
+    let r = svc.lookup(SHA);
+    assert!(r.reasons.iter().any(|s| s.contains("trojan.x")));
+    let svc = service_with(MockTransport::new((200, mk(10, 0, None))));
+    let r = svc.lookup(SHA);
+    assert!(r.reasons.iter().any(|s| s.contains("malicious")));
+    let svc = service_with(MockTransport::new((200, mk(0, 3, None))));
+    let r = svc.lookup(SHA);
+    assert!(r
+        .reasons
+        .iter()
+        .any(|s| s.contains("below malicious threshold")));
+    assert!(r.reasons.iter().any(|s| s.contains("suspicious")));
+}
+
+#[test]
+fn submit_file_non_200_returns_http_error() {
+    let mock = MockTransport::new((500, "server exploded".to_string()));
+    let svc = ReputationService::with_transport(
+        RepConfig {
+            allow_uploads: true,
+            requests_per_minute: 0,
+            ..RepConfig::default()
+        },
+        Box::new(mock),
+    );
+    match svc.submit_file("e.exe", b"MZ") {
+        Err(RepError::Http { status, body }) => {
+            assert_eq!(status, 500);
+            assert_eq!(body, "server exploded");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn submit_file_unparseable_response() {
+    let mock = MockTransport::new((200, "not json".to_string()));
+    let svc = ReputationService::with_transport(
+        RepConfig {
+            allow_uploads: true,
+            requests_per_minute: 0,
+            ..RepConfig::default()
+        },
+        Box::new(mock),
+    );
+    assert!(matches!(
+        svc.submit_file("e.exe", b"MZ"),
+        Err(RepError::Parse(_))
+    ));
+}
+
+#[test]
+fn decode_pending_roundtrip_and_rejects() {
+    use crate::vt::{decode_pending, encode_pending};
+    let hashes = vec![SHA.to_string()];
+    let json = encode_pending(&hashes);
+    assert_eq!(decode_pending(&json).unwrap(), hashes);
+    assert!(decode_pending("not json").is_err());
+    assert!(decode_pending(r#"{"format":"other","hashes":[]}"#).is_err());
+}
+
+#[test]
+fn mem_cache_evict_expired() {
+    let svc = ReputationService::new(RepConfig {
+        ttl: Duration::from_secs(0),
+        ..RepConfig::default()
+    });
+    svc.lookup(SHA); // pending-recorded, offline
+    svc.evict_expired(); // must not panic or wedge
+    assert_eq!(svc.pending_hashes().len(), 1);
+}
+
+#[test]
+fn rate_limiter_blocking_and_try_acquire() {
+    use crate::ratelimit::{RateLimiter, TokenBucket};
+    use std::time::Instant;
+    // try_acquire drains the burst, then refuses.
+    let rl = RateLimiter::new(1);
+    assert!(rl.try_acquire());
+    assert!(!rl.try_acquire());
+    // TokenBucket: available/time_until_ready on the injected clock.
+    let mut b = TokenBucket::new(1);
+    let t0 = Instant::now();
+    assert_eq!(b.available(t0), 1.0);
+    assert!(b.try_take(t0));
+    let wait = b.time_until_ready(t0);
+    assert!(wait > Duration::from_secs(0) && wait <= Duration::from_secs(60));
+    // Refill restores readiness after the period.
+    let t1 = t0 + Duration::from_secs(61);
+    assert!(b.try_take(t1));
 }
