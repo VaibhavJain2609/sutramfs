@@ -21,5 +21,6 @@
 #![forbid(unsafe_code)]
 
 pub mod common;
+pub mod lnk;
 
 pub use common::{ArtifactTimestamp as FsTimestamp, Error, Result};
