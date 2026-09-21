@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sutram_io::ByteSource;
 
 use crate::fbe::{find_crypt_footer, CRYPT_FOOTER_OFFSET, CRYPT_FTR_MAGIC};
-use crate::names::{classify_name, has_slot_suffix, split_slot_suffix, PartitionRole};
+use crate::names::{classify_name, has_slot_suffix, notable_flag, split_slot_suffix, PartitionRole};
 use crate::sparse::{inspect_sparse, is_android_sparse, open_sparse};
 use crate::vbmeta::{self, DmVerityState, VbmetaDescriptor};
 
@@ -460,4 +460,427 @@ fn vbmeta_pubkey_size_field_not_offset() {
     w64be(&mut img, 72, 4096); // public_key_offset only
     let info = vbmeta::parse(&img.as_slice()).unwrap();
     assert!(!info.has_public_key);
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustive enum/classification batteries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partition_role_full_table() {
+    use crate::names::PartitionRole::*;
+    let cases: &[(&str, PartitionRole)] = &[
+        ("boot", Boot), ("boot_a", Boot), ("Boot_A", Boot),
+        ("recovery", Recovery),
+        ("init_boot", InitBoot), ("init_boot_b", InitBoot),
+        ("vendor_boot", VendorBoot), ("vendor_kernel_boot", VendorBoot),
+        ("vbmeta", Vbmeta), ("vbmeta_system", Vbmeta),
+        ("vbmeta_vendor", Vbmeta), ("vbmeta_vendor_dlkm", Vbmeta),
+        ("vbmeta_system_dlkm", Vbmeta),
+        ("dtbo", Dtbo), ("dtbo_a", Dtbo),
+        ("super", Super), ("SUPER", Super),
+        ("system", System), ("system_ext", System), ("system_other", System),
+        ("vendor", Vendor), ("vendor_other", Vendor),
+        ("product", Product), ("odm", Odm),
+        ("vendor_dlkm", Dlkm), ("system_dlkm", Dlkm), ("odm_dlkm", Dlkm), ("dlkm", Dlkm),
+        ("userdata", Userdata), ("data", Userdata), ("userdata_orig", Userdata),
+        ("metadata", Metadata),
+        ("persist", Persist), ("persistbak", Persist), ("persist_backup", Persist),
+        ("cache", Cache), ("misc", Misc),
+        ("modem", Modem), ("radio", Modem), ("modemst1", Modem),
+        ("modemst2", Modem), ("fsg", Modem), ("modem_a", Modem),
+        ("md1img", Modem), ("mdm1m9kefs1", Modem),
+        ("frp", Frp),
+        ("splash", Logo), ("logo", Logo), ("bootlogo", Logo), ("imagefv", Logo),
+        // Bootloader-chain prefix families.
+        ("xbl", Bootloader), ("xbl_2", Bootloader), ("aboot", Bootloader),
+        ("sbl1", Bootloader), ("bl31", Bootloader), ("bl2", Bootloader),
+        ("tz", Bootloader), ("hyp", Bootloader), ("aop", Bootloader),
+        ("cmnlib", Bootloader), ("keymaster", Bootloader),
+        ("lksecapp", Bootloader), ("uefi", Bootloader), ("pvmfw", Bootloader),
+        ("mcupm", Bootloader), ("tee", Bootloader), ("gz", Bootloader),
+        ("scp", Bootloader), ("spmfw", Bootloader), ("sspm", Bootloader),
+        ("preloader", Bootloader), ("lk", Bootloader),
+        // Prefix-shaped names that are NOT bootloader blobs.
+        ("lkpick", Other), ("gizmo", Other), ("home", Other),
+        ("vendorise", Other), ("mystery", Other),
+    ];
+    for (name, want) in cases {
+        assert_eq!(classify_name(name), *want, "{name}");
+        assert!(!classify_name(name).as_str().is_empty(), "{name}");
+    }
+    // as_str round-trips every variant.
+    for role in [
+        Boot, Recovery, InitBoot, VendorBoot, Vbmeta, Dtbo, Super, System,
+        Vendor, Product, Odm, Dlkm, Userdata, Metadata, Persist, Cache, Misc,
+        Modem, Frp, Logo, Bootloader, Other,
+    ] {
+        assert!(!role.as_str().is_empty());
+    }
+    // split_slot_suffix edges.
+    assert_eq!(split_slot_suffix("boot_a"), ("boot", Some('a')));
+    assert_eq!(split_slot_suffix("vendor_boot"), ("vendor_boot", None));
+    assert_eq!(split_slot_suffix("ab"), ("ab", None));
+    assert_eq!(split_slot_suffix("x"), ("x", None));
+    assert_eq!(split_slot_suffix("boot_"), ("boot_", None));
+    assert_eq!(split_slot_suffix("boot_1"), ("boot_1", None));
+    assert!(has_slot_suffix("system_b"));
+    assert!(!has_slot_suffix("system"));
+    // notable_flag arms.
+    assert!(notable_flag("metadata").unwrap().contains("metadata"));
+    assert!(notable_flag("frp").unwrap().contains("frp"));
+    assert!(notable_flag("boot").is_none());
+    assert!(notable_flag("mystery").is_none());
+}
+
+#[test]
+fn enum_label_arms() {
+    use crate::layout::ContainerKind;
+    for k in [
+        ContainerKind::Sparse,
+        ContainerKind::Super,
+        ContainerKind::Raw,
+        ContainerKind::Gpt,
+        ContainerKind::Mbr,
+    ] {
+        assert!(!k.as_str().is_empty());
+    }
+    assert_eq!(crate::CryptoKind::CryptFooter.as_str(), "crypt_footer");
+    assert_eq!(
+        crate::CryptoKind::MetadataPartition.as_str(),
+        "metadata_partition"
+    );
+    assert_eq!(DmVerityState::Enabled.as_str(), "enabled");
+    assert_eq!(DmVerityState::HashtreeDisabled.as_str(), "hashtree_disabled");
+    assert_eq!(
+        DmVerityState::VerificationDisabled.as_str(),
+        "verification_disabled"
+    );
+    // VbmetaDescriptor::partition_name — only partition-bound kinds Some.
+    assert_eq!(
+        VbmetaDescriptor::Property {
+            key: "k".into(),
+            value: vec![]
+        }
+        .partition_name(),
+        None
+    );
+    assert_eq!(
+        VbmetaDescriptor::KernelCmdline {
+            flags: 0,
+            cmdline: String::new()
+        }
+        .partition_name(),
+        None
+    );
+    // Attrs bits.
+    let a = crate::Attrs(crate::Attrs::READONLY | crate::Attrs::SLOT_SUFFIXED | crate::Attrs::UPDATED | crate::Attrs::DISABLED);
+    assert!(a.readonly() && a.slot_suffixed() && a.updated() && a.disabled());
+    assert!(!crate::Attrs::NONE.readonly());
+}
+
+#[test]
+fn sparse_header_validation_arms() {
+    use crate::sparse::read_header;
+    use crate::sparse::SPARSE_MAGIC;
+    // Truncated below 28 bytes.
+    assert!(read_header(&vec![0u8; 16].as_slice()).is_err());
+    // Missing magic.
+    assert!(read_header(&vec![0u8; 64].as_slice()).is_err());
+    let hdr = |f: &dyn Fn(&mut [u8])| -> Vec<u8> {
+        let mut h = vec![0u8; 64];
+        w32(&mut h, 0, SPARSE_MAGIC);
+        w16(&mut h, 8, 28);
+        w16(&mut h, 10, 12);
+        w32(&mut h, 12, 4096);
+        w32(&mut h, 16, 1);
+        w32(&mut h, 20, 0);
+        f(&mut h);
+        h
+    };
+    // file_hdr_sz too small.
+    assert!(read_header(&hdr(&|h| w16(h, 8, 8))).is_err());
+    // chunk_hdr_sz too small.
+    assert!(read_header(&hdr(&|h| w16(h, 10, 4))).is_err());
+    // block size zero / oversized.
+    assert!(read_header(&hdr(&|h| w32(h, 12, 0))).is_err());
+    assert!(read_header(&hdr(&|h| w32(h, 12, 1 << 30))).is_err());
+    // Header alone is fine (zero chunks).
+    assert!(read_header(&hdr(&|_| {})).is_ok());
+}
+
+#[test]
+fn sparse_open_and_inspect_arms() {
+    use crate::sparse::{open_sparse, inspect_sparse};
+    // RAW chunk declares 4 blocks but only 512 bytes of payload exist:
+    // the decoder maps the declared extent → open_sparse catches the
+    // out-of-backing read *up front*.
+    let mut img = Vec::new();
+    img.extend_from_slice(&{
+        let mut h = [0u8; 28];
+        w32(&mut h, 0, 0xED26_FF3A);
+        w16(&mut h, 8, 28);
+        w16(&mut h, 10, 12);
+        w32(&mut h, 12, 4096);
+        w32(&mut h, 16, 4);
+        w32(&mut h, 20, 1);
+        h
+    });
+    img.extend_from_slice(&{
+        let mut c = [0u8; 12];
+        w16(&mut c, 0, 0xCAC1); // RAW
+        w32(&mut c, 4, 4); // 4 output blocks
+        w32(&mut c, 8, 12 + 4 * 4096); // claims 4 blocks of payload
+        c
+    });
+    img.extend_from_slice(&[0xAAu8; 512]); // only 512 B of actual payload
+    assert!(open_sparse(src(img)).is_err());
+
+    // Declared total_blks disagrees with the decoded size → warning.
+    let mut img = Vec::new();
+    img.extend_from_slice(&{
+        let mut h = [0u8; 28];
+        w32(&mut h, 0, 0xED26_FF3A);
+        w16(&mut h, 8, 28);
+        w16(&mut h, 10, 12);
+        w32(&mut h, 12, 4096);
+        w32(&mut h, 16, 9); // declares 9 blocks
+        w32(&mut h, 20, 1);
+        h
+    });
+    img.extend_from_slice(&{
+        let mut c = [0u8; 12];
+        w16(&mut c, 0, 0xCAC3); // DONT_CARE
+        w32(&mut c, 4, 1);
+        w32(&mut c, 8, 12);
+        c
+    });
+    let (_sf, _h, w) = inspect_sparse(src(img)).unwrap();
+    assert!(w.iter().any(|m| m.contains("decoded size")), "{w:?}");
+}
+
+#[test]
+fn sparse_chunk_table_warnings() {
+    use crate::sparse::inspect_sparse;
+    // A FILL chunk with a non-4-byte payload → tolerated by the decoder,
+    // flagged by the chunk-table audit.
+    let mk = |chunks: &[(u16, u32, Vec<u8>)]| -> Vec<u8> {
+        let mut img = Vec::new();
+        img.extend_from_slice(&{
+            let mut h = [0u8; 28];
+            w32(&mut h, 0, 0xED26_FF3A);
+            w16(&mut h, 8, 28);
+            w16(&mut h, 10, 12);
+            w32(&mut h, 12, 4096);
+            w32(&mut h, 16, chunks.iter().map(|c| c.1).sum());
+            w32(&mut h, 20, chunks.len() as u32);
+            h
+        });
+        for (t, n, p) in chunks {
+            let mut c = [0u8; 12];
+            w16(&mut c, 0, *t);
+            w32(&mut c, 4, *n);
+            w32(&mut c, 8, 12 + p.len() as u32);
+            img.extend_from_slice(&c);
+            img.extend_from_slice(p);
+        }
+        img
+    };
+    let img = mk(&[(0xCAC2, 1, vec![0u8; 8])]); // FILL with 8-byte payload
+    let (_sf, _h, w) = inspect_sparse(src(img)).unwrap();
+    assert!(w.iter().any(|m| m.contains("0xcac2")), "{w:?}");
+
+    // 40 malformed chunks → the warning list is capped and counted.
+    let chunks: Vec<(u16, u32, Vec<u8>)> =
+        (0..40).map(|_| (0xCAC2u16, 1u32, vec![0u8; 8])).collect();
+    let img = mk(&chunks);
+    let (_sf, _h, w) = inspect_sparse(src(img)).unwrap();
+    assert_eq!(w.len(), 33, "{w:?}"); // 32 + suppressed note
+    assert!(w.last().unwrap().contains("suppressed"), "{w:?}");
+
+    // RAW chunk carrying more payload than declared → "disagree" note.
+    let img = mk(&[(0xCAC1, 1, vec![0u8; 8192])]);
+    let (_sf, _h, w) = inspect_sparse(src(img)).unwrap();
+    assert!(w.iter().any(|m| m.contains("0xcac1")), "{w:?}");
+}
+
+#[test]
+fn lp_geometry_and_metadata_arms() {
+    use crate::lp::{read_geometry, read_metadata};
+    let super_img = || -> Vec<u8> { vec![0u8; 0x40000] };
+    // Nothing at either geometry offset.
+    assert!(read_geometry(&super_img().as_slice()).is_err());
+    // Bad struct_size at primary → backup tried (also bad here) → Err.
+    let mut img = super_img();
+    w32(&mut img[0x1000..], 0, 0x616C_4467);
+    w32(&mut img[0x1000..], 4, 99); // struct_size != 52
+    assert!(read_geometry(&img.as_slice()).is_err());
+    // Valid backup geometry at 0x2000 rescues a corrupt primary.
+    let mut img = super_img();
+    let mut g = [0u8; 52];
+    w32(&mut g, 0, 0x616C_4467);
+    w32(&mut g, 4, 52);
+    w32(&mut g, 40, 65536);
+    w32(&mut g, 44, 2);
+    w32(&mut g, 48, 4096);
+    let mut tmp = g;
+    tmp[8..40].fill(0);
+    g[8..40].copy_from_slice(&crate::sha256::sha256(&tmp));
+    img[0x1000..0x1000 + 52].copy_from_slice(&[0xEEu8; 52]); // broken primary
+    img[0x2000..0x2000 + 52].copy_from_slice(&g);
+    let geo = read_geometry(&img.as_slice()).unwrap();
+    assert_eq!(geo.offset, 0x2000);
+    // Implausible slot count.
+    let mut img = super_img();
+    let mut g2 = g;
+    w32(&mut g2, 44, 0); // slot_count = 0
+    img[0x1000..0x1000 + 52].copy_from_slice(&g2);
+    assert!(read_geometry(&img.as_slice()).is_err());
+    let mut img = super_img();
+    let mut g3 = g;
+    w32(&mut g3, 44, 9999);
+    img[0x1000..0x1000 + 52].copy_from_slice(&g3);
+    assert!(read_geometry(&img.as_slice()).is_err());
+    // metadata_max_size not sector-aligned.
+    let mut img = super_img();
+    let mut g4 = g;
+    w32(&mut g4, 40, 513);
+    img[0x1000..0x1000 + 52].copy_from_slice(&g4);
+    assert!(read_geometry(&img.as_slice()).is_err());
+    // No readable metadata slot → the collected-error message.
+    let mut img = super_img();
+    img[0x1000..0x1000 + 52].copy_from_slice(&g);
+    img[0x2000..0x2000 + 52].copy_from_slice(&g);
+    let e = read_metadata(&img.as_slice()).unwrap_err();
+    assert!(e.to_string().contains("no readable LP metadata slot"), "{e}");
+}
+
+#[test]
+fn vbmeta_parse_warning_arms() {
+    // Unaligned aux size → warning (still parses).
+    let mut blob = vec![0u8; 512];
+    blob[0..4].copy_from_slice(b"AVB0");
+    w64be(&mut blob, 20, 72); // aux_size not 64-aligned
+    blob.resize(512, 0);
+    let info = vbmeta::parse_at(&blob.as_slice(), 0, None).unwrap();
+    assert!(info.warnings.iter().any(|w| w.contains("aligned")));
+    // Total size beyond the cap → hard error.
+    let mut blob = vec![0u8; 512];
+    blob[0..4].copy_from_slice(b"AVB0");
+    w64be(&mut blob, 20, u64::MAX);
+    assert!(vbmeta::parse_at(&blob.as_slice(), 0, None).is_err());
+    // Blob extends past the source → warning.
+    let mut blob = vec![0u8; 512];
+    blob[0..4].copy_from_slice(b"AVB0");
+    w64be(&mut blob, 20, 1 << 20);
+    let info = vbmeta::parse_at(&blob.as_slice(), 0, None).unwrap();
+    assert!(info.warnings.iter().any(|w| w.contains("past end")));
+    // hash/sig range past the auth block → warning.
+    let mut blob = vec![0u8; 512];
+    blob[0..4].copy_from_slice(b"AVB0");
+    w64be(&mut blob, 12, 64); // auth_size 64
+    w64be(&mut blob, 32, 8); // hash_offset
+    w64be(&mut blob, 40, 0x100); // hash_size runs past
+    let info = vbmeta::parse_at(&blob.as_slice(), 0, None).unwrap();
+    assert!(info
+        .warnings
+        .iter()
+        .any(|w| w.contains("authentication block")));
+    // Descriptor region past aux → warning + no descriptors.
+    let mut blob = vec![0u8; 512];
+    blob[0..4].copy_from_slice(b"AVB0");
+    w64be(&mut blob, 20, 64);
+    w64be(&mut blob, 96, 32);
+    w64be(&mut blob, 104, 0x1000);
+    let info = vbmeta::parse_at(&blob.as_slice(), 0, None).unwrap();
+    assert!(info
+        .warnings
+        .iter()
+        .any(|w| w.contains("auxiliary block")));
+    // Truncated header → error.
+    assert!(vbmeta::parse_at(&vec![0u8; 32].as_slice(), 0, None).is_err());
+    // Missing magic.
+    assert!(vbmeta::parse_at(&vec![0u8; 512].as_slice(), 0, None).is_err());
+}
+
+#[test]
+fn vbmeta_descriptor_variants() {
+    // CHAIN_PARTITION descriptor.
+    let mut d = Vec::new();
+    d.extend_from_slice(&4u64.to_be_bytes());
+    let mut p = vec![0u8; 76];
+    w32be(&mut p, 0, 5); // rollback_index_location
+    w32be(&mut p, 4, 4); // name_len
+    w32be(&mut p, 8, 128); // pubkey len
+    w32be(&mut p, 12, 1); // flags
+    p.extend_from_slice(b"sys\0");
+    let nbytes = p.len().next_multiple_of(8) as u64;
+    p.resize(nbytes as usize, 0);
+    d.extend_from_slice(&nbytes.to_be_bytes());
+    d.extend_from_slice(&p);
+    // UNKNOWN descriptor.
+    d.extend_from_slice(&0xDEADu64.to_be_bytes());
+    d.extend_from_slice(&8u64.to_be_bytes());
+    d.extend_from_slice(&[0xAAu8; 8]);
+    let info = vbmeta::parse_at(&vbmeta_image(0, 0, &d).as_slice(), 0, None).unwrap();
+    assert_eq!(info.descriptors.len(), 2);
+    match &info.descriptors[0] {
+        VbmetaDescriptor::ChainPartition {
+            partition_name,
+            rollback_index_location,
+            public_key_len,
+            flags,
+        } => {
+            assert_eq!(partition_name, "sys");
+            assert_eq!(*rollback_index_location, 5);
+            assert_eq!(*public_key_len, 128);
+            assert_eq!(*flags, 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        info.descriptors[1],
+        VbmetaDescriptor::Unknown { tag: 0xDEAD, len: 8 }
+    ));
+    assert_eq!(info.descriptors[0].partition_name(), Some("sys"));
+    // Trailing non-zero bytes → padding warning.
+    let mut d = Vec::new();
+    d.extend_from_slice(&0xDEADu64.to_be_bytes());
+    d.extend_from_slice(&8u64.to_be_bytes());
+    d.extend_from_slice(&[0xAAu8; 8]);
+    d.extend_from_slice(&[0x55u8; 8]); // nonzero trailing bytes
+    let info = vbmeta::parse_at(&vbmeta_image(0, 0, &d).as_slice(), 0, None).unwrap();
+    assert!(info
+        .warnings
+        .iter()
+        .any(|w| w.contains("trailing non-descriptor")));
+    // has_hash / has_signature / has_public_key reporting.
+    let mut blob = vbmeta_image(0, 0, &[]);
+    w64be(&mut blob, 12, 128); // auth block
+    w64be(&mut blob, 40, 32); // hash_size
+    w64be(&mut blob, 56, 256); // sig_size
+    w64be(&mut blob, 64, 1024); // pubkey_size
+    blob.resize(256 + 128 + 64, 0);
+    let info = vbmeta::parse_at(&blob.as_slice(), 0, None).unwrap();
+    assert!(info.has_hash && info.has_signature && info.has_public_key);
+}
+
+#[test]
+fn vbmeta_footer_scan_edges() {
+    // Too small to hold a footer.
+    assert!(vbmeta::parse_footer(&vec![0u8; 32].as_slice()).unwrap().is_none());
+    // No AVBf magic in the tail.
+    assert!(vbmeta::parse_footer(&vec![0u8; 8192].as_slice()).unwrap().is_none());
+    // Footer magic present → decoded.
+    let mut img = vec![0u8; 8192];
+    img[8192 - 64..8192 - 60].copy_from_slice(b"AVBf");
+    w32be(&mut img, 8192 - 60, 1);
+    w64be(&mut img, 8192 - 52, 0x800);
+    w64be(&mut img, 8192 - 44, 0x100);
+    w64be(&mut img, 8192 - 36, 0x300);
+    let f = vbmeta::parse_footer(&img.as_slice()).unwrap().unwrap();
+    assert_eq!(f.footer_offset, 8192 - 64);
+    assert_eq!(f.version, (1, 0));
+    // find_vbmeta: no footer, no offset-0 magic → None.
+    assert!(vbmeta::find_vbmeta(&vec![0u8; 8192].as_slice()).is_none());
 }
