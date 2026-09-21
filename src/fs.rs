@@ -8,7 +8,7 @@ use sutram_fs::{
     DetectConfidence, EntryKind, FsEntry, FsEntryStatus, FsError, FsInfo, FsParser, FileSystem,
     FsTimestamp, MountOptions, RecoveryState, Result, Timestamps,
 };
-use sutram_io::le::u32_be;
+use sutram_io::le::{u16_be, u32_be};
 use sutram_io::ByteSource;
 
 use crate::attr;
@@ -282,8 +282,10 @@ impl XfsFs {
         out
     }
 
-    /// Decode inobt/finobt leaf records — 16-byte full format, or 24-byte
-    /// sparse format when the spinodes feature bit is set.
+    /// Decode inobt/finobt leaf records. Both formats are 16 bytes —
+    /// sparse chunks (spinodes) re-encode the old 4-byte freecount field
+    /// as `{holemask u16, count u8, freecount u8}`; `ir_free` stays at
+    /// offset 8 in every record.
     fn decode_inobt_leaves(
         &self,
         agno: u32,
@@ -292,7 +294,7 @@ impl XfsFs {
         errs: &mut Vec<FsError>,
     ) -> Vec<InobtRec> {
         let sparse = self.sb.has_spinodes();
-        let stride = if sparse { 24 } else { 16 };
+        const REC_LEN: usize = 16;
         let mut out = Vec::new();
         for &agbno in leaves {
             let (hdr, blk, off) = match read_leaf(self.src.as_ref(), &self.sb, agno, agbno, kind) {
@@ -305,15 +307,15 @@ impl XfsFs {
             if hdr.crc_ok == Some(false) {
                 errs.push(FsError::corrupt(off, "inode btree leaf CRC mismatch"));
             }
-            let cap = (blk.len() - hdr.hdr_len) / stride;
+            let cap = (blk.len() - hdr.hdr_len) / REC_LEN;
             let n = (hdr.numrecs as usize).min(cap);
             for i in 0..n {
-                let p = hdr.hdr_len + i * stride;
+                let p = hdr.hdr_len + i * REC_LEN;
                 let startino = u32_be(&blk, p).unwrap_or(0);
                 let (holemask, free) = if sparse {
                     (
-                        Some(u32_be(&blk, p + 4).unwrap_or(0)),
-                        u64be(&blk, p + 16),
+                        Some(u16_be(&blk, p + 4).unwrap_or(0) as u32),
+                        u64be(&blk, p + 8),
                     )
                 } else {
                     (None, u64be(&blk, p + 8))

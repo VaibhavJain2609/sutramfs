@@ -425,7 +425,17 @@ impl<'m> Walk<'m> {
             // Advance the cursor before emitting (chain may corrupt-loop).
             match self.fs.inode(ino) {
                 Ok(inode) => {
-                    self.ul = (ag, bucket, inode.next_unlinked);
+                    let mut next = inode.next_unlinked;
+                    // A next_unlinked that revisits a seen inode would loop
+                    // the chain forever — terminate it instead.
+                    if next != NULLAGINO {
+                        let nino =
+                            ((ag as u64) << self.fs.sb.agino_bits()) | next as u64;
+                        if self.ul_seen.contains(&nino) {
+                            next = NULLAGINO;
+                        }
+                    }
+                    self.ul = (ag, bucket, next);
                     if self.emitted.contains(&ino) || !self.ul_seen.insert(ino) {
                         continue;
                     }

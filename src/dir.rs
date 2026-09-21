@@ -50,13 +50,14 @@ pub(crate) const DIR_FREE_OFFSET: u64 = 2 << 35;
 const FREE_TAG: u16 = 0xFFFF;
 
 /// First data-entry offset inside a data/block block — the kernel's
-/// `data_entry_offset` is `sizeof(xfs_dir3_data_hdr)` (56+24+4 = 84)
-/// on v5, else `sizeof(xfs_dir2_data_hdr)` (4+24 = 28).
+/// `data_entry_offset` is `sizeof(xfs_dir3_data_hdr)` = 64 on v5
+/// (blk_hdr 48 + best_free[3]×4 + pad 4), else
+/// `sizeof(xfs_dir2_data_hdr)` = 16 (magic 4 + best_free[3]×4).
 fn data_entry_offset(v3: bool) -> usize {
     if v3 {
-        84
+        64
     } else {
-        28
+        16
     }
 }
 

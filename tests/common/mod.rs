@@ -265,8 +265,9 @@ impl Img {
         w64(blk, 16, 0x2222); // lsn
         blk[24..40].copy_from_slice(&UUID);
         w64(blk, 40, owner_ino);
-        // best_free[3] at 56; pad at 80; entries from 84.
-        let mut off = 84usize;
+        // best_free[3] at 48 (each {u16 off, u16 len}); pad at 60;
+        // entries from sizeof(xfs_dir3_data_hdr) = 64.
+        let mut off = 64usize;
         // Live entries first, then deleted (which get freed).
         for (name, ino, ftype) in entries.iter().chain(deleted.iter()) {
             let namelen = name.len();
@@ -280,7 +281,7 @@ impl Img {
         }
         // Convert deleted entries' space into a free run.
         if !deleted.is_empty() {
-            let dstart = 84 + entries
+            let dstart = 64 + entries
                 .iter()
                 .map(|(n, _, _)| ((9 + n.len() + 1 + 2) + 7) & !7)
                 .sum::<usize>();
@@ -288,9 +289,9 @@ impl Img {
             w16(blk, dstart, 0xFFFF); // freetag
             w16(blk, dstart + 2, dlen as u16); // length
             w16(blk, dstart + dlen - 2, dstart as u16); // tail tag
-            // best_free[0] points at the run.
-            w32(blk, 56, dstart as u32);
-            w32(blk, 60, dlen as u32);
+            // best_free[0] = {u16 off, u16 len} points at the run.
+            w16(blk, 48, dstart as u16);
+            w16(blk, 50, dlen as u16);
         }
         // Tail: leaf count + stale count at blksize-8.
         w32(blk, BS - 8, 0); // leaf count = 0 (no leaf entries needed)

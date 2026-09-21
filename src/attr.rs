@@ -76,8 +76,9 @@ pub(crate) fn parse_local(buf: &[u8]) -> Vec<Xattr> {
     if buf.len() < 4 {
         return out;
     }
+    // xfs_attr_sf_hdr = {totsize u16, count u8} — 3 bytes, no pad.
     let count = buf[2] as usize;
-    let mut pos = 4;
+    let mut pos = 3;
     for _ in 0..count.min(MAX_ATTRS) {
         if pos + 3 > buf.len() {
             break;
@@ -241,7 +242,9 @@ pub(crate) fn remote_read(
     valuelen: u32,
 ) -> Result<Vec<u8>> {
     let bs = sb.blocksize as usize;
-    let nblocks = (valuelen as usize).div_ceil(bs - RMT_HDR_LEN);
+    // v5 remote blocks carry a 56-byte 'XARM' header; v4 blocks are raw.
+    let per_block = if sb.is_v5() { bs - RMT_HDR_LEN } else { bs };
+    let nblocks = (valuelen as usize).div_ceil(per_block);
     let mut out = Vec::with_capacity(valuelen.min(1 << 20) as usize);
     for i in 0..nblocks.max(1) {
         let logical = valueblk as u64 + i as u64;
