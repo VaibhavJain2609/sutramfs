@@ -56,7 +56,7 @@ fn json(e: &FsEntry) -> String {
     ] {
         ts.push_str(&format!(
             "\"{name}\":{},",
-            t.as_ref().map(|t| ts_json(t)).unwrap_or("null".into())
+            t.as_ref().map(ts_json).unwrap_or("null".into())
         ));
     }
     ts.pop();

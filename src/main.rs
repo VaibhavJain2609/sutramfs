@@ -177,7 +177,7 @@ fn cmd_detect(args: &[String]) -> Result<(), String> {
         .iter()
         .map(|p| (p.name(), p.detect(src.as_ref())))
         .collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
     println!("{:<10} confidence", "parser");
     for (name, conf) in rows {
         println!("{name:<10} {conf:?}");
@@ -302,16 +302,21 @@ fn cmd_ls(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_cat(args: &[String]) -> Result<(), String> {
-    let (c, pos) = parse_common(args)?;
+    // `--recover` is advisory: cat already attempts recovery reads of
+    // deleted entries, so accept (and drop) the flag the usage advertises.
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--recover")
+        .cloned()
+        .collect();
+    let (c, pos) = parse_common(&args)?;
     let target = pos.get(1).ok_or("usage: sutramfs cat <image> <path>")?;
     let fs = c.mount()?;
     let mut found: Option<FsEntry> = None;
-    for item in fs.walk() {
-        if let Ok(e) = item {
-            if e.path == *target || e.name == *target {
-                found = Some(e);
-                break;
-            }
+    for e in fs.walk().flatten() {
+        if e.path == *target || e.name == *target {
+            found = Some(e);
+            break;
         }
     }
     let e = found.ok_or_else(|| format!("no entry '{target}'"))?;
