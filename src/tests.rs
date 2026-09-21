@@ -488,9 +488,14 @@ fn ewf_signature_without_volume_is_corrupt() {
     // non-EWF input → corrupt, not unsupported
     let res = ewf::EwfSource::open(vec![vec_src(vec![0u8; 64])]);
     assert!(matches!(res, Err(Error::Corrupt { .. })));
-    // >1 segment → unsupported (multi-segment not implemented yet)
+    // two garbage segments → corrupt on segment 1 (multi-segment parses
+    // each supplied source, so the bad signature is reported)
     let res = ewf::EwfSource::open(vec![vec_src(vec![0u8; 64]), vec_src(vec![0u8; 64])]);
-    assert!(matches!(res, Err(Error::Unsupported { .. })));
+    match res {
+        Err(Error::Corrupt { msg, .. }) => assert!(msg.contains("segment 1")),
+        Err(e) => panic!("expected Corrupt naming segment 1, got {e:?}"),
+        Ok(_) => panic!("expected Corrupt naming segment 1, got an opened image"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,10 +512,14 @@ struct E01 {
 
 impl E01 {
     fn new() -> Self {
+        Self::new_seg(1)
+    }
+
+    fn new_seg(segment_number: u16) -> Self {
         let mut img = Vec::new();
         img.extend_from_slice(ewf::EWF_SIGNATURE);
         img.push(0x01); // start of fields
-        img.extend_from_slice(&1u16.to_le_bytes()); // segment number
+        img.extend_from_slice(&segment_number.to_le_bytes());
         img.extend_from_slice(&0u16.to_le_bytes()); // end of fields
         Self {
             img,
@@ -839,7 +848,9 @@ fn ewf_error2_ranges_read_zero() {
 }
 
 #[test]
-fn ewf_next_section_detects_multi_segment() {
+fn ewf_next_section_requires_further_segments() {
+    // A `next` terminator says the image continues in .E02; opening
+    // without it is a clear InvalidInput error, never a silent zero tail.
     let media = e01_media(E01_CS);
     let img = build_e01(
         &media,
@@ -851,9 +862,12 @@ fn ewf_next_section_detects_multi_segment() {
     );
     let res = ewf::EwfSource::open(vec![vec_src(img)]);
     match res {
-        Err(Error::Unsupported { msg }) => assert!(msg.contains(".E02")),
-        Err(e) => panic!("expected Unsupported, got {e:?}"),
-        Ok(_) => panic!("expected Unsupported, got an opened image"),
+        Err(Error::Io(e)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(e.to_string().contains("next"));
+        }
+        Err(e) => panic!("expected InvalidInput io error, got {e:?}"),
+        Ok(_) => panic!("expected an error, got an opened image"),
     }
 }
 
@@ -1020,4 +1034,166 @@ fn ewf_segment_number_two_unsupported() {
     img[9..11].copy_from_slice(&2u16.to_le_bytes()); // segment 2
     let res = ewf::EwfSource::open(vec![vec_src(img)]);
     assert!(matches!(res, Err(Error::Unsupported { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// Multi-segment EWF corpus & tests
+// ---------------------------------------------------------------------------
+
+/// Build one segment file of a multi-segment EWF image holding `chunks`
+/// (each exactly E01_CS bytes except possibly the last). Every segment
+/// repeats the full-image `volume` geometry; `terminal` is `"next"` for
+/// all but the last segment and `"done"` for the last. Chunks alternate
+/// zlib-raw-zlib to exercise both paths per segment.
+fn build_e01_segment(
+    chunks: &[&[u8]],
+    seg_no: u16,
+    total_chunks: u32,
+    total_sectors: u64,
+    terminal: &str,
+) -> Vec<u8> {
+    let mut w = E01::new_seg(seg_no);
+    w.section("volume", &e01_volume(total_chunks, total_sectors));
+
+    let mut payloads = Vec::new();
+    let mut rel_offsets = Vec::new();
+    let mut compressed = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        rel_offsets.push(payloads.len());
+        if i % 2 == 0 {
+            let z = miniz_oxide::deflate::compress_to_vec_zlib(chunk, 6);
+            payloads.extend_from_slice(&z);
+            compressed.push(true);
+        } else {
+            payloads.extend_from_slice(chunk);
+            payloads.extend_from_slice(&ewf::adler32(chunk).to_le_bytes());
+            compressed.push(false);
+        }
+    }
+    let desc = w.section("sectors", &payloads);
+    let entries: Vec<u32> = rel_offsets
+        .iter()
+        .enumerate()
+        .map(|(k, &rel)| {
+            let mut e = (desc + 76 + rel) as u32;
+            if compressed[k] {
+                e |= 0x8000_0000;
+            }
+            e
+        })
+        .collect();
+    let t = e01_table(&entries);
+    w.section("table", &t);
+    w.section("table2", &t);
+    w.section(terminal, &[]);
+    w.finish()
+}
+
+#[test]
+fn ewf_multi_segment_roundtrip() {
+    // 4 chunks: 2 in .E01 (terminated by `next`), 2 in .E02 (`done`).
+    let media = e01_media(4 * E01_CS);
+    let chunks: Vec<&[u8]> = media.chunks(E01_CS).collect();
+    let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+    let s1 = build_e01_segment(&chunks[..2], 1, 4, sectors, "next");
+    let s2 = build_e01_segment(&chunks[2..], 2, 4, sectors, "done");
+    let e = ewf::EwfSource::open(vec![vec_src(s1), vec_src(s2)]).unwrap();
+    assert_eq!(e.len(), media.len() as u64);
+    assert!(e.info().multi_segment);
+    assert_eq!(e.info().segment_count, 2);
+    // whole-image round trip across the segment seam
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+    // a read spanning the chunk 1|2 boundary is a cross-segment read
+    let seam = 2 * E01_CS;
+    let off = seam - 50;
+    assert_eq!(
+        e.read_slice(off as u64, 150).unwrap(),
+        media[off..off + 150]
+    );
+    // reads confined to the second segment also work
+    assert_eq!(
+        e.read_slice(3 * E01_CS as u64, 512).unwrap(),
+        media[3 * E01_CS..3 * E01_CS + 512]
+    );
+    assert!(
+        e.warnings().is_empty(),
+        "unexpected warnings: {:?}",
+        e.warnings()
+    );
+}
+
+#[test]
+fn ewf_missing_continuation_segment_is_clear_error() {
+    // .E01 ends with `next` but .E02 was not supplied → clear error.
+    let media = e01_media(2 * E01_CS);
+    let chunks: Vec<&[u8]> = media.chunks(E01_CS).collect();
+    let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+    let s1 = build_e01_segment(&chunks[..1], 1, 2, sectors, "next");
+    let res = ewf::EwfSource::open(vec![vec_src(s1)]);
+    match res {
+        Err(Error::Io(e)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            let m = e.to_string();
+            assert!(m.contains("next") && m.contains("E02"), "{m}");
+        }
+        Err(e) => panic!("expected InvalidInput io error, got {e:?}"),
+        Ok(_) => panic!("expected InvalidInput io error, got an opened image"),
+    }
+}
+
+#[test]
+fn ewf_multi_segment_three_way_and_bad_signature() {
+    // 3 segments; a corrupt middle segment reports its position.
+    let media = e01_media(3 * E01_CS);
+    let chunks: Vec<&[u8]> = media.chunks(E01_CS).collect();
+    let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+    let s1 = build_e01_segment(&chunks[..1], 1, 3, sectors, "next");
+    let s2 = build_e01_segment(&chunks[1..2], 2, 3, sectors, "next");
+    let s3 = build_e01_segment(&chunks[2..], 3, 3, sectors, "done");
+    let e = ewf::EwfSource::open(vec![vec_src(s1.clone()), vec_src(s2), vec_src(s3)]).unwrap();
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+    assert_eq!(e.info().segment_count, 3);
+
+    let bad = vec_src(vec![0u8; 512]);
+    let res = ewf::EwfSource::open(vec![vec_src(s1), bad]);
+    match res {
+        Err(Error::Corrupt { msg, .. }) => assert!(msg.contains("segment 2"), "{msg}"),
+        Err(e) => panic!("expected Corrupt naming segment 2, got {e:?}"),
+        Ok(_) => panic!("expected Corrupt naming segment 2, got an opened image"),
+    }
+}
+
+#[test]
+fn ewf_open_segments_from_paths() {
+    // Real-file path API: write two segments to a temp dir, open by path.
+    let media = e01_media(2 * E01_CS);
+    let chunks: Vec<&[u8]> = media.chunks(E01_CS).collect();
+    let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+    let s1 = build_e01_segment(&chunks[..1], 1, 2, sectors, "next");
+    let s2 = build_e01_segment(&chunks[1..], 2, 2, sectors, "done");
+
+    let dir = std::env::temp_dir()
+        .join(format!("sutram-ewf-segments-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p1 = dir.join("case.E01");
+    let p2 = dir.join("case.E02");
+    std::fs::write(&p1, &s1).unwrap();
+    std::fs::write(&p2, &s2).unwrap();
+
+    let e = ewf::EwfSource::open_segments(&[p1.clone(), p2.clone()]).unwrap();
+    assert_eq!(e.len(), media.len() as u64);
+    assert_eq!(e.read_slice(0, media.len()).unwrap(), media);
+
+    // A missing continuation path → io error naming the segment & path.
+    let p3 = dir.join("case.E03");
+    let res = ewf::EwfSource::open_segments(&[p1.clone(), p2.clone(), p3]);
+    match res {
+        Err(Error::Io(e)) => {
+            let m = e.to_string();
+            assert!(m.contains("segment 3") && m.contains("case.E03"), "{m}");
+        }
+        Err(e) => panic!("expected Io error for missing segment, got {e:?}"),
+        Ok(_) => panic!("expected Io error for missing segment, got an opened image"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }

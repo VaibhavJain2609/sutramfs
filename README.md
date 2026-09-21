@@ -21,9 +21,9 @@ between a raw acquisition and a filesystem parser:
 - MBR + GPT partition parsing (`partitions`, `open_partitions`) producing
   partitions with absolute byte offsets.
 - `ewf::EwfSource` — pure-Rust EWF (Expert Witness Format / `.E01`)
-  reader: zlib-compressed and raw chunks, `table`/`table2` chunk maps,
-  `error2` acquisition-error ranges, and stored MD5/SHA-1 integrity
-  hashes. Never FFI to libewf.
+  reader: single- and multi-segment (`.E02`+) images, zlib-compressed and
+  raw chunks, `table`/`table2` chunk maps, `error2` acquisition-error
+  ranges, and stored MD5/SHA-1 integrity hashes. Never FFI to libewf.
 
 ## Forensic guarantees
 
@@ -58,17 +58,24 @@ for part in open_partitions(disk)? {
 
 ## EWF (E01) support
 
-`ewf::EwfSource::open` turns a single-segment EnCase/FTK `.E01` image into
-a `ByteSource`, so every parser built on this crate can mount forensic
-images directly:
+`ewf::EwfSource::open` turns an EnCase/FTK `.E01` image into a
+`ByteSource`, so every parser built on this crate can mount forensic
+images directly. Multi-segment images pass all segments in order (or use
+`open_segments` with paths):
 
 ```rust,no_run
 use std::sync::Arc;
 use sutram_io::{into_arc, ByteSource, FileSource};
 use sutram_io::ewf::EwfSource;
 
+// Single segment:
 let seg = into_arc(FileSource::open("case01.E01")?);
 let img = EwfSource::open(vec![seg])?;
+
+// Multi-segment (.E01 + .E02 + …) by path:
+let img2 = EwfSource::open_segments(&["case02.E01", "case02.E02"])?;
+println!("{} bytes over {} segments", img2.len(), img2.info().segment_count);
+
 println!("{} bytes, chunk size {}", img.len(), img.info().chunk_size);
 if let Some(h) = img.acquisition_hash() {
     println!("stored MD5: {:?}", h.md5_hex());
@@ -80,23 +87,27 @@ for w in img.warnings() { eprintln!("ewf: {w}"); }
 
 - Chunks are zlib-deflate or raw (auto-detected per table-entry flag bit);
   reads are served through a bounded 8-chunk LRU cache.
+- Multi-segment images share one logical chunk table; each table entry
+  addresses bytes inside the segment file that declared it. Chunk order
+  follows the supplied segment order — a last segment that still declares
+  `next` is a clear `InvalidInput` error, not a silent zero tail.
 - `error2` acquisition-error ranges read as zeros (what the acquisition
   tool stored) and are listed via `error_ranges()`.
 - Stored `hash`/`digest` MD5 + SHA-1 are exposed via `acquisition_hash()` —
   they are the acquisition tool's *claims*, verify them yourself.
 - Non-fatal anomalies (checksum mismatches, table/count mismatches,
-  degraded entries) are collected in `warnings()`, never panics.
+  degraded entries, segment-number mismatches) are collected in
+  `warnings()`, never panics.
 - `table2` mirrors are used automatically when a `table` section is
   missing or yields fewer entries.
 
 ### EWF limitations
 
-- **Single-segment only.** Multi-segment images (`.E02`+, detected via the
-  `next` section or multiple `segments` arguments) return
-  `Error::Unsupported`; segment 1 is still parsed fully to make that
-  detection definitive.
 - EWF2 (`.Ex01`), logical evidence files (`.L01` / media type `0x0e`) and
   SMART `.s01` layouts return `Error::Unsupported`.
+- Segment ordering is the caller's responsibility; a segment whose
+  declared number disagrees with its position earns a warning, not a
+  re-ordering.
 - A chunk whose zlib stream is corrupt yields `io::Error(InvalidData)` on
   reads touching it — corrupt stored data is never silently replaced with
   zeros. Missing/out-of-range *table entries* do zero-fill (documented
@@ -114,7 +125,7 @@ regions — nothing is filtered).
 
 ## Known limitations
 
-- EWF support covers single-segment E01 only — multi-segment (`.E02`+),
+- EWF support covers E01 segments (single- and multi-segment `.E02`+);
   EWF2 (`.Ex01`), L01 and SMART `.s01` variants return `Unsupported`.
   qcow2/VMDK/VHD are not yet decoded.
 - Partition parsing assumes 512-byte sectors, probing 4096 only for GPT.

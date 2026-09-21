@@ -34,12 +34,14 @@
 //!
 //! ## Supported / unsupported
 //!
-//! * Single-segment EWF-E01 images (EnCase/FTK/`linen` `volume`+`sectors`
-//!   layout, compressed and raw chunks): **readable**.
-//! * Multi-segment images (`.E02`+): detected via the `next` section and
-//!   via multiple `segments` arguments → [`Error::Unsupported`]. The
-//!   plumbing to glue segments exists (`ConcatSource`-style) but is not
-//!   wired up yet.
+//! * Single- and multi-segment EWF-E01 images (EnCase/FTK/`linen`
+//!   `volume`+`sectors` layout, compressed and raw chunks): **readable**.
+//!   Pass every segment (`*.E01`, `*.E02`, …) to [`EwfSource::open`] as
+//!   sources in order, or to [`EwfSource::open_segments`] as paths. Chunk
+//!   table entries are relative to the segment file that declares them;
+//!   a shared table spans all supplied segments. A last segment carrying
+//!   a `next` section (i.e. the image continues in a segment that was not
+//!   supplied) is a clear error, not silent truncation.
 //! * EWF2 (`*.Ex01`), logical evidence files (`*.L01`, media type 0x0e)
 //!   and SMART `*.s01` variants: → [`Error::Unsupported`].
 //! * `session`, `ltree`, `xheader`, `restart_data` and other metadata
@@ -67,10 +69,11 @@
 //! small LRU cache of [`CHUNK_CACHE_CAP`] chunks.
 
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::le;
-use crate::{ByteSource, Error, Result};
+use crate::{ByteSource, Error, FileSource, Result};
 
 /// EWF file-signature bytes (`EVF` + format marker).
 pub const EWF_SIGNATURE: &[u8] = b"EVF\x09\x0d\x0a\xff\x00";
@@ -169,8 +172,10 @@ impl AcqHash {
 /// Geometry and acquisition metadata of an opened EWF image.
 #[derive(Debug, Clone)]
 pub struct EwfInfo {
-    /// Segment number from the file header (always 1 for now).
+    /// Segment number from the first segment's file header (normally 1).
     pub segment_number: u16,
+    /// Number of segment files that were supplied (`.E01`, `.E02`, …).
+    pub segment_count: u16,
     /// Media type byte from the volume section (0x00 removable,
     /// 0x01 fixed, 0x03 optical, 0x0e logical, 0x10 RAM).
     pub media_type: u8,
@@ -190,10 +195,8 @@ pub struct EwfInfo {
     pub error_granularity: u32,
     /// Segment file set identifier GUID (RFC-4122 text), if stored.
     pub set_identifier: Option<String>,
-    /// Whether the image declares further segments (`.E02`+). Always
-    /// `false` for successfully opened images — multi-segment input is
-    /// rejected with [`Error::Unsupported`]; kept for the future
-    /// multi-segment reader.
+    /// Whether the image spans several segment files
+    /// (`segment_count > 1`; `.E02`+ were supplied).
     pub multi_segment: bool,
     /// Decompressed `header`/`header2` acquisition text (lossy, bounded).
     pub acquisition_header: Option<String>,
@@ -206,8 +209,14 @@ pub struct EwfInfo {
 /// Where one logical chunk's stored bytes live.
 #[derive(Debug, Clone, Copy)]
 enum ChunkLoc {
-    /// Stored at absolute `offset` in the segment; `compressed` = zlib.
-    Stored { offset: u64, compressed: bool },
+    /// Stored at absolute `offset` inside segment file `seg`
+    /// (0-based index into `EwfSource::segs`); `compressed` = zlib.
+    /// Table entries are always relative to their owning segment.
+    Stored {
+        seg: u32,
+        offset: u64,
+        compressed: bool,
+    },
     /// No usable table entry — reads as zeros (documented leniency).
     Missing,
 }
@@ -269,14 +278,19 @@ impl ChunkCache {
 // EwfSource
 // ---------------------------------------------------------------------------
 
-/// Read-only `ByteSource` over a single-segment EWF (`*.E01`) image.
+/// Read-only `ByteSource` over an EWF image (`*.E01` + optional `.E02`+
+/// continuation segments).
 ///
-/// Build with [`EwfSource::open`]; use as a plain [`ByteSource`]
-/// (`read_at`, `read_slice`, `reader_at`) or interrogate acquisition
-/// metadata via [`EwfSource::info`], [`EwfSource::acquisition_hash`],
+/// Build with [`EwfSource::open`] (sources) or [`EwfSource::open_segments`]
+/// (paths); use as a plain [`ByteSource`] (`read_at`, `read_slice`,
+/// `reader_at`) or interrogate acquisition metadata via
+/// [`EwfSource::info`], [`EwfSource::acquisition_hash`],
 /// [`EwfSource::error_ranges`] and [`EwfSource::warnings`].
 pub struct EwfSource {
-    src: Arc<dyn ByteSource>,
+    /// One handle per supplied segment file, in acquisition order.
+    /// Chunk-table entries name their owning segment by index into this
+    /// vector — single-segment images have exactly one entry.
+    segs: Vec<Arc<dyn ByteSource>>,
     info: EwfInfo,
     /// Chunk location map; index = logical chunk number. Length is the
     /// usable table entries; chunk indices beyond it read as zeros.
@@ -298,157 +312,266 @@ impl EwfSource {
             .unwrap_or(false)
     }
 
-    /// Open a single-segment EWF image.
+    /// Open an EWF image from one or more segment sources.
     ///
-    /// `segments` currently must hold exactly one source (the `.E01`).
-    /// Passing several segments, or a lone `.E01` containing a `next`
-    /// section (i.e. the image continues in `.E02`+), returns
-    /// [`Error::Unsupported`]; segment 1 itself is parsed fully so the
-    /// error is a definitive detection, not a guess.
+    /// `segments` holds the `.E01`, `.E02`, … sources **in acquisition
+    /// order** — chunk ordering follows argument order, and each
+    /// segment's `table` entries address bytes inside that same segment
+    /// file. A single-element vector is the plain `.E01` path and behaves
+    /// exactly as before.
+    ///
+    /// If the last supplied segment ends with a `next` section the image
+    /// is incomplete: `open` returns an `InvalidInput` error naming the
+    /// missing continuation rather than silently zero-filling it. Supply
+    /// the remaining segments or use [`EwfSource::open_segments`].
     ///
     /// A source that does not start with the `EVF` signature returns
     /// [`Error::Corrupt`] at offset 0.
     pub fn open(segments: Vec<Arc<dyn ByteSource>>) -> Result<Self> {
-        match segments.len() {
-            0 => {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "EWF image needs at least one segment source",
-                )))
-            }
-            1 => {}
-            n => {
-                return Err(Error::unsupported(format!(
-                    "multi-segment EWF images are not yet supported ({n} segments given)"
-                )))
-            }
-        }
-        let src = segments[0].clone();
-        let file_len = src.len();
-        if file_len < FILE_HEADER_SIZE {
-            return Err(Error::Truncated {
-                offset: 0,
-                requested: FILE_HEADER_SIZE,
-                available: file_len,
-            });
-        }
-        let head = src.read_slice(0, FILE_HEADER_SIZE as usize).map_err(Error::Io)?;
-        if head[0..8] == *LVF_SIGNATURE {
-            return Err(Error::unsupported(
-                "EWF-L01 logical evidence files are not supported",
-            ));
-        }
-        if head[0..8] != *EWF_SIGNATURE {
-            return Err(Error::corrupt(0, "not an EWF image (bad EVF signature)"));
-        }
-
-        let mut warnings = Vec::new();
-        if head[8] != 0x01 {
-            warn(
-                &mut warnings,
-                format!("file header: start-of-fields byte is {:#04x}, expected 0x01", head[8]),
-            );
-        }
-        let segment_number = le::u16(&head, 9).unwrap_or(0);
-        if segment_number == 0 {
-            warn(&mut warnings, "file header: segment number is 0, treating as 1");
-        } else if segment_number != 1 {
-            return Err(Error::unsupported(format!(
-                "EWF segment {segment_number}: only segment 1 can be opened"
+        if segments.is_empty() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EWF image needs at least one segment source",
             )));
         }
 
-        // ---- walk the section descriptors -------------------------------
-        let sections = walk_sections(src.as_ref(), file_len, &mut warnings);
-
-        // ---- harvest the sections we understand -------------------------
+        let mut warnings = Vec::new();
         let mut volume: Option<Volume> = None;
-        let mut primary_locs: Vec<ChunkLoc> = Vec::new();
-        let mut backup_locs: Vec<ChunkLoc> = Vec::new();
+        let mut locs: Vec<ChunkLoc> = Vec::new();
         let mut error_ranges: Vec<(u64, u64)> = Vec::new();
         let mut hash = AcqHash::default();
         let mut header_text: Option<String> = None;
-        let mut multi_segment = false;
+        let mut segment_number = 0u16;
+        let mut declares_next = false;
 
-        for sec in &sections {
-            match sec.name.as_str() {
-                "volume" | "disk" | "data" => {
-                    match parse_volume(src.as_ref(), sec, &mut warnings) {
-                        Ok(v) => {
-                            if let Some(prev) = &volume {
-                                if v.chunk_count != prev.chunk_count
-                                    || v.sector_count != prev.sector_count
-                                    || v.bytes_per_sector != prev.bytes_per_sector
-                                    || v.sectors_per_chunk != prev.sectors_per_chunk
-                                {
-                                    warn(
-                                        &mut warnings,
-                                        format!(
-                                            "section '{}' at {:#x} disagrees with earlier geometry",
-                                            sec.name, sec.desc_offset
-                                        ),
-                                    );
+        for (seg_idx, src) in segments.iter().enumerate() {
+            let file_len = src.len();
+            if file_len < FILE_HEADER_SIZE {
+                return Err(Error::Truncated {
+                    offset: 0,
+                    requested: FILE_HEADER_SIZE,
+                    available: file_len,
+                });
+            }
+            let head = src.read_slice(0, FILE_HEADER_SIZE as usize).map_err(Error::Io)?;
+            if head[0..8] == *LVF_SIGNATURE {
+                return Err(Error::unsupported(
+                    "EWF-L01 logical evidence files are not supported",
+                ));
+            }
+            if head[0..8] != *EWF_SIGNATURE {
+                return Err(Error::corrupt(
+                    0,
+                    format!(
+                        "segment {} is not an EWF image (bad EVF signature)",
+                        seg_idx + 1
+                    ),
+                ));
+            }
+            if head[8] != 0x01 {
+                warn(
+                    &mut warnings,
+                    format!(
+                        "segment {}: start-of-fields byte is {:#04x}, expected 0x01",
+                        seg_idx + 1,
+                        head[8]
+                    ),
+                );
+            }
+            let seg_no = le::u16(&head, 9).unwrap_or(0);
+            let expected = seg_idx as u64 + 1;
+            if seg_no == 0 {
+                warn(
+                    &mut warnings,
+                    format!("segment {expected}: segment number is 0, treating as {expected}"),
+                );
+            } else if seg_idx == 0 && seg_no != 1 {
+                return Err(Error::unsupported(format!(
+                    "EWF segment {seg_no}: the first supplied segment must be .E01 (number 1)"
+                )));
+            } else if seg_no as u64 != expected {
+                // Table order — not this field — assigns chunk indices, so
+                // a mislabelled file only earns a warning; the caller owns
+                // segment ordering.
+                warn(
+                    &mut warnings,
+                    format!(
+                        "segment at position {expected} declares number {seg_no}; \
+                         ordering follows the supplied order"
+                    ),
+                );
+            }
+            if seg_idx == 0 {
+                segment_number = seg_no;
+            }
+
+            // ---- walk this segment's section descriptors ---------------
+            let sections = walk_sections(src.as_ref(), file_len, &mut warnings);
+
+            let mut primary_locs: Vec<ChunkLoc> = Vec::new();
+            let mut backup_locs: Vec<ChunkLoc> = Vec::new();
+            declares_next = false;
+            let mut declares_done = false;
+
+            for sec in &sections {
+                match sec.name.as_str() {
+                    "volume" | "disk" | "data" => {
+                        match parse_volume(src.as_ref(), sec, &mut warnings) {
+                            Ok(v) => {
+                                if let Some(prev) = &volume {
+                                    if v.chunk_count != prev.chunk_count
+                                        || v.sector_count != prev.sector_count
+                                        || v.bytes_per_sector != prev.bytes_per_sector
+                                        || v.sectors_per_chunk != prev.sectors_per_chunk
+                                    {
+                                        warn(
+                                            &mut warnings,
+                                            format!(
+                                                "section '{}' at segment {} offset {:#x} disagrees with earlier geometry",
+                                                sec.name,
+                                                seg_idx + 1,
+                                                sec.desc_offset
+                                            ),
+                                        );
+                                    }
+                                } else {
+                                    volume = Some(v);
                                 }
-                            } else {
-                                volume = Some(v);
+                            }
+                            Err(e) => warn(
+                                &mut warnings,
+                                format!(
+                                    "{} section at segment {} offset {:#x}: {e}",
+                                    sec.name,
+                                    seg_idx + 1,
+                                    sec.desc_offset
+                                ),
+                            ),
+                        }
+                    }
+                    "table" => parse_table(
+                        src.as_ref(),
+                        sec,
+                        seg_idx as u32,
+                        &mut primary_locs,
+                        &mut warnings,
+                    ),
+                    "table2" => parse_table(
+                        src.as_ref(),
+                        sec,
+                        seg_idx as u32,
+                        &mut backup_locs,
+                        &mut warnings,
+                    ),
+                    "error2" => {
+                        let bps = volume.as_ref().map(|v| v.bytes_per_sector).unwrap_or(0);
+                        parse_error2(src.as_ref(), sec, bps, &mut error_ranges, &mut warnings);
+                    }
+                    "hash" => {
+                        if let Some(d) = read_section_data(src.as_ref(), sec, 36, &mut warnings) {
+                            let md5: Option<[u8; 16]> =
+                                le::get(&d, 0, 16).and_then(|s| s.try_into().ok());
+                            if md5.map(|h| h.iter().any(|&b| b != 0)).unwrap_or(false) {
+                                hash.md5 = md5;
                             }
                         }
-                        Err(e) => warn(
-                            &mut warnings,
-                            format!("{} section at {:#x}: {e}", sec.name, sec.desc_offset),
+                    }
+                    "digest" => {
+                        if let Some(d) = read_section_data(src.as_ref(), sec, 80, &mut warnings) {
+                            let md5: Option<[u8; 16]> =
+                                le::get(&d, 0, 16).and_then(|s| s.try_into().ok());
+                            let sha1: Option<[u8; 20]> =
+                                le::get(&d, 16, 20).and_then(|s| s.try_into().ok());
+                            if md5.map(|h| h.iter().any(|&b| b != 0)).unwrap_or(false) {
+                                hash.md5 = md5;
+                            }
+                            if sha1.map(|h| h.iter().any(|&b| b != 0)).unwrap_or(false) {
+                                hash.sha1 = sha1;
+                            }
+                        }
+                    }
+                    "header" | "header2" => {
+                        if header_text.is_none() {
+                            header_text = parse_header_section(src.as_ref(), sec, &mut warnings);
+                        }
+                    }
+                    "next" => declares_next = true,
+                    "done" => declares_done = true,
+                    "incomplete" => warn(
+                        &mut warnings,
+                        format!(
+                            "image carries an 'incomplete' section at segment {} offset {:#x}",
+                            seg_idx + 1,
+                            sec.desc_offset
                         ),
-                    }
+                    ),
+                    // sectors / session / ltree / restart_data / xheader /
+                    // unknown types: tolerated, not interpreted.
+                    _ => {}
                 }
-                "table" => parse_table(src.as_ref(), sec, &mut primary_locs, &mut warnings),
-                "table2" => parse_table(src.as_ref(), sec, &mut backup_locs, &mut warnings),
-                "error2" => {
-                    let bps = volume.as_ref().map(|v| v.bytes_per_sector).unwrap_or(0);
-                    parse_error2(src.as_ref(), sec, bps, &mut error_ranges, &mut warnings);
-                }
-                "hash" => {
-                    if let Some(d) = read_section_data(src.as_ref(), sec, 36, &mut warnings) {
-                        let md5: Option<[u8; 16]> =
-                            le::get(&d, 0, 16).and_then(|s| s.try_into().ok());
-                        if md5.map(|h| h.iter().any(|&b| b != 0)).unwrap_or(false) {
-                            hash.md5 = md5;
-                        }
-                    }
-                }
-                "digest" => {
-                    if let Some(d) = read_section_data(src.as_ref(), sec, 80, &mut warnings) {
-                        let md5: Option<[u8; 16]> =
-                            le::get(&d, 0, 16).and_then(|s| s.try_into().ok());
-                        let sha1: Option<[u8; 20]> =
-                            le::get(&d, 16, 20).and_then(|s| s.try_into().ok());
-                        if md5.map(|h| h.iter().any(|&b| b != 0)).unwrap_or(false) {
-                            hash.md5 = md5;
-                        }
-                        if sha1.map(|h| h.iter().any(|&b| b != 0)).unwrap_or(false) {
-                            hash.sha1 = sha1;
-                        }
-                    }
-                }
-                "header" | "header2" => {
-                    if header_text.is_none() {
-                        header_text = parse_header_section(src.as_ref(), sec, &mut warnings);
-                    }
-                }
-                "next" => multi_segment = true,
-                "incomplete" => warn(
+            }
+
+            // ---- per-segment table pick: primary `table`, `table2`
+            // mirror as backup (it exists for exactly this failure mode).
+            let mut seg_locs = if primary_locs.len() >= backup_locs.len() {
+                primary_locs
+            } else {
+                warn(
                     &mut warnings,
-                    format!("image carries an 'incomplete' section at {:#x}", sec.desc_offset),
-                ),
-                // sectors / done / session / ltree / restart_data / xheader /
-                // unknown types: tolerated, not interpreted.
-                _ => {}
+                    format!(
+                        "segment {}: 'table' yielded {} entries, 'table2' mirror {}; using the mirror",
+                        seg_idx + 1,
+                        primary_locs.len(),
+                        backup_locs.len()
+                    ),
+                );
+                backup_locs
+            };
+
+            // Entries pointing outside their owning segment degrade to
+            // missing chunks.
+            let mut bad = 0u64;
+            for loc in &mut seg_locs {
+                if let ChunkLoc::Stored { offset, .. } = *loc {
+                    if offset >= file_len {
+                        *loc = ChunkLoc::Missing;
+                        bad += 1;
+                    }
+                }
+            }
+            if bad > 0 {
+                warn(
+                    &mut warnings,
+                    format!(
+                        "segment {}: {bad} table entr(ies) point outside the segment; \
+                         those chunks read as zeros",
+                        seg_idx + 1
+                    ),
+                );
+            }
+            locs.append(&mut seg_locs);
+
+            if declares_done && seg_idx + 1 < segments.len() {
+                warn(
+                    &mut warnings,
+                    format!(
+                        "segment {} declares 'done' but further segments were supplied",
+                        seg_idx + 1
+                    ),
+                );
             }
         }
 
-        if multi_segment {
-            return Err(Error::unsupported(
-                "EWF image continues in further segment(s) (.E02+); \
-                 multi-segment reading is not yet supported",
-            ));
+        if declares_next {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "EWF segment {} declares continuation via 'next' (.E{:02}); \
+                     supply the remaining segment file(s)",
+                    segments.len(),
+                    segments.len() + 1
+                ),
+            )));
         }
 
         let vol = volume.ok_or_else(|| {
@@ -478,28 +601,13 @@ impl EwfSource {
                 )
             })?;
 
-        // ---- pick the chunk table: primary `table`, `table2` mirror as
-        // backup (it exists for exactly this failure mode).
-        let mut locs = if primary_locs.len() >= backup_locs.len() {
-            primary_locs
-        } else {
-            warn(
-                &mut warnings,
-                format!(
-                    "'table' sections yielded {} entries, 'table2' mirror {}; using the mirror",
-                    primary_locs.len(),
-                    backup_locs.len()
-                ),
-            );
-            backup_locs
-        };
-
-        // header-vs-table count mismatches: lenient, documented.
+        // Chunk count vs table-entry count mismatches across the whole
+        // segment set: lenient, documented.
         match locs.len().cmp(&(vol.chunk_count as usize)) {
             std::cmp::Ordering::Less => warn(
                 &mut warnings,
                 format!(
-                    "volume declares {} chunks but table lists {}; tail chunks read as zeros",
+                    "volume declares {} chunks but tables list {}; tail chunks read as zeros",
                     vol.chunk_count,
                     locs.len()
                 ),
@@ -508,7 +616,7 @@ impl EwfSource {
                 warn(
                     &mut warnings,
                     format!(
-                        "table lists {} entries but volume declares {} chunks; extras ignored",
+                        "tables list {} entries but volume declares {} chunks; extras ignored",
                         locs.len(),
                         vol.chunk_count
                     ),
@@ -516,23 +624,6 @@ impl EwfSource {
                 locs.truncate(vol.chunk_count as usize);
             }
             std::cmp::Ordering::Equal => {}
-        }
-
-        // Entries pointing outside the segment degrade to missing chunks.
-        let mut bad = 0u64;
-        for loc in &mut locs {
-            if let ChunkLoc::Stored { offset, .. } = *loc {
-                if offset >= file_len {
-                    *loc = ChunkLoc::Missing;
-                    bad += 1;
-                }
-            }
-        }
-        if bad > 0 {
-            warn(
-                &mut warnings,
-                format!("{bad} table entr(ies) point outside the segment; those chunks read as zeros"),
-            );
         }
 
         // Logical image size: declared sectors, capped by chunk capacity;
@@ -560,8 +651,10 @@ impl EwfSource {
             );
         }
 
+        let segment_count = u16::try_from(segments.len()).unwrap_or(u16::MAX);
         let info = EwfInfo {
             segment_number,
+            segment_count,
             media_type: vol.media_type,
             compression_level: vol.compression_level,
             chunk_size,
@@ -571,13 +664,13 @@ impl EwfSource {
             sector_count: vol.sector_count,
             error_granularity: vol.error_granularity,
             set_identifier: vol.set_identifier,
-            multi_segment: false,
+            multi_segment: segments.len() > 1,
             acquisition_header: header_text,
         };
 
         let hash_opt = if hash.is_empty() { None } else { Some(hash) };
         Ok(Self {
-            src,
+            segs: segments,
             info,
             locs,
             len,
@@ -586,6 +679,40 @@ impl EwfSource {
             warnings,
             cache: Mutex::new(ChunkCache::new()),
         })
+    }
+
+    /// Open an EWF image from segment file paths (`*.E01`, `*.E02`, …)
+    /// in acquisition order.
+    ///
+    /// Convenience wrapper around [`EwfSource::open`]: every path is
+    /// opened read-only through [`FileSource`]; a path that cannot be
+    /// opened (a missing `.E02`, a permission error) produces an
+    /// [`Error::Io`] naming the segment position and path. Segment
+    /// ordering is the caller's responsibility — see
+    /// [`EwfSource::open`].
+    pub fn open_segments<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EWF image needs at least one segment path",
+            )));
+        }
+        let mut segs: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(paths.len());
+        for (i, p) in paths.iter().enumerate() {
+            let p = p.as_ref();
+            let fs = FileSource::open(p).map_err(|e| {
+                Error::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot open EWF segment {} '{}': {e}",
+                        i + 1,
+                        p.display()
+                    ),
+                ))
+            })?;
+            segs.push(Arc::new(fs));
+        }
+        Self::open(segs)
     }
 
     /// Geometry and acquisition metadata.
@@ -650,25 +777,40 @@ impl EwfSource {
             // Beyond the parsed table: documented leniency — zeros.
             return Ok(vec![0u8; expected_usize]);
         };
-        let (offset, compressed) = match loc {
+        let (seg, offset, compressed) = match loc {
             ChunkLoc::Missing => return Ok(vec![0u8; expected_usize]),
-            ChunkLoc::Stored { offset, compressed } => (offset, compressed),
+            ChunkLoc::Stored {
+                seg,
+                offset,
+                compressed,
+            } => (seg, offset, compressed),
         };
-        let file_len = self.src.len();
+        // Dispatch to the segment that owns this chunk. A loc whose
+        // segment index is out of range cannot happen (tags are written
+        // at parse time); degrade to zeros defensively rather than panic.
+        let Some(src) = self.segs.get(seg as usize) else {
+            return Ok(vec![0u8; expected_usize]);
+        };
+        let file_len = src.len();
         if offset >= file_len {
             return Ok(vec![0u8; expected_usize]);
         }
         let avail = file_len - offset;
 
         // Stored length: prefer the delta to the next chunk's offset
-        // (authoritative in well-formed images); otherwise a bound that
-        // comfortably fits the chunk (zlib streams self-terminate; raw
-        // chunks are `expected + 4` trailer bytes).
+        // (authoritative in well-formed images, and only meaningful when
+        // the neighbour lives in the same segment); otherwise a bound
+        // that comfortably fits the chunk (zlib streams self-terminate;
+        // raw chunks are `expected + 4` trailer bytes).
         let next_off = self
             .locs
             .get(idx as usize + 1)
             .and_then(|l| match l {
-                ChunkLoc::Stored { offset: o, .. } if *o > offset => Some(*o),
+                ChunkLoc::Stored {
+                    seg: s2,
+                    offset: o,
+                    ..
+                } if *s2 == seg && *o > offset => Some(*o),
                 _ => None,
             });
         let bound = match next_off {
@@ -676,9 +818,8 @@ impl EwfSource {
             None if compressed => (expected.saturating_add(COMPRESSED_CHUNK_SLACK)).min(avail),
             None => (expected.saturating_add(4)).min(avail),
         };
-        let stored = self
-            .src
-            .read_slice(offset, usize::try_from(bound).unwrap_or(usize::MAX))?;
+        let stored =
+            src.read_slice(offset, usize::try_from(bound).unwrap_or(usize::MAX))?;
 
         let mut out = if compressed {
             // Bound output by chunk_size (a stored chunk never legitimately
@@ -926,6 +1067,7 @@ fn parse_volume(
 fn parse_table(
     src: &dyn ByteSource,
     sec: &Section,
+    seg: u32,
     out: &mut Vec<ChunkLoc>,
     warnings: &mut Vec<String>,
 ) {
@@ -956,8 +1098,14 @@ fn parse_table(
     for i in 0..n {
         let raw = le::u32(&data, 24 + i as usize * 4).unwrap_or(0);
         let compressed = raw & 0x8000_0000 != 0;
+        // Offsets are relative to the table's own segment file (base is
+        // usually 0 = absolute within that segment).
         let offset = base.saturating_add((raw & 0x7fff_ffff) as u64);
-        out.push(ChunkLoc::Stored { offset, compressed });
+        out.push(ChunkLoc::Stored {
+            seg,
+            offset,
+            compressed,
+        });
     }
 }
 

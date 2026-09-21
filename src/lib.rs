@@ -42,14 +42,14 @@ mod views;
 
 /// Pure-Rust EWF (Expert Witness Format / E01) reader.
 ///
-/// EWF segment files (`*.E01`) are self-describing containers: an `EVF`
-/// file header, framed section descriptors and `table`/`table2` block maps
-/// pointing at zlib/deflate-compressed chunks. [`ewf::EwfSource`] opens a
-/// single-segment E01 and exposes it as a [`ByteSource`] alongside the
-/// stored acquisition hashes and error ranges. Multi-segment (`.E02`+),
-/// EWF2 (`*.Ex01`) and logical (`.L01`) images are detected and reported
-/// as [`Error::Unsupported`]. No FFI to libewf — decompression is pure
-/// Rust via `miniz_oxide`.
+/// EWF segment files (`*.E01`, `*.E02`, …) are self-describing
+/// containers: an `EVF` file header, framed section descriptors and
+/// `table`/`table2` block maps pointing at zlib/deflate-compressed
+/// chunks. [`ewf::EwfSource`] opens single- and multi-segment images and
+/// exposes them as a [`ByteSource`] alongside the stored acquisition
+/// hashes and error ranges. EWF2 (`*.Ex01`) and logical (`.L01`) images
+/// are detected and reported as [`Error::Unsupported`]. No FFI to
+/// libewf — decompression is pure Rust via `miniz_oxide`.
 pub mod ewf;
 
 pub use error::{Error, Result};
