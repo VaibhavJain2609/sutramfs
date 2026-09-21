@@ -1,3 +1,6 @@
+// Shared corpus helpers — not every test binary uses every helper.
+#![allow(dead_code)]
+
 //! Synthetic FAT12 corpus for `sutram-report` tests — the `sutram-cli`
 //! image-builder pattern: byte-by-byte construction, no fixtures.
 //!
