@@ -121,12 +121,12 @@ struct Header {
     next: u64,
 }
 
-fn hex_field(f: &[u8]) -> Option<u64> {
+pub(crate) fn hex_field(f: &[u8]) -> Option<u64> {
     let s = std::str::from_utf8(f).ok()?;
     u64::from_str_radix(s.trim(), 16).ok()
 }
 
-fn oct_field(f: &[u8]) -> Option<u64> {
+pub(crate) fn oct_field(f: &[u8]) -> Option<u64> {
     let s = std::str::from_utf8(f).ok()?;
     u64::from_str_radix(s.trim_end_matches('\0').trim(), 8).ok()
 }
@@ -142,7 +142,7 @@ fn r16e(b: &[u8], le: bool) -> u64 {
 
 /// Binary 32-bit fields: two 16-bit halves, most-significant first
 /// (PDP-endian), each half in the archive's byte order.
-fn r32bin(b: &[u8], le: bool) -> u64 {
+pub(crate) fn r32bin(b: &[u8], le: bool) -> u64 {
     (r16e(b, le) << 16) | r16e(&b[2..], le)
 }
 

@@ -284,7 +284,7 @@ fn skip_data_descriptor(src: &dyn ByteSource, data_end: u64, zip64: bool) -> u64
 }
 
 /// DOS date+time → `FsTimestamp` (modified; 2 s granularity).
-fn dos_timestamp(date: u16, time: u16) -> FsTimestamp {
+pub(crate) fn dos_timestamp(date: u16, time: u16) -> FsTimestamp {
     let value = if date == 0 {
         None
     } else {
@@ -317,7 +317,7 @@ fn filetime_ns(v: u64) -> Option<i64> {
 }
 
 /// Decode a member name: UTF-8 when flag 11 set, else CP437.
-fn decode_name(raw: &[u8], utf8: bool) -> String {
+pub(crate) fn decode_name(raw: &[u8], utf8: bool) -> String {
     if utf8 {
         return String::from_utf8_lossy(raw).into_owned();
     }
@@ -344,7 +344,7 @@ fn cp437_upper(b: u8) -> char {
 /// Turn a raw member name into a safe relative path (no leading `/`).
 /// `".."` components (zip-slip attempts) become `"__"`; the verbatim name
 /// is preserved separately in `meta["raw_name"]`.
-fn member_path(raw: &[u8], utf8: bool) -> (String, bool /*is_dir*/) {
+pub(crate) fn member_path(raw: &[u8], utf8: bool) -> (String, bool /*is_dir*/) {
     let decoded = decode_name(raw, utf8);
     let is_dir = decoded.ends_with('/');
     let mut comps = Vec::new();

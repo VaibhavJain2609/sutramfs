@@ -92,7 +92,7 @@ fn is_zero_block(b: &[u8]) -> bool {
 
 /// Header checksum: bytes 148..156 are stored as the octal sum, computed
 /// with those bytes treated as spaces. Accept unsigned and signed sums.
-fn checksum_ok(h: &[u8]) -> bool {
+pub(crate) fn checksum_ok(h: &[u8]) -> bool {
     let stored = match parse_octal(&h[148..156]) {
         Some(v) => v as i64,
         None => return false,
@@ -108,7 +108,7 @@ fn checksum_ok(h: &[u8]) -> bool {
 }
 
 /// Octal field: leading spaces/NUL skipped, digits until NUL/space.
-fn parse_octal(f: &[u8]) -> Option<u64> {
+pub(crate) fn parse_octal(f: &[u8]) -> Option<u64> {
     let mut v: u64 = 0;
     let mut seen = false;
     for &b in f {
@@ -131,7 +131,7 @@ fn parse_octal(f: &[u8]) -> Option<u64> {
 
 /// Size field: octal, or base-256 binary when the top bit is set
 /// (POSIX.1-2001 extension for >8 GiB members).
-fn parse_size(f: &[u8]) -> Option<u64> {
+pub(crate) fn parse_size(f: &[u8]) -> Option<u64> {
     if f.first().map(|b| b & 0x80 != 0).unwrap_or(false) {
         let mut v: u64 = (f[0] & 0x7f) as u64;
         for &b in &f[1..] {
@@ -217,7 +217,7 @@ fn parse_header(h: &[u8]) -> Result<Header> {
 }
 
 /// pax `len key=value\n` records.
-fn parse_pax(data: &[u8]) -> Vec<(String, String)> {
+pub(crate) fn parse_pax(data: &[u8]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < data.len() {
@@ -251,7 +251,7 @@ fn parse_pax(data: &[u8]) -> Vec<(String, String)> {
 }
 
 /// pax-style decimal timestamp `"sec[.frac]"` → nanoseconds.
-fn pax_ts(s: &str) -> Option<(u64, i64, &'static str)> {
+pub(crate) fn pax_ts(s: &str) -> Option<(u64, i64, &'static str)> {
     let (sec, frac) = s.split_once('.').unwrap_or((s, ""));
     let sec: i64 = sec.trim().parse().ok()?;
     let nanos = if frac.is_empty() {
