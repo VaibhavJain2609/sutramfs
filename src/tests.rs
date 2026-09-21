@@ -4,7 +4,7 @@ use crate::attr::{
     self, decode_runlist, filetime_ts, parse_attr, parse_attr_list, parse_ea, parse_fn,
     parse_object_id, parse_reparse, parse_si, parse_volume_information, parse_volume_name,
 };
-use crate::lznt1;
+use sutram_compress::lznt1;
 use crate::record::{apply_fixup, apply_indx_fixup, parse_record};
 
 #[test]

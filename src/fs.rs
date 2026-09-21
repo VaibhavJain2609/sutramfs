@@ -1103,12 +1103,12 @@ impl CompressedReader {
             self.buf.resize(unit_bytes, 0); // wholly sparse unit
             return Ok(());
         }
-        if stored.len() >= unit_bytes || !crate::lznt1::looks_compressed(&stored) {
+        if stored.len() >= unit_bytes || !sutram_compress::lznt1::looks_compressed(&stored) {
             // Stored raw (incompressible unit).
             stored.resize(unit_bytes, 0);
             self.buf = stored;
         } else {
-            let (out, clean) = crate::lznt1::decompress_unit(&stored, unit_bytes);
+            let (out, clean) = sutram_compress::lznt1::decompress_unit(&stored, unit_bytes);
             if !clean && out.is_empty() {
                 stored.resize(unit_bytes, 0);
                 self.buf = stored;

@@ -46,7 +46,6 @@ mod attr;
 mod boot;
 mod fs;
 mod indx;
-mod lznt1;
 mod record;
 mod walk;
 
