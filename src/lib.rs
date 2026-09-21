@@ -14,6 +14,7 @@
 
 pub mod entropy;
 pub mod hash;
+pub mod suspicion;
 pub mod timeline;
 
 pub use entropy::{
@@ -23,5 +24,8 @@ pub use entropy::{
 pub use hash::{
     hash_entry, hash_reader, hash_source, verify_acquisition, verify_ewf, verify_source,
     AcqVerification, Digests, HashMismatch, HashResult, Md5, MediaHashes, Sha1, Sha256,
+};
+pub use suspicion::{
+    assess, assess_with, score_entry, Assessment, EntrySuspicion, Signals, Suspicion,
 };
 pub use timeline::{Timeline, TimelineEvent, TimelineOptions};
