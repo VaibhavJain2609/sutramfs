@@ -1606,3 +1606,219 @@ fn vhdx_reserved_bat_state_io_errors() {
     let e = v.read_at(0, &mut buf).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
 }
+
+// ---------------------------------------------------------------------------
+// QCOW2 synthetic-image corpus
+// ---------------------------------------------------------------------------
+
+const QCOW2_CBITS: u32 = 12; // 4 KiB clusters
+const QCOW2_CS: usize = 1 << QCOW2_CBITS;
+
+/// Build a QCOW2 image: header + L1 + L2 tables + cluster payloads.
+/// `clusters[i]` describes guest cluster i:
+///   Raw(data)   — stored uncompressed at a fresh host cluster;
+///   Comp(data)  — stored as raw deflate;
+///   Unalloc     — L2 entry 0;
+///   ZeroFlag    — L2 entry with the ZERO bit set.
+enum QCluster {
+    Raw(Vec<u8>),
+    Comp(Vec<u8>),
+    Unalloc,
+    ZeroFlag,
+}
+use QCluster::*;
+
+fn build_qcow2(clusters: &[QCluster], version: u32) -> Vec<u8> {
+    let cs = QCOW2_CS as u64;
+    let l2e = cs / 8; // entries per L2 table
+    let total = clusters.len() as u64;
+    let needed_l1 = total.div_ceil(l2e).max(1) as usize;
+    // layout: header @0, l1 @ 512, l2 tables @ 4096+, payloads after
+    let l1_off = 512u64;
+    let l2_base = 4096u64;
+    let mut img = vec![0u8; l2_base as usize + needed_l1 * QCOW2_CS];
+    img[..4].copy_from_slice(&0x5146_49FBu32.to_be_bytes());
+    img[4..8].copy_from_slice(&version.to_be_bytes());
+    img[20..24].copy_from_slice(&QCOW2_CBITS.to_be_bytes());
+    img[24..32].copy_from_slice(&(total * cs).to_be_bytes());
+    img[36..40].copy_from_slice(&(needed_l1 as u32).to_be_bytes());
+    img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+    if version == 3 {
+        img[96..100].copy_from_slice(&4u32.to_be_bytes()); // refcount_order
+        img[100..104].copy_from_slice(&(HEADER_LEN as u32).to_be_bytes());
+    }
+
+    let csize_shift = 62 - (QCOW2_CBITS - 8);
+    let csize_mask = (1u64 << (QCOW2_CBITS - 8)) - 1;
+    // L1 entry i → L2 table i at l2_base + i*cs, marked COPIED.
+    for i in 0..needed_l1 {
+        let e = ((l2_base + i as u64 * cs) & 0x00FF_FFFF_FFFF_FE00) | (1 << 63);
+        img[l1_off as usize + i * 8..l1_off as usize + i * 8 + 8]
+            .copy_from_slice(&e.to_be_bytes());
+    }
+    for (i, c) in clusters.iter().enumerate() {
+        let l1i = i as u64 / l2e;
+        let l2i = i as u64 % l2e;
+        let l2e_off = (l2_base + l1i * cs) as usize + l2i as usize * 8;
+        match c {
+            Raw(d) => {
+                assert!(d.len() <= QCOW2_CS);
+                img.resize(img.len().div_ceil(QCOW2_CS) * QCOW2_CS, 0);
+                let off = img.len() as u64;
+                img.extend_from_slice(d);
+                img.resize(off as usize + QCOW2_CS, 0);
+                let e = (off & 0x00FF_FFFF_FFFF_FE00) | (1 << 63);
+                img[l2e_off..l2e_off + 8].copy_from_slice(&e.to_be_bytes());
+            }
+            Comp(d) => {
+                let z = miniz_oxide::deflate::compress_to_vec(d, 6); // raw deflate
+                let off = img.len() as u64;
+                img.extend_from_slice(&z);
+                let nb_sec = (off % 512 + z.len() as u64).div_ceil(512);
+                let e = (1u64 << 62)
+                    | (((nb_sec - 1) & csize_mask) << csize_shift)
+                    | (off & ((1 << csize_shift) - 1));
+                img[l2e_off..l2e_off + 8].copy_from_slice(&e.to_be_bytes());
+            }
+            Unalloc => {} // entry stays 0
+            ZeroFlag => {
+                img[l2e_off..l2e_off + 8].copy_from_slice(&1u64.to_be_bytes());
+            }
+        }
+    }
+    img
+}
+
+const HEADER_LEN: usize = 104;
+
+fn qcow_media(n: usize) -> Vec<u8> {
+    (0..n).map(|i| ((i * 17 + i / 11 * 5 + 3) & 0xff) as u8).collect()
+}
+
+#[test]
+fn qcow2_roundtrip_mixed_clusters() {
+    let d0 = qcow_media(QCOW2_CS);
+    let d1 = qcow_media(QCOW2_CS / 2); // compressed, partial cluster
+    let img = build_qcow2(
+        &[Raw(d0.clone()), Comp(d1.clone()), Unalloc, ZeroFlag],
+        3,
+    );
+    assert!(qcow2::Qcow2Source::is_qcow2(&img.as_slice()));
+    let q = qcow2::Qcow2Source::open(vec_src(img)).unwrap();
+    assert_eq!(q.info().version, 3);
+    assert_eq!(q.info().cluster_size, QCOW2_CS as u64);
+    assert_eq!(q.len(), 4 * QCOW2_CS as u64);
+    let mut expected = d0.clone();
+    expected.extend_from_slice(&d1);
+    expected.resize(4 * QCOW2_CS, 0);
+    assert_eq!(q.read_slice(0, 4 * QCOW2_CS).unwrap(), expected);
+    // cross-cluster read
+    let off = QCOW2_CS - 10;
+    let mut exp2 = d0[off..].to_vec();
+    exp2.extend_from_slice(&d1[..20]);
+    assert_eq!(q.read_slice(off as u64, 30).unwrap(), exp2);
+    assert!(q.warnings().is_empty(), "{:?}", q.warnings());
+}
+
+#[test]
+fn qcow2_version2_and_hostoff() {
+    // v2 header + an L2 entry pointing at an absolute file offset (the
+    // host region is appended after the image is laid out).
+    let d0 = qcow_media(QCOW2_CS);
+    let mut img = build_qcow2(&[Raw(d0.clone()), Unalloc], 2);
+    let tail_off = img.len() as u64;
+    img.extend_from_slice(&vec![0x77u8; QCOW2_CS]);
+    // Point cluster 1's L2 entry at the appended data (COPIED + offset).
+    let e = (tail_off & 0x00FF_FFFF_FFFF_FE00) | (1 << 63);
+    img[4096 + 8..4096 + 16].copy_from_slice(&e.to_be_bytes());
+    let q = qcow2::Qcow2Source::open(vec_src(img)).unwrap();
+    assert_eq!(q.info().version, 2);
+    assert_eq!(q.read_slice(0, QCOW2_CS).unwrap(), d0);
+    assert!(q
+        .read_slice(QCOW2_CS as u64, QCOW2_CS)
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0x77));
+}
+
+#[test]
+fn qcow2_encrypted_and_backing_unsupported() {
+    let d0 = qcow_media(QCOW2_CS);
+    let mut img = build_qcow2(&[Raw(d0.clone())], 3);
+    // crypt_method = 1 (AES)
+    img[32..36].copy_from_slice(&1u32.to_be_bytes());
+    match qcow2::Qcow2Source::open(vec_src(img)) {
+        Err(Error::Unsupported { msg }) => assert!(msg.contains("crypt_method")),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("expected Unsupported, got an opened image"),
+    }
+    // backing file set
+    let mut img = build_qcow2(&[Raw(d0.clone())], 3);
+    img[8..16].copy_from_slice(&4096u64.to_be_bytes());
+    img[16..20].copy_from_slice(&4u32.to_be_bytes());
+    match qcow2::Qcow2Source::open(vec_src(img)) {
+        Err(Error::Unsupported { msg }) => assert!(msg.contains("backing")),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("expected Unsupported, got an opened image"),
+    }
+    // old qcow v1
+    let mut img = build_qcow2(&[Raw(d0)], 3);
+    img[4..8].copy_from_slice(&1u32.to_be_bytes());
+    match qcow2::Qcow2Source::open(vec_src(img)) {
+        Err(Error::Unsupported { msg }) => assert!(msg.contains("version")),
+        Err(e) => panic!("expected Unsupported, got {e:?}"),
+        Ok(_) => panic!("expected Unsupported, got an opened image"),
+    }
+}
+
+#[test]
+fn qcow2_corrupt_deflate_io_error() {
+    let d0 = qcow_media(QCOW2_CS);
+    let mut img = build_qcow2(&[Comp(d0.clone()), Raw(d0.clone())], 3);
+    // find the compressed stream: it's appended right after the L2 table
+    // region; corrupt the middle of it. The compressed payload begins at
+    // the first byte after l2_base + cs (l1 covers it) — locate via the
+    // L2 entry.
+    let cs = QCOW2_CS as u64;
+    let l2e = le::u64_be(&img, 4096).unwrap(); // entry 0 in L2 table 0
+    let csize_shift = 62 - (QCOW2_CBITS - 8);
+    let comp_off = (l2e & ((1u64 << csize_shift) - 1)) as usize;
+    img[comp_off + 4] ^= 0xFF;
+    let q = qcow2::Qcow2Source::open(vec_src(img)).unwrap();
+    let mut buf = vec![0u8; QCOW2_CS];
+    let e = q.read_at(0, &mut buf).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    // the raw cluster still reads fine
+    assert_eq!(q.read_slice(cs, QCOW2_CS).unwrap(), d0);
+}
+
+#[test]
+fn qcow2_truncated_l2_and_bad_offsets_zero_fill() {
+    let d0 = qcow_media(QCOW2_CS);
+    let mut img = build_qcow2(&[Raw(d0.clone()), Raw(d0.clone())], 3);
+    // point cluster 1's L2 entry past EOF
+    img[4096 + 8..4096 + 16].copy_from_slice(&((0x00FF_FFFFu64 << 9) | (1 << 63)).to_be_bytes());
+    let q = qcow2::Qcow2Source::open(vec_src(img)).unwrap();
+    assert_eq!(q.read_slice(0, QCOW2_CS).unwrap(), d0);
+    assert!(q
+        .read_slice(QCOW2_CS as u64, QCOW2_CS)
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0));
+}
+
+#[test]
+fn qcow2_bad_magic_and_geometry() {
+    let res = qcow2::Qcow2Source::open(vec_src(vec![0u8; 4096]));
+    assert!(matches!(res, Err(Error::Corrupt { .. })));
+    let res = qcow2::Qcow2Source::open(vec_src(vec![0u8; 10]));
+    assert!(matches!(res, Err(Error::Truncated { .. })));
+    // absurd cluster_bits
+    let d0 = qcow_media(QCOW2_CS);
+    let mut img = build_qcow2(&[Raw(d0)], 3);
+    img[20..24].copy_from_slice(&63u32.to_be_bytes());
+    assert!(matches!(
+        qcow2::Qcow2Source::open(vec_src(img)),
+        Err(Error::Corrupt { .. })
+    ));
+}

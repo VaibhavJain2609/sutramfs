@@ -61,6 +61,15 @@ pub mod ewf;
 /// are reported as [`Error::Unsupported`].
 pub mod vhd;
 
+/// Pure-Rust QCOW2 (`*.qcow2`) image reader.
+///
+/// [`qcow2::Qcow2Source`] walks the two-level L1/L2 cluster map and
+/// exposes the virtual disk as a [`ByteSource`], including raw-deflate
+/// compressed clusters. Backing-file (differencing) and encrypted
+/// (AES/LUKS) images are reported as [`Error::Unsupported`]; refcount
+/// tables are ignored — this reader never writes.
+pub mod qcow2;
+
 pub use error::{Error, Result};
 pub use partition::{
     open_partitions, partitions, Partition, PartitionSource, TableKind,

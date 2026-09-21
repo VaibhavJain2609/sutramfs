@@ -27,6 +27,8 @@ between a raw acquisition and a filesystem parser:
 - `vhd::VhdSource` — VHD and VHDX virtual-disk reader: fixed and
   dynamic VHD (BAT + sector bitmaps), non-differencing VHDX (region
   table + u64 BAT, CRC-32C-checked headers).
+- `qcow2::Qcow2Source` — QCOW2 reader: two-level L1/L2 cluster map,
+  raw-deflate compressed clusters, zero/unallocated cluster handling.
 
 ## Forensic guarantees
 
@@ -156,6 +158,40 @@ for w in img.warnings() { eprintln!("vhd: {w}"); }
   allocation map says unallocated; CRC failures on VHDX headers/region
   tables fail open only if the redundant copy validates.
 
+## QCOW2 support
+
+`qcow2::Qcow2Source::open` exposes a QCOW2 virtual disk as a
+`ByteSource`:
+
+```rust,no_run
+use sutram_io::{into_arc, FileSource};
+use sutram_io::qcow2::Qcow2Source;
+
+let img = Qcow2Source::open(into_arc(FileSource::open("disk.qcow2")?))?;
+println!("v{} {} bytes, {}-byte clusters",
+    img.info().version, img.len(), img.info().cluster_size);
+# Ok::<(), sutram_io::Error>(())
+```
+
+- Versions 2 and 3; unallocated, zero-flagged and compressed clusters all
+  handled (compressed clusters are raw deflate — QEMU's "zlib" mode has
+  no zlib wrapper — decoded via `miniz_oxide`).
+- Unallocated clusters and out-of-range host offsets read as zeros; a
+  corrupt deflate stream yields `io::Error(InvalidData)` on reads
+  touching it.
+- Refcount tables are ignored — the reader never writes.
+- Decoded clusters are served through a bounded LRU cache; L2 tables are
+  cached raw.
+
+### QCOW2 limitations
+
+- **No backing files** (differencing), no AES/LUKS encryption, no
+  external-data-file / extended-L2 / non-deflate-compression
+  incompatible features — all return `Error::Unsupported`.
+- `dirty`/`corrupt` incompatible flags and unknown feature bits produce
+  warnings, not failures.
+- Snapshots are not exposed (the active image is what you read).
+
 ## Deleted / recovery semantics
 
 This crate is below the filesystem layer and therefore reports no file
@@ -167,8 +203,8 @@ regions — nothing is filtered).
 
 - EWF support covers E01 segments (single- and multi-segment `.E02`+);
   EWF2 (`.Ex01`), L01 and SMART `.s01` variants return `Unsupported`.
-- VHD/VHDX: no differencing/parent chains; qcow2 and VMDK are not yet
-  decoded.
+- VHD/VHDX and QCOW2: no differencing/backing-file chains, no encrypted
+  qcow2; VMDK is not yet decoded.
 - Partition parsing assumes 512-byte sectors, probing 4096 only for GPT.
 - BSD disklabels, APM and dynamic (LDM) disks are not parsed.
 
