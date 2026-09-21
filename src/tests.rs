@@ -147,6 +147,51 @@ fn superblock_rejects_garbage() {
 }
 
 #[test]
+fn attr_shortform_decodes() {
+    // xfs_attr_sf_hdr = {totsize u16, count u8} then entries
+    // {namelen u8, valuelen u8, flags u8, name[], value[]}.
+    let mut b = Vec::new();
+    b.extend_from_slice(&0u16.to_be_bytes()); // totsize (unused)
+    b.push(2); // count
+    // entry 0: user.lang = en_US
+    b.extend_from_slice(&[4, 5, 0]);
+    b.extend_from_slice(b"lang");
+    b.extend_from_slice(b"en_US");
+    // entry 1: trusted.key = 0xAA (ROOT flag)
+    b.extend_from_slice(&[3, 1, 2]);
+    b.extend_from_slice(b"key");
+    b.push(0xAA);
+    let attrs = crate::attr::parse_local(&b);
+    assert_eq!(attrs.len(), 2);
+    assert_eq!(attrs[0].name, "user.lang");
+    assert_eq!(attrs[0].value.as_deref(), Some(b"en_US".as_slice()));
+    assert_eq!(attrs[1].name, "trusted.key");
+    assert_eq!(attrs[1].value.as_deref(), Some(&[0xAA][..]));
+}
+
+#[test]
+fn remote_attr_reads_xarm_blocks() {
+    // v5 remote value: each block carries a 56-byte 'XARM' header; the
+    // value spans block0's payload (4040 B) + 4 bytes of block1's.
+    let mut img = vec![0u8; 2 * 4096];
+    img[0..4].copy_from_slice(&0x5841_524Du32.to_be_bytes()); // XARM
+    img[56..4096].fill(b'A');
+    img[4096..4100].copy_from_slice(&0x5841_524Du32.to_be_bytes());
+    img[4096 + 56..4096 + 60].copy_from_slice(b"done");
+    let sb = test_sb();
+    let e = crate::extent::Extent {
+        fileoff: 0,
+        fsb: 0,
+        len: 2,
+        unwritten: false,
+    };
+    let v = crate::attr::remote_read(&img, &sb, &[e], 0, 4044).unwrap();
+    assert_eq!(v.len(), 4044);
+    assert!(v[..4040].iter().all(|&b| b == b'A'));
+    assert_eq!(&v[4040..], b"done");
+}
+
+#[test]
 fn attr_v2_leaf_layout() {
     // v2 attr leaf: xfs_da_blkinfo = 12 B (magic u16 @8), leaf hdr =
     // 32 B (count @12, freemap[3] @20), entries @32 — 8 B each.

@@ -564,6 +564,145 @@ fn truncation_is_graceful() {
 }
 
 #[test]
+fn bmbt_btree_file_reads_data() {
+    // File inode with format=BTREE: in-inode xfs_bmdr_block root
+    // (level 1, 1 rec) → disk leaf 'BMA3' at fsb 40 holding the extent
+    // records. Data at fsb 41.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("big", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_data(41, b"btree payload!");
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 3, // btree fork
+            size: 14,
+            nblocks: 1,
+            ..Default::default()
+        },
+    );
+    // Overwrite the fork with a bmdr root: level=1 numrecs=1, then
+    // maxrecs keys + maxrecs ptrs (ptr[0] → fsb 40). Re-crc the inode.
+    {
+        let pos = i.ino_pos(65);
+        let ib = &mut i.b[pos..pos + ISZ];
+        let fork = &mut ib[176..];
+        fork.fill(0);
+        w16(fork, 0, 1); // level 1 → children are leaves
+        w16(fork, 2, 1); // numrecs
+        let maxrecs = (fork.len() - 4) / 16;
+        // key[0] = fileoff 0 at offset 4; ptr[0] at 4 + maxrecs*8.
+        w64(fork, 4, 0);
+        w64(fork, 4 + maxrecs * 8, 40);
+        write_crc(ib, 100);
+    }
+    // Leaf at fsb 40: BMA3 header (72 B) + 1 extent record.
+    {
+        let blk = i.blk_mut(40);
+        w32(blk, 0, 0x424D_4133); // 'BMA3'
+        w16(blk, 4, 0); // level 0 = leaf
+        w16(blk, 6, 1); // numrecs
+        w64(blk, 8, u64::MAX); // leftsib
+        w64(blk, 16, u64::MAX); // rightsib
+        w64(blk, 24, 40); // blkno
+        blk[40..56].copy_from_slice(&UUID);
+        w64(blk, 56, 65); // owner
+        let rec = extent_rec(&ExtentSpec {
+            fileoff: 0,
+            fsb: 41,
+            len: 1,
+            unwritten: false,
+        });
+        blk[72..88].copy_from_slice(&rec);
+        write_crc(blk, 64); // lblock crc is __le32
+    }
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec {
+        startino: 64,
+        freecount: 62,
+        free,
+    });
+    i.free = vec![(28, 12), (42, 22), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().collect::<Result<_, _>>().expect("walk");
+    let big = entries
+        .iter()
+        .find(|e| e.path == "/big")
+        .expect("big file");
+    let mut buf = Vec::new();
+    fs.read_file(big).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"btree payload!");
+}
+
+#[test]
+fn sparse_file_holes_read_as_zeros() {
+    // Extents at fileoff 0 and fileoff 2 — file block 1 is a hole and
+    // must read back as zeros, not the next extent's data.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("sparse", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_data(24, b"HEAD");
+    i.write_data(26, b"TAIL");
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 2,
+            size: 3 * BS as u64,
+            nblocks: 2,
+            extents: vec![
+                ExtentSpec {
+                    fileoff: 0,
+                    fsb: 24,
+                    len: 1,
+                    unwritten: false,
+                },
+                ExtentSpec {
+                    fileoff: 2,
+                    fsb: 26,
+                    len: 1,
+                    unwritten: false,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec {
+        startino: 64,
+        freecount: 62,
+        free,
+    });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().collect::<Result<_, _>>().expect("walk");
+    let e = entries
+        .iter()
+        .find(|e| e.path == "/sparse")
+        .expect("sparse file");
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(&buf[..4], b"HEAD");
+    assert!(buf[4096..8192].iter().all(|&b| b == 0), "hole not zeros");
+    assert_eq!(&buf[8192..8196], b"TAIL");
+}
+
+#[test]
 fn second_btree_level_walked() {
     // Force inobt to two levels: root node at blk2 (IAB3 level 1) with
     // one child leaf at blk3 carrying the chunk record.
