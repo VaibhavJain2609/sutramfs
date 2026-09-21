@@ -44,11 +44,22 @@ pub fn crc32c(seed: u32, mut crc: u32, buf: &[u8]) -> u32 {
     crc
 }
 
-/// XFS checksum: ~crc32c(~0, buf with field zeroed), stored little-endian.
+/// XFS checksum: ~crc32c(~0, buf with field zeroed).
+///
+/// Stored **little-endian** for the superblock, inodes and btree blocks;
+/// **big-endian** for AGF/AGI/AGFL, dir3/attr3 blk hdrs and symlink hdrs
+/// (the field types in `xfs_format.h`/`xfs_da_format.h`).
 pub fn write_crc(buf: &mut [u8], crc_off: usize) {
     buf[crc_off..crc_off + 4].fill(0);
     let c = !crc32c(0xFFFF_FFFF, 0, buf);
     buf[crc_off..crc_off + 4].copy_from_slice(&c.to_le_bytes());
+}
+
+/// Same checksum, stored big-endian (AGF/AGI/AGFL/dir3/attr3 blocks).
+pub fn write_crc_be(buf: &mut [u8], crc_off: usize) {
+    buf[crc_off..crc_off + 4].fill(0);
+    let c = !crc32c(0xFFFF_FFFF, 0, buf);
+    buf[crc_off..crc_off + 4].copy_from_slice(&c.to_be_bytes());
 }
 
 // ---- big-endian writers ----
@@ -305,7 +316,7 @@ impl Img {
             w16(blk, tail - 2, off as u16);
         }
         if self.write_crcs {
-            write_crc(blk, 4);
+            write_crc_be(blk, 4);
         }
     }
 
@@ -412,7 +423,7 @@ impl Img {
             b[64..80].copy_from_slice(&UUID);
             w64(b, 208, 0x99); // lsn
             if self.write_crcs {
-                write_crc(b, 216);
+                write_crc_be(b, 216);
             }
         }
         // AGI at sector 2.
@@ -441,7 +452,7 @@ impl Img {
             w32(b, 328, 3); // free_root (finobt)
             w32(b, 332, 1); // free_level
             if self.write_crcs {
-                write_crc(b, 312);
+                write_crc_be(b, 312);
             }
         }
         // AGFL at sector 3 — magic only (v5).
@@ -451,7 +462,7 @@ impl Img {
             w64(b, 8, 3); // blkno-ish
             b[24..40].copy_from_slice(&UUID);
             if self.write_crcs {
-                write_crc(b, 4);
+                write_crc_be(b, 4);
             }
         }
         // Superblock at sector 0.

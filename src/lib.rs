@@ -22,8 +22,10 @@
 //!
 //! XFS on-disk metadata is **big-endian**. Every field is decoded through
 //! explicit `u16_be`/`u32_be`/`u64_be` reads — no host-order assumptions,
-//! no unsafe code. The one exception is the CRC field itself, which is
-//! little-endian even on disk (see `xfs_cksum.h`).
+//! no unsafe code. CRC fields are mixed-endian: `__le32` on the
+//! superblock, inodes and btree blocks, but `__be32` on AGF/AGI/AGFL
+//! sector headers and dir3/attr3/symlink block headers (see
+//! `xfs_format.h`, `xfs_da_format.h`).
 //!
 //! ## Known limitations
 //!

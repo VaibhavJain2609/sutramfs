@@ -6,8 +6,11 @@
 //!
 //! 1. zero the 4-byte crc field,
 //! 2. `crc = crc32c(seed = 0xFFFF_FFFF, object_bytes)`,
-//! 3. store `!crc` as **little-endian** at the field offset
-//!    (the only little-endian field in XFS metadata).
+//! 3. store `!crc` at the field offset — **little-endian** for the
+//!    superblock, inodes and btree blocks (`__le32` fields), but
+//!    **big-endian** for AGF/AGI/AGFL sector headers and dir3/attr3/
+//!    symlink block headers (`__be32` fields). Callers pick the
+//!    byte order per object type.
 //!
 //! [`crc32c`] mirrors the Linux `crc32c(seed, buf)` contract: the seed is
 //! the running CRC state verbatim — no implicit complement — and the

@@ -414,11 +414,12 @@ impl<'m> Walk<'m> {
                 continue;
             };
             if cur == NULLAGINO {
-                if bucket >= 63 {
+                // Chain exhausted — load the next bucket's head.
+                if bucket >= 64 {
                     self.ul = (ag + 1, 0, NULLAGINO);
                     continue;
                 }
-                self.ul = (ag, bucket + 1, agi.unlinked[bucket + 1]);
+                self.ul = (ag, bucket + 1, agi.unlinked[bucket]);
                 continue;
             }
             let ino = ((ag as u64) << self.fs.sb.agino_bits()) | cur as u64;

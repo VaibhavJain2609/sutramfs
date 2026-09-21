@@ -127,7 +127,7 @@ pub(crate) fn collect(
 }
 
 /// Walk every extent of an extent/btree attr fork and parse leaf blocks.
-fn collect_leaf(
+pub(crate) fn collect_leaf(
     src: &dyn ByteSource,
     sb: &Superblock,
     extents: &[Extent],
@@ -151,12 +151,16 @@ fn collect_leaf(
                 _ => continue, // may be a remote value block or node
             };
             if v3 && sb.has_crc() {
-                let stored = u32::from_le_bytes([blk[12], blk[13], blk[14], blk[15]]);
+                // xfs_da3_blkinfo.crc is __be32 (unlike sb/inode/btree).
+                let stored = u32::from_be_bytes([blk[12], blk[13], blk[14], blk[15]]);
                 if crc::verify(&blk, 12, stored) == Some(false) {
                     return Err(FsError::corrupt(off, "attr leaf CRC mismatch"));
                 }
             }
-            // Header: v3 = 80 B, v2 = 32 B; entries follow.
+            // Header sizes: v3 xfs_attr3_leaf_hdr = 80 B (da3 blkinfo 56 +
+            // count/usedbytes/firstused/holes/pad 8 + freemap[3] 12 +
+            // pad2 4), count at 56; v2 xfs_attr_leaf_hdr = 32 B
+            // (blkinfo 12 + same 8 + freemap[3] 12), count at 12.
             let (hdr_len, count_off) = if v3 { (80usize, 56usize) } else { (32, 12) };
             let count = u16_be(&blk, count_off).unwrap_or(0) as usize;
             for i in 0..count.min(MAX_ATTRS) {

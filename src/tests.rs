@@ -145,3 +145,58 @@ fn superblock_rejects_garbage() {
     b[0..4].copy_from_slice(&be32(0xDEAD_BEEF));
     assert!(Superblock::parse_buf(&b, 0).is_err());
 }
+
+#[test]
+fn attr_v2_leaf_layout() {
+    // v2 attr leaf: xfs_da_blkinfo = 12 B (magic u16 @8), leaf hdr =
+    // 32 B (count @12, freemap[3] @20), entries @32 — 8 B each.
+    let mut blk = vec![0u8; 4096];
+    blk[8..10].copy_from_slice(&0xFBEEu16.to_be_bytes()); // XFS_ATTR_LEAF_MAGIC
+    blk[12..14].copy_from_slice(&1u16.to_be_bytes()); // count = 1
+    // entry 0 @32: hashval, nameidx=100, flags=LOCAL(1), pad.
+    blk[36..38].copy_from_slice(&100u16.to_be_bytes());
+    blk[38] = 1;
+    // name block @100: {valuelen u16, namelen u8, name, value}.
+    blk[100..102].copy_from_slice(&5u16.to_be_bytes());
+    blk[102] = 4;
+    blk[103..107].copy_from_slice(b"lang");
+    blk[107..112].copy_from_slice(b"en_US");
+    let sb = test_sb();
+    let e = crate::extent::Extent {
+        fileoff: 0,
+        fsb: 0,
+        len: 1,
+        unwritten: false,
+    };
+    let attrs = crate::attr::collect_leaf(&blk, &sb, &[e]).unwrap();
+    assert_eq!(attrs.len(), 1);
+    assert_eq!(attrs[0].name, "user.lang");
+    assert_eq!(attrs[0].value.as_deref(), Some(b"en_US".as_slice()));
+}
+
+#[test]
+fn attr3_leaf_crc_is_big_endian() {
+    // dir3/da3-style blk hdrs store their crc field big-endian —
+    // unlike sb/inode/btree crcs. Build a v3 attr leaf with a valid
+    // BE crc at offset 12; collect_leaf must not report a CRC error.
+    let mut blk = vec![0u8; 4096];
+    blk[8..10].copy_from_slice(&0x3BEEu16.to_be_bytes()); // ATTR3_LEAF_MAGIC
+    blk[56..58].copy_from_slice(&0u16.to_be_bytes()); // count = 0
+    // crc over the block with bytes 12..16 zeroed, stored BE.
+    let c = crc::xfs_cksum(&blk, 12).unwrap();
+    blk[12..16].copy_from_slice(&c.to_be_bytes());
+    let sb = test_sb();
+    let e = crate::extent::Extent {
+        fileoff: 0,
+        fsb: 0,
+        len: 1,
+        unwritten: false,
+    };
+    let attrs = crate::attr::collect_leaf(&blk, &sb, &[e]).unwrap();
+    assert!(attrs.is_empty());
+    // And the same block with the crc stored little-endian must FAIL —
+    // guards against regressing to a uniform little-endian crc read.
+    let mut bad = blk.clone();
+    bad[12..16].copy_from_slice(&c.to_le_bytes());
+    assert!(crate::attr::collect_leaf(&bad, &sb, &[e]).is_err());
+}

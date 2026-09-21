@@ -213,6 +213,25 @@ fn test_image() -> Vec<u8> {
             ..Default::default()
         },
     );
+    // ino 128: unlinked-but-allocated in agi_unlinked bucket 0
+    // (ino%64=0) — regression: bucket 0 must be walked, not skipped.
+    i.write_inode(
+        128,
+        &InodeSpec {
+            format: 2,
+            size: 64,
+            nlink: 0,
+            nblocks: 1,
+            next_unlinked: NULLAGINO,
+            extents: vec![ExtentSpec {
+                fileoff: 0,
+                fsb: 36,
+                len: 1,
+                unwritten: false,
+            }],
+            ..Default::default()
+        },
+    );
     // ino 132: unlinked-but-allocated (agi_unlinked bucket 4, ino%64=4).
     i.write_inode(
         132,
@@ -243,8 +262,9 @@ fn test_image() -> Vec<u8> {
         freecount: free0.count_ones(),
         free: free0,
     });
-    // chunk 128 — 130,131 free w/ residue; 132 allocated; rest free.
+    // chunk 128 — 130,131 free w/ residue; 128,132 allocated; rest free.
     let mut free1 = u64::MAX;
+    free1 &= !(1 << 0); // ino 128 allocated (unlinked, bucket 0)
     free1 &= !(1 << 4); // ino 132 allocated (unlinked)
     i.inobt.push(ChunkRec {
         startino: 128,
@@ -257,6 +277,7 @@ fn test_image() -> Vec<u8> {
         freecount: free1.count_ones(),
         free: free1,
     });
+    i.unlinked[0] = 128; // bucket 0 — was skipped by an off-by-one cursor
     i.unlinked[4] = 132;
 
     // Free space: everything not in use.
@@ -402,6 +423,16 @@ fn unlinked_and_orphan_inodes() {
         .find(|e| e.entry_id == 132 && e.is_deleted())
         .expect("unlinked inode 132");
     assert_eq!(unl.meta.get("inode_source").map(String::as_str), Some("agi_unlinked"));
+
+    // Bucket-0 chain head — previously skipped by an off-by-one cursor.
+    let unl0 = entries
+        .iter()
+        .find(|e| e.entry_id == 128 && e.is_deleted())
+        .expect("unlinked inode 128 (bucket 0)");
+    assert_eq!(
+        unl0.meta.get("inode_source").map(String::as_str),
+        Some("agi_unlinked")
+    );
 
     let orph = entries
         .iter()

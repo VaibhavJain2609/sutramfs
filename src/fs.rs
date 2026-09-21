@@ -588,9 +588,10 @@ impl XfsFs {
                 if !have_any {
                     continue;
                 }
-                // v5 directory blocks are CRC-validated.
+                // v5 directory blocks are CRC-validated; the dir3 blk hdr
+                // crc field is __be32 (unlike sb/inode/btree crcs).
                 if self.sb.has_crc() {
-                    let stored = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    let stored = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
                     if crate::crc::verify(&buf, 4, stored) == Some(false) {
                         out.push(Err(FsError::corrupt(
                             blk_disk_off,

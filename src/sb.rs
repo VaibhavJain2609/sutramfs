@@ -513,7 +513,8 @@ impl Agf {
             return Err(FsError::corrupt(off + 4, "bad AGF version"));
         }
         let crc_ok = if crc {
-            let stored = u32::from_le_bytes([b[216], b[217], b[218], b[219]]);
+            // agf_crc is __be32 — unlike sb/inode/btree crcs (le32).
+            let stored = u32::from_be_bytes([b[216], b[217], b[218], b[219]]);
             crc::verify(&b[..b.len().min(512)], 216, stored)
         } else {
             None
@@ -554,7 +555,8 @@ impl Agi {
             unlinked.push(u32_be(b, 40 + i * 4).unwrap_or(NULLAGINO));
         }
         let crc_ok = if crc {
-            let stored = u32::from_le_bytes([b[312], b[313], b[314], b[315]]);
+            // agi_crc is __be32 — unlike sb/inode/btree crcs (le32).
+            let stored = u32::from_be_bytes([b[312], b[313], b[314], b[315]]);
             crc::verify(&b[..b.len().min(512)], 312, stored)
         } else {
             None
