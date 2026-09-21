@@ -1,3 +1,7 @@
+# Fuzzing: `cargo +nightly fuzz run parse_image` (see fuzz/).
+# cargo-fuzz is a dev tool only — no feature flag or dependency here;
+# the fuzz/ crate links libfuzzer-sys itself and stays out of the build
+# graph, so `cargo test` never requires nightly.
 [package]
 name = "sutram-apfs"
 version = "0.1.0"

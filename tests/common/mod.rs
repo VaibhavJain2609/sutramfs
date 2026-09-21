@@ -484,10 +484,8 @@ pub fn spaceman(oid: u64, xid: u64, free: u64) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 /// Build the two-checkpoint test image. `encrypted` flips the volume's
 /// UNENCRYPTED flag (FileVault fixture — no actual crypto is exercised).
-pub fn build_image(encrypted: bool) -> Vec<u8> {
-    let mut img: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-
-    // ---- fs-tree records --------------------------------------------------
+/// Shared inodes present in both generations.
+fn shared_inodes() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     // Shared in both generations.
     let root_inode = inode_val(1, ROOT_DIR, 0o040755, 3, &[]);
     let photo_inode = inode_val(
@@ -514,8 +512,13 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         ],
     );
 
-    // Generation B (live, xid 2).
-    let mut gen_b: Vec<(Vec<u8>, Vec<u8>)> = vec![
+    (root_inode, photo_inode, docs_inode)
+}
+
+/// Generation B (live, xid 2) fs-tree records.
+pub fn gen_b_records() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (root_inode, photo_inode, docs_inode) = shared_inodes();
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = vec![
         (
             jhdr(ROOT_DIR, JT_INODE).to_le_bytes().to_vec(),
             root_inode.clone(),
@@ -613,10 +616,14 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         sibling_link_kv(200, 503, 999, "alias4.png"),
         sibling_map_kv(503, 200),
     ];
-    gen_b.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
 
-    // Generation A (xid 1) = gen B + the since-deleted `old.txt` (inode 100,
-    // private_id 100 → extents at blocks 31 and 32).
+/// Generation A (xid 1): generation B's early state plus the since-deleted
+/// `old.txt` (inode 100, private_id 100 → extents at blocks 31 and 32).
+pub fn gen_a_records() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let (root_inode, photo_inode, docs_inode) = shared_inodes();
     let old_inode = inode_val(
         ROOT_DIR,
         100,
@@ -624,7 +631,7 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         1,
         &[xblob(8, &xf_dstream(8192, 8192, 0))],
     );
-    let mut gen_a: Vec<(Vec<u8>, Vec<u8>)> = vec![
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = vec![
         (
             jhdr(ROOT_DIR, JT_INODE).to_le_bytes().to_vec(),
             root_inode.clone(),
@@ -674,6 +681,27 @@ pub fn build_image(encrypted: bool) -> Vec<u8> {
         ),
         drec_kv(ROOT_DIR, "empty.bin", 501, 0x8, 0xeeee),
     ];
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+pub fn build_image(encrypted: bool) -> Vec<u8> {
+    build_image_with(encrypted, &[], &[])
+}
+
+/// `build_image` plus caller-supplied extra leaf records appended to each
+/// generation's fs tree (sorted into place).
+pub fn build_image_with(
+    encrypted: bool,
+    extra_b: &[(Vec<u8>, Vec<u8>)],
+    extra_a: &[(Vec<u8>, Vec<u8>)],
+) -> Vec<u8> {
+    let mut img: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut gen_b = gen_b_records();
+    gen_b.extend_from_slice(extra_b);
+    gen_b.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut gen_a = gen_a_records();
+    gen_a.extend_from_slice(extra_a);
     gen_a.sort_by(|a, b| a.0.cmp(&b.0));
 
     // ---- per-checkpoint object graphs -------------------------------------

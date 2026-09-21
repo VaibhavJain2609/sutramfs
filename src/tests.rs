@@ -716,3 +716,400 @@ fn btree_entry_at_bounds() {
     let node = BtreeNode::parse(&b, 0).unwrap();
     assert!(node.entry_at(0, (0, 0)).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Additional defensive-arm coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn obj_hdr_edges() {
+    use crate::object::Storage;
+    // Shorter than the 32-byte object header.
+    assert!(ObjHdr::parse(&[0u8; 16], 0, false).is_err());
+    // Checksum enforcement.
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&otype::BTREE_NODE.to_le_bytes());
+    seal(&mut b);
+    assert!(ObjHdr::parse(&b, 0, true).is_ok());
+    b[64] ^= 0xFF;
+    assert!(ObjHdr::parse(&b, 0, true).is_err());
+    // Storage classes + encrypted flag.
+    let mk = |otype: u32| {
+        let mut b = vec![0u8; 4096];
+        b[24..28].copy_from_slice(&otype.to_le_bytes());
+        ObjHdr::parse(&b, 0, false).unwrap()
+    };
+    assert_eq!(mk(otype::OMAP | oflags::EPHEMERAL).storage(), Storage::Ephemeral);
+    assert_eq!(mk(otype::OMAP | oflags::PHYSICAL).storage(), Storage::Physical);
+    assert_eq!(mk(otype::FSTREE).storage(), Storage::Virtual);
+    assert!(mk(otype::OMAP | oflags::ENCRYPTED).encrypted());
+    // type_name for every code this parser knows + the fallback.
+    let named = |code: u32| {
+        let mut b = vec![0u8; 4096];
+        b[24..28].copy_from_slice(&code.to_le_bytes());
+        ObjHdr::parse(&b, 0, false).unwrap().type_name()
+    };
+    assert_eq!(named(otype::NX_SUPERBLOCK), "nx_superblock");
+    assert_eq!(named(otype::BTREE), "btree");
+    assert_eq!(named(otype::BTREE_NODE), "btree_node");
+    assert_eq!(named(otype::SPACEMAN), "spaceman");
+    assert_eq!(named(otype::OMAP), "omap");
+    assert_eq!(named(otype::CHECKPOINT_MAP), "checkpoint_map");
+    assert_eq!(named(otype::FS), "apfs_superblock");
+    assert_eq!(named(otype::FSTREE), "fs_tree");
+    assert_eq!(named(otype::SNAPMETATREE), "snapmeta_tree");
+    assert_eq!(named(0xDEAD), "unknown");
+}
+
+/// One-entry leaf-node block with caller-controlled ToC fields.
+fn leaf_node(koff: u16, klen: u16, voff: u16, vlen: u16) -> Vec<u8> {
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&(otype::BTREE_NODE | oflags::PHYSICAL).to_le_bytes());
+    b[32..34].copy_from_slice(&0x3u16.to_le_bytes()); // ROOT|LEAF
+    b[36..40].copy_from_slice(&1u32.to_le_bytes());
+    b[42..44].copy_from_slice(&8u16.to_le_bytes()); // toc len
+    b[56..58].copy_from_slice(&koff.to_le_bytes());
+    b[58..60].copy_from_slice(&klen.to_le_bytes());
+    b[60..62].copy_from_slice(&voff.to_le_bytes());
+    b[62..64].copy_from_slice(&vlen.to_le_bytes());
+    seal(&mut b);
+    b
+}
+
+#[test]
+fn btree_parse_error_arms() {
+    // ToC offset beyond the block.
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&otype::BTREE_NODE.to_le_bytes());
+    b[32..34].copy_from_slice(&0x3u16.to_le_bytes());
+    b[40..42].copy_from_slice(&0xFFF0u16.to_le_bytes()); // toc_off
+    seal(&mut b);
+    assert!(BtreeNode::parse(&b, 0).is_err());
+    // nkeys exceeding the declared table space.
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&otype::BTREE_NODE.to_le_bytes());
+    b[32..34].copy_from_slice(&0x3u16.to_le_bytes());
+    b[36..40].copy_from_slice(&100u32.to_le_bytes()); // nkeys
+    b[42..44].copy_from_slice(&8u16.to_le_bytes()); // tiny table
+    seal(&mut b);
+    assert!(BtreeNode::parse(&b, 0).is_err());
+    // ToC index beyond nkeys.
+    let b = leaf_node(0, 8, 8, 8);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    assert!(node.entry_at(7, (0, 0)).is_err());
+    // Ghost entry (voff = BTOFF_INVALID) → empty value.
+    let b = leaf_node(0, 4, 0xFFFF, 8);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    let (_, k, v) = node.entry_at(0, (0, 0)).unwrap();
+    assert_eq!(k.len(), 4);
+    assert!(v.is_empty());
+    // Value offset underflow.
+    let b = leaf_node(0, 4, 0xF000, 8);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    assert!(node.entry_at(0, (0, 0)).is_err());
+}
+
+#[test]
+fn btree_child_at_error_arms() {
+    use crate::jrec;
+    let _ = jrec::ROOT_DIR_INODE;
+    // Internal node with a ghost entry → "internal entry is a ghost".
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&(otype::BTREE_NODE | oflags::PHYSICAL).to_le_bytes());
+    b[34..36].copy_from_slice(&1u16.to_le_bytes()); // level 1, not leaf
+    b[36..40].copy_from_slice(&1u32.to_le_bytes());
+    b[42..44].copy_from_slice(&8u16.to_le_bytes());
+    b[56..58].copy_from_slice(&0u16.to_le_bytes()); // koff
+    b[58..60].copy_from_slice(&8u16.to_le_bytes()); // klen
+    b[60..62].copy_from_slice(&0xFFFFu16.to_le_bytes()); // voff ghost
+    b[62..64].copy_from_slice(&8u16.to_le_bytes());
+    seal(&mut b);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    assert!(node.child_at(0, 8).is_err());
+    // Child key beyond the value area.
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&(otype::BTREE_NODE | oflags::PHYSICAL).to_le_bytes());
+    b[34..36].copy_from_slice(&1u16.to_le_bytes());
+    b[36..40].copy_from_slice(&1u32.to_le_bytes());
+    b[42..44].copy_from_slice(&8u16.to_le_bytes());
+    b[56..58].copy_from_slice(&0xFFF0u16.to_le_bytes()); // koff
+    b[58..60].copy_from_slice(&64u16.to_le_bytes()); // klen runs off
+    b[60..62].copy_from_slice(&8u16.to_le_bytes());
+    b[62..64].copy_from_slice(&8u16.to_le_bytes());
+    seal(&mut b);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    assert!(node.child_at(0, 8).is_err());
+    // Child offset underflow (voff > vals_end).
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&(otype::BTREE_NODE | oflags::PHYSICAL).to_le_bytes());
+    b[34..36].copy_from_slice(&1u16.to_le_bytes());
+    b[36..40].copy_from_slice(&1u32.to_le_bytes());
+    b[42..44].copy_from_slice(&8u16.to_le_bytes());
+    b[56..58].copy_from_slice(&0u16.to_le_bytes());
+    b[58..60].copy_from_slice(&8u16.to_le_bytes());
+    b[60..62].copy_from_slice(&0x8000u16.to_le_bytes()); // voff >> vals_end
+    b[62..64].copy_from_slice(&8u16.to_le_bytes());
+    seal(&mut b);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    assert!(node.child_at(0, 8).is_err());
+}
+
+#[test]
+fn btree_fixed_kv_fallback_arms() {
+    // A non-root FIXED_KV node uses the caller's sizes (no footer).
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&(otype::BTREE_NODE | oflags::PHYSICAL).to_le_bytes());
+    b[28..32].copy_from_slice(&otype::OMAP.to_le_bytes());
+    b[32..34].copy_from_slice(&(0x0002u16 | 0x0004).to_le_bytes()); // LEAF|FIXED
+    b[36..40].copy_from_slice(&1u32.to_le_bytes());
+    b[42..44].copy_from_slice(&4u16.to_le_bytes()); // 1 x kvoff_t
+    b[56..58].copy_from_slice(&0u16.to_le_bytes()); // koff
+    b[58..60].copy_from_slice(&16u16.to_le_bytes()); // voff → [4080..4096]
+    // key 16 B at keys_start (60+4=60? keys_start=56+4=60); val 16 B before block end.
+    let ks = 60usize;
+    b[ks..ks + 16].copy_from_slice(&[0xAAu8; 16]);
+    b[4096 - 16..].copy_from_slice(&[0xBBu8; 16]);
+    seal(&mut b);
+    let node = BtreeNode::parse(&b, 0).unwrap();
+    let (_off, k, v) = node.entry_at(0, (16, 16)).unwrap();
+    assert_eq!(k.len(), 16);
+    assert_eq!(v.len(), 16);
+}
+
+#[test]
+fn omap_decode_and_insert_arms() {
+    use crate::omap::{OmapEntry, OmapPhys};
+    assert!(OmapEntry::decode(&[0u8; 8], &[0u8; 16]).is_err());
+    assert!(OmapEntry::decode(&[0u8; 16], &[0u8; 8]).is_err());
+    // Insert ordering: equal xid replaces position (binary_search Ok arm).
+    let mut idx = OmapIndex::default();
+    let e = |xid: u64, paddr: u64| OmapEntry {
+        oid: 7,
+        xid,
+        flags: 0,
+        size: 4096,
+        paddr,
+    };
+    idx.insert(e(3, 30));
+    idx.insert(e(1, 10)); // out-of-order → Err(pos) arm
+    idx.insert(e(1, 11)); // dup xid → Ok(pos) arm
+    assert_eq!(idx.record_count, 3);
+    assert_eq!(idx.lookup(7, 2).unwrap().paddr, 10);
+    assert_eq!(idx.lookup(7, 5).unwrap().paddr, 30);
+    // Wrong o_type rejected.
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&otype::FSTREE.to_le_bytes());
+    assert!(OmapPhys::parse(&b, 0).is_err());
+}
+
+#[test]
+fn nx_parse_error_arms() {
+    // Not an NXSB object.
+    let mut b = nx_block(4096, 64);
+    b[24..28].copy_from_slice(&otype::OMAP.to_le_bytes());
+    seal(&mut b);
+    assert!(NxSuperblock::parse(&b, 0).is_err());
+    // Missing NXSB magic.
+    let mut b = nx_block(4096, 64);
+    b[32..36].fill(0);
+    seal(&mut b);
+    assert!(NxSuperblock::parse(&b, 0).is_err());
+    // Absurd block size.
+    let mut b = nx_block(4096, 64);
+    b[36..40].copy_from_slice(&3u32.to_le_bytes());
+    seal(&mut b);
+    assert!(NxSuperblock::parse(&b, 0).is_err());
+    // Declared block size exceeds the buffer → truncated.
+    let mut b = nx_block(8192, 64);
+    b.truncate(4096);
+    assert!(NxSuperblock::parse(&b, 0).is_err());
+    // block_count == 0.
+    let mut b = nx_block(4096, 0);
+    seal(&mut b);
+    assert!(NxSuperblock::parse(&b, 0).is_err());
+    // Zeroed fs_oid entries are skipped.
+    let mut b = nx_block(4096, 64);
+    b[180..184].copy_from_slice(&2u32.to_le_bytes()); // max_fs = 2
+    b[184..192].copy_from_slice(&0u64.to_le_bytes()); // slot 0 empty
+    b[192..200].copy_from_slice(&0x77u64.to_le_bytes());
+    seal(&mut b);
+    let nx = NxSuperblock::parse(&b, 0).unwrap();
+    assert_eq!(nx.fs_oids, vec![0x77]);
+    // Non-contiguous descriptor area flag.
+    let mut b = nx_block(4096, 64);
+    b[104..108].copy_from_slice(&0x8000_0008u32.to_le_bytes());
+    seal(&mut b);
+    let nx = NxSuperblock::parse(&b, 0).unwrap();
+    assert!(!nx.xp_desc_contiguous);
+}
+
+#[test]
+fn nx_read_block0_and_detect_arms() {
+    use sutram_fs::DetectConfidence;
+    // Tiny source → truncated.
+    assert!(NxSuperblock::read_block0(&vec![0u8; 64]).is_err());
+    // No magic at all.
+    let mut img = vec![0u8; 8192];
+    assert!(NxSuperblock::read_block0(&img).is_err());
+    // Magic but bad block size → read_block0 errors, detect → Low.
+    img[32..36].copy_from_slice(&crate::nx::NX_MAGIC.to_le_bytes());
+    img[36..40].copy_from_slice(&3u32.to_le_bytes());
+    assert!(NxSuperblock::read_block0(&img).is_err());
+    assert_eq!(crate::nx::detect(&img), DetectConfidence::Low);
+    // Good block size, block_count 0 → detect Low.
+    img[36..40].copy_from_slice(&4096u32.to_le_bytes());
+    assert_eq!(crate::nx::detect(&img), DetectConfidence::Low);
+    // Valid superblock, bad checksum → Medium.
+    let mut img = nx_block(4096, 64);
+    img.resize(8192, 0);
+    img[64] ^= 0xA5;
+    assert_eq!(crate::nx::detect(&img), DetectConfidence::Medium);
+    // Physical-storage nxsb → High (not ephemeral).
+    let mut img = nx_block(4096, 64);
+    img.resize(8192, 0);
+    img[24..28].copy_from_slice(&(otype::NX_SUPERBLOCK | oflags::PHYSICAL).to_le_bytes());
+    seal(&mut img[..4096]);
+    assert_eq!(crate::nx::detect(&img), DetectConfidence::High);
+    // uuid_be on a short buffer.
+    assert!(crate::nx::uuid_be(&[0u8; 8], 0).is_none());
+    assert!(crate::nx::uuid_be(&[0xABu8; 16], 0).is_some());
+}
+
+#[test]
+fn apsb_spaceman_type_errors() {
+    use crate::apsb::Apsb;
+    use crate::spaceman::Spaceman;
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&otype::OMAP.to_le_bytes());
+    assert!(Apsb::parse(&b, 0).is_err());
+    assert!(Spaceman::parse(&b, 0).is_err());
+    // Right type, missing APSB magic.
+    let mut b = vec![0u8; 4096];
+    b[24..28].copy_from_slice(&otype::FS.to_le_bytes());
+    assert!(Apsb::parse(&b, 0).is_err());
+}
+
+#[test]
+fn jrec_decode_error_arms() {
+    use crate::jrec::xtype;
+    // Key shorter than j_key_t.
+    assert!(jrec::decode_record(&[0u8; 4], &[], None).is_err());
+    // Inode value under the 92-byte fixed header.
+    let k = (3u64 << 60 | 7).to_le_bytes();
+    assert!(jrec::decode_record(&k, &[0u8; 40], None).is_err());
+    // Drec: forced hashed layout, undecodable name field.
+    let k = (9u64 << 60 | 2).to_le_bytes();
+    assert!(jrec::decode_record(&k, &[0u8; 24], Some(true)).is_err());
+    // Drec: forced plain layout, undecodable.
+    assert!(jrec::decode_record(&k, &[0u8; 24], Some(false)).is_err());
+    // Drec: auto-sniff, undecodable both ways.
+    assert!(jrec::decode_record(&k, &[0u8; 24], None).is_err());
+    // Drec: plain layout decodes (u16 name_len + name + NUL).
+    let mut k = (9u64 << 60 | 2).to_le_bytes().to_vec();
+    k.extend_from_slice(&4u16.to_le_bytes()); // name_len incl NUL
+    k.extend_from_slice(b"abc\0");
+    let mut v = vec![0u8; 24];
+    v[..8].copy_from_slice(&200u64.to_le_bytes());
+    let rec = jrec::decode_record(&k, &v, None).unwrap();
+    match rec {
+        jrec::JRecord::Drec {
+            name,
+            file_id,
+            name_hash,
+            ..
+        } => {
+            assert_eq!(name, "abc");
+            assert_eq!(file_id, 200);
+            assert!(name_hash.is_none());
+        }
+        _ => panic!("expected drec"),
+    }
+    // Drec with a DREC_SIBLING_ID xfield → sibling_id populated.
+    let mut v = vec![0u8; 18];
+    v[..8].copy_from_slice(&200u64.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes()); // xf num
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v.push(xtype::DREC_SIBLING_ID);
+    v.push(0);
+    v.extend_from_slice(&8u16.to_le_bytes());
+    v.extend_from_slice(&0xBEEFu64.to_le_bytes());
+    let rec = jrec::decode_record(&k, &v, None).unwrap();
+    match rec {
+        jrec::JRecord::Drec { sibling_id, .. } => assert_eq!(sibling_id, Some(0xBEEF)),
+        _ => panic!("expected drec"),
+    }
+    // Xattr: neither stream nor embedded flag and no data → embedded None.
+    let mut k = (4u64 << 60 | 200).to_le_bytes().to_vec();
+    k.extend_from_slice(&3u16.to_le_bytes());
+    k.extend_from_slice(b"x\0");
+    let v = [0u8; 8];
+    match jrec::decode_record(&k, &v, None).unwrap() {
+        jrec::JRecord::Xattr {
+            embedded,
+            stream_oid,
+            ..
+        } => {
+            assert!(embedded.is_none());
+            assert!(stream_oid.is_none());
+        }
+        _ => panic!("expected xattr"),
+    }
+    // Sibling link record.
+    let mut k = (5u64 << 60 | 200).to_le_bytes().to_vec();
+    k.extend_from_slice(&500u64.to_le_bytes());
+    let mut v = vec![0u8; 10];
+    v[..8].copy_from_slice(&300u64.to_le_bytes());
+    v[8..10].copy_from_slice(&6u16.to_le_bytes());
+    v.extend_from_slice(b"alias\0");
+    match jrec::decode_record(&k, &v, None).unwrap() {
+        jrec::JRecord::SiblingLink {
+            sibling_id,
+            parent_id,
+            name,
+            ..
+        } => {
+            assert_eq!(sibling_id, 500);
+            assert_eq!(parent_id, 300);
+            assert_eq!(name, "alias");
+        }
+        _ => panic!("expected sibling link"),
+    }
+}
+
+#[test]
+fn jrec_xfield_and_dstream_arms() {
+    use crate::jrec::xtype;
+    // parse_xfields: too short / oversized count / out-of-bounds size.
+    assert!(jrec::parse_xfields(&[0u8; 2]).is_empty());
+    let mut b = vec![0u8; 8];
+    b[..2].copy_from_slice(&100u16.to_le_bytes()); // num*4 > len
+    assert!(jrec::parse_xfields(&b).is_empty());
+    let mut b = vec![0u8; 12];
+    b[..2].copy_from_slice(&1u16.to_le_bytes());
+    b[4] = 8; // type
+    b[6..8].copy_from_slice(&0xFFFu16.to_le_bytes()); // size runs off
+    assert!(jrec::parse_xfields(&b).is_empty());
+    // Inode xfields: INO_NAME + a short DSTREAM (<40 B → None) + unknown.
+    let mut blob = vec![0u8; 92];
+    blob.extend_from_slice(&3u16.to_le_bytes()); // 3 xfields
+    blob.extend_from_slice(&0u16.to_le_bytes());
+    for (t, sz) in [(xtype::INO_NAME, 4u16), (xtype::INO_DSTREAM, 8u16), (0xEEu8, 4u16)] {
+        blob.push(t);
+        blob.push(0);
+        blob.extend_from_slice(&sz.to_le_bytes());
+    }
+    blob.extend_from_slice(b"nm\0\0\0\0\0"); // 8-aligned name
+    blob.extend_from_slice(&[0u8; 8]); // short dstream
+    blob.extend_from_slice(&[0u8; 4]); // unknown payload
+    let iv = jrec::InodeVal::decode(&blob).unwrap();
+    assert_eq!(iv.xf_name.as_deref(), Some("nm"));
+    assert!(iv.dstream.is_none());
+    // Snap metadata record with a name_len beyond the value tail.
+    let k = (1u64 << 60 | 5).to_le_bytes();
+    let mut v = vec![0u8; 50];
+    v[48..50].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    match jrec::decode_record(&k, &v, None).unwrap() {
+        jrec::JRecord::SnapMetadata { name, .. } => assert!(name.is_empty()),
+        _ => panic!("expected snap metadata"),
+    }
+}
