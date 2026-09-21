@@ -267,6 +267,61 @@ pub fn build_fat32() -> Vec<u8> {
     img
 }
 
+/// Minimal FAT16 image (~2.2 MiB): 1 reserved sector, 2×32-sector FATs,
+/// 512-entry root region, 4300 data sectors (4300 clusters → FAT16).
+///
+/// Cluster map: root region fixed. Cluster 2 = FILE16.TXT data.
+pub fn build_fat16() -> Vec<u8> {
+    let reserved = 1usize;
+    let fatsz = 32usize;
+    let nfats = 2usize;
+    let root_secs = 32usize; // 512 entries * 32 = 16 KiB
+    let data_secs = 4300usize;
+    let total = reserved + nfats * fatsz + root_secs + data_secs;
+    let mut img = vec![0u8; total * BPS];
+
+    img[0] = 0xEB;
+    img[1] = 0x3C;
+    img[2] = 0x90;
+    img[3..11].copy_from_slice(b"SUTRAM16");
+    w16(&mut img, 11, 512);
+    img[13] = 1;
+    w16(&mut img, 14, 1);
+    img[16] = nfats as u8;
+    w16(&mut img, 17, 512); // root entries
+    w16(&mut img, 19, total as u16);
+    img[21] = 0xF8;
+    w16(&mut img, 22, fatsz as u16);
+    w16(&mut img, 24, 1);
+    w16(&mut img, 26, 1);
+    img[38] = 0x29;
+    w32(&mut img, 39, 0x0BAD_CAFE);
+    img[43..54].copy_from_slice(b"FAT16VOL   ");
+    img[54..62].copy_from_slice(b"FAT16   ");
+    img[510] = 0x55;
+    img[511] = 0xAA;
+
+    // FAT16: entry n at n*2. [0]=F8FF media, [1]=FFFF, [2]=FFFF EOC.
+    let fat = |img: &mut [u8], base: usize| {
+        img[base] = 0xF8;
+        img[base + 1] = 0xFF;
+        img[base + 2] = 0xFF;
+        img[base + 3] = 0xFF;
+        // cluster 2 → EOC
+        img[base + 4] = 0xFF;
+        img[base + 5] = 0xFF;
+    };
+    fat(&mut img, reserved * BPS);
+    fat(&mut img, (reserved + fatsz) * BPS);
+
+    let root = (reserved + nfats * fatsz) * BPS;
+    let (wd, wt) = (dos_date(2001, 3, 4), dos_time(12, 0, 0));
+    dirent(&mut img, root, 0, b"FILE16  TXT", ATTR_ARCHIVE, 2, 9, false, wt, wd, 0, wt, wd, 0);
+    let off = (reserved + nfats * fatsz + root_secs) * BPS;
+    img[off..off + 9].copy_from_slice(b"sixteen!!");
+    img
+}
+
 /// Minimal FAT12 image (~64 KiB): 1 reserved sector, 2×2-sector FATs,
 /// 16-entry root region, 100 data sectors.
 ///

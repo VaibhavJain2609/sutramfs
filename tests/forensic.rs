@@ -277,6 +277,154 @@ fn lenient_walk_survives_corruption() {
 }
 
 #[test]
+fn cyclic_directory_chain_terminates() {
+    let mut img = common::build_fat32();
+    // Corrupt: make SUBDIR contain a subdirectory entry pointing back at
+    // the root cluster (cycle), and one pointing at itself.
+    let sub = common::clus_off(11);
+    let (wd, wt) = (
+        ((2024u16 - 1980) << 9) | (1 << 5) | 15,
+        (10 << 11) | (30 << 5) | 10,
+    );
+    common::dirent(
+        &mut img, sub, 3, b"LOOPUP     ", common::ATTR_DIR, 2, 0, false, wt, wd, 0, wt, wd, 0,
+    );
+    common::dirent(
+        &mut img, sub, 4, b"SELFREF    ", common::ATTR_DIR, 11, 0, false, wt, wd, 0, wt, wd, 0,
+    );
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = FatParser.mount(src).unwrap();
+    // The walk must terminate — dir_seen rejects re-visiting clusters.
+    let items: Vec<_> = fs.walk().collect();
+    assert!(items.iter().any(|i| i.is_ok()));
+    // The cyclic dirs appear once each as entries, but are not descended.
+    let ok: Vec<_> = items.iter().flatten().collect();
+    let loops = ok.iter().filter(|e| e.name == "LOOPUP").count();
+    assert_eq!(loops, 1);
+    // And the loop's own contents are never emitted under a nested path.
+    assert!(!ok.iter().any(|e| e.path.starts_with("/SUBDIR/LOOPUP/")));
+}
+
+#[test]
+fn lfn_checksum_mismatch_falls_back_to_short_name() {
+    let mut img = common::build_fat32();
+    let root = common::clus_off(2);
+    // Reuse the "Long File Name.txt" slots but corrupt the checksum byte in
+    // the second LFN slot — the binding no longer verifies.
+    let slot2 = root + 2 * 32;
+    img[slot2 + 13] ^= 0xFF;
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = FatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    // Name falls back to the 8.3 form; the residue is still recorded.
+    let e = entries
+        .iter()
+        .find(|e| e.name == "LONGFI~1.TXT")
+        .expect("8.3 fallback name should be emitted");
+    assert_eq!(e.meta["lfn_checksum_ok"], "false");
+    assert!(e.meta.contains_key("lfn"));
+    assert!(!entries.iter().any(|e| e.name == "Long File Name.txt"));
+}
+
+#[test]
+fn fat32_root_dir_reports_whole_chain() {
+    let mut img = common::build_fat32();
+    // Extend the root dir chain: 2 → 25 → EOC, with an entry in cluster 25.
+    common::set_fat(&mut img, 2, 25);
+    common::set_fat(&mut img, 25, 0x0FFF_FFFF);
+    let second = common::clus_off(25);
+    let (wd, wt) = (
+        ((2024u16 - 1980) << 9) | (1 << 5) | 15,
+        (10 << 11) | (30 << 5) | 10,
+    );
+    common::dirent(
+        &mut img, second, 0, b"TAILFILETXT", common::ATTR_ARCHIVE, 26, 4,
+        false, wt, wd, 0, wt, wd, 0,
+    );
+    common::put_data(&mut img, 26, b"tail");
+    common::set_fat(&mut img, 26, 0x0FFF_FFFF);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = FatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    // "/" provenance covers BOTH clusters of the root chain.
+    let root = entries.iter().find(|e| e.path == "/").unwrap();
+    assert_eq!(
+        root.allocated_ranges,
+        vec![
+            (common::clus_off(2) as u64, 512),
+            (common::clus_off(25) as u64, 512)
+        ]
+    );
+    // And the entry in the second root cluster is found.
+    assert!(entries.iter().any(|e| e.path == "/TAILFILE.TXT"));
+}
+
+#[test]
+fn deleted_recovery_edge_cases() {
+    let mut img = common::build_fat32();
+    // Use free slots inside SUBDIR (cluster 11) — the single-cluster root
+    // is fully occupied (slot 15 is the last).
+    let sub = common::clus_off(11);
+    let (wd, wt) = (
+        ((2024u16 - 1980) << 9) | (1 << 5) | 15,
+        (10 << 11) | (30 << 5) | 10,
+    );
+    // Deleted entry recording NO start cluster → Unrecoverable.
+    common::dirent(
+        &mut img, sub, 3, b"NOCLSTR BIN", common::ATTR_ARCHIVE, 0, 500,
+        true, wt, wd, 0, wt, wd, 0,
+    );
+    // Deleted entry whose FAT link was zeroed but whose start cluster is
+    // unclaimed → candidate extent survives (PartiallyOverwritten).
+    common::dirent(
+        &mut img, sub, 4, b"FREEDLN BIN", common::ATTR_ARCHIVE, 30, 700,
+        true, wt, wd, 0, wt, wd, 0,
+    );
+    common::put_data(&mut img, 30, b"freed-chain candidate bytes");
+    // FAT[30] stays 0 → freed.
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = FatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+
+    let e = find(&entries, "_OCLSTR.BIN");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unrecoverable
+        }
+    ));
+    assert!(e.meta["recovery_note_0"].contains("no start cluster"));
+
+    let e = find(&entries, "_REEDLN.BIN");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::PartiallyOverwritten { .. }
+        }
+    ));
+    assert!(e.meta["recovery_note_0"].contains("truncated"));
+    // The candidate cluster is still offered for carving.
+    assert_eq!(e.allocated_ranges.len(), 1);
+    // And its bytes are readable.
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert!(buf.starts_with(b"freed-chain candidate"));
+}
+
+#[test]
+fn fat16_minimal_image() {
+    let src: Arc<dyn ByteSource> = Arc::new(common::build_fat16());
+    assert!(FatParser.detect(src.as_ref()) >= DetectConfidence::Medium);
+    let fs = FatParser.mount(src).unwrap();
+    assert_eq!(fs.info().fs_type, "FAT16");
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    let data = entries.iter().find(|e| e.name == "FILE16.TXT").unwrap();
+    let mut buf = Vec::new();
+    fs.read_file(data).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"sixteen!!");
+}
+
+#[test]
 fn strict_mode_aborts_on_io_error() {
     use sutram_fs::MountOptions;
     // Image truncated mid-root-dir: mount may succeed but walk hits
@@ -297,12 +445,15 @@ fn strict_mode_aborts_on_io_error() {
         .mount_with(Arc::new(truncated) as Arc<dyn ByteSource>, &MountOptions::strict())
         .unwrap();
     let mut seen_err = false;
+    let mut items_after_err = 0usize;
     for item in fs.walk() {
         if seen_err {
-            assert!(item.is_err() || true); // strict may simply stop
+            items_after_err += 1;
         }
         if item.is_err() {
             seen_err = true;
         }
     }
+    // Strict mode: the first error is terminal — the walk ends there.
+    assert_eq!(items_after_err, 0, "strict walk yielded items after an error");
 }

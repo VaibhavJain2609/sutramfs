@@ -143,8 +143,7 @@ impl BootSector {
         }
         let root_cluster = le::u32(&b, 44).unwrap_or(0);
 
-        let root_dir_sectors =
-            ((root_entry_count as u64 * 32) + (bps - 1)) / bps;
+        let root_dir_sectors = (root_entry_count as u64 * 32).div_ceil(bps);
         let first_data_sector =
             reserved + num_fats as u64 * fat_size_sectors + root_dir_sectors;
         if total_sectors <= first_data_sector {

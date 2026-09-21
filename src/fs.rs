@@ -153,6 +153,7 @@ impl FatFs {
     /// Load a directory's raw entry table + a logical→disk offset map.
     ///
     /// Bounded: one directory's bytes at a time.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn read_dir(&self, loc: &DirLoc) -> Result<(Vec<u8>, Vec<(u64, u64, u64)>)> {
         match *loc {
             DirLoc::RootRegion => {
@@ -245,9 +246,10 @@ impl FatFs {
                             let needed = if e.is_dir() {
                                 usize::MAX
                             } else {
-                                (e.size as u64)
-                                    .div_ceil(self.bs.cluster_size)
-                                    .max(1) as usize
+                                usize::try_from(
+                                    (e.size as u64).div_ceil(self.bs.cluster_size).max(1),
+                                )
+                                .unwrap_or(usize::MAX)
                             };
                             if let Ok(chain) = self.chain(e.first_cluster, needed) {
                                 for cl in chain {
@@ -274,7 +276,7 @@ impl FatFs {
         size: u64,
     ) -> (RecoveryState, Vec<(u64, u64)>, Vec<String>) {
         let csz = self.bs.cluster_size;
-        let expected = size.div_ceil(csz) as usize;
+        let expected = usize::try_from(size.div_ceil(csz)).unwrap_or(usize::MAX);
         let mut notes = Vec::new();
         if size == 0 {
             return (RecoveryState::Intact, Vec::new(), notes);
@@ -351,7 +353,9 @@ impl FatFs {
         let mut header = vec![0u8; 4096.min(e.size as usize)];
         let n = r.read(&mut header).ok()?;
         header.truncate(n);
-        Some(sutram_magic::check_entry(&e.name, &header))
+        // `check_entry_sized` lets the verifier emit "no trailer" notes only
+        // when the header really is the whole file.
+        Some(sutram_magic::check_entry_sized(&e.name, &header, e.size))
     }
 
     /// Count free clusters by streaming the FAT (bounded memory).

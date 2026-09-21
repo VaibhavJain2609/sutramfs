@@ -116,3 +116,89 @@ fn boot_sector_rejects_garbage() {
     let src: Vec<u8> = vec![0u8; 512];
     assert!(BootSector::parse(&src.as_slice()).is_err());
 }
+
+/// A minimally-valid FAT32-style boot sector; callers then break one field.
+fn valid_boot() -> Vec<u8> {
+    let mut b = vec![0u8; 512];
+    b[0] = 0xEB;
+    b[3..11].copy_from_slice(b"SUTRAM32");
+    b[11..13].copy_from_slice(&512u16.to_le_bytes());
+    b[13] = 1;
+    b[14..16].copy_from_slice(&32u16.to_le_bytes());
+    b[16] = 2;
+    b[21] = 0xF8;
+    b[32..36].copy_from_slice(&200_000u32.to_le_bytes());
+    b[36..40].copy_from_slice(&512u32.to_le_bytes());
+    b[44..48].copy_from_slice(&2u32.to_le_bytes());
+    b[510] = 0x55;
+    b[511] = 0xAA;
+    b
+}
+
+#[test]
+fn boot_sector_validation_errors() {
+    // Each corrupt field must be a hard FsError, never a panic.
+    let bad_sig = valid_boot();
+    let mut bad_sig2 = bad_sig.clone();
+    bad_sig2[511] = 0x00;
+    assert!(BootSector::parse(&bad_sig2.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[11..13].copy_from_slice(&100u16.to_le_bytes()); // bad bytes/sector
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[13] = 0; // sectors/cluster = 0
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+    let mut b = valid_boot();
+    b[13] = 3; // not a power of two
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[14..16].copy_from_slice(&0u16.to_le_bytes()); // reserved = 0
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[16] = 0; // zero FATs
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[32..36].copy_from_slice(&0u32.to_le_bytes()); // zero total sectors
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[36..40].copy_from_slice(&0u32.to_le_bytes()); // zero FAT size
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[32..36].copy_from_slice(&500u32.to_le_bytes()); // impossible geometry
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    let mut b = valid_boot();
+    b[44..48].copy_from_slice(&0u32.to_le_bytes()); // FAT32 root cluster < 2
+    assert!(BootSector::parse(&b.as_slice()).is_err());
+
+    // Truncated source (< 512 B) is an error, not a panic.
+    let short = vec![0u8; 100];
+    assert!(BootSector::parse(&short.as_slice()).is_err());
+}
+
+#[test]
+fn boot_sector_tot16_tot32_and_label_paths() {
+    // tot16 nonzero wins over tot32.
+    let mut b = valid_boot();
+    b[19..21].copy_from_slice(&60_000u16.to_le_bytes());
+    let bs = BootSector::parse(&b.as_slice()).unwrap();
+    assert_eq!(bs.total_sectors, 60_000);
+    // ext-BPB signature present → volume id + label decoded.
+    let mut b = valid_boot();
+    b[66] = 0x29;
+    b[67..71].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    b[71..82].copy_from_slice(b"MYVOL      ");
+    let bs = BootSector::parse(&b.as_slice()).unwrap();
+    assert_eq!(bs.volume_id, Some(0xDEAD_BEEF));
+    assert_eq!(bs.volume_label.as_deref(), Some("MYVOL"));
+    // absent signature → None fields
+    let bs = BootSector::parse(&valid_boot().as_slice()).unwrap();
+    assert!(bs.volume_id.is_none());
+}

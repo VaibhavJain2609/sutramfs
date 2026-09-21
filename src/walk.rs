@@ -63,6 +63,10 @@ pub(crate) struct Walk<'m> {
     /// Clusters already accounted for (live map ∪ deleted chains seen) —
     /// the orphan pass emits the allocated remainder.
     claimed: HashSet<u32>,
+    /// Directory start-clusters already queued/scanned — a corrupt image
+    /// can make a subdir point at an ancestor (cycle), which would
+    /// otherwise loop `pending_dirs` forever.
+    dir_seen: HashSet<u32>,
     /// Orphan scan progress (cluster index).
     scan_cluster: u32,
     /// Orphan pass completed.
@@ -78,12 +82,17 @@ impl<'m> Walk<'m> {
         } else {
             DirLoc::RootRegion
         };
+        let mut dir_seen = HashSet::new();
+        if let DirLoc::Chain(c) = root {
+            dir_seen.insert(c);
+        }
         Walk {
             fs,
             queue: VecDeque::new(),
             pending_dirs: VecDeque::from(vec![("/".to_string(), root)]),
             cur: None,
             claimed: fs.live.keys().copied().collect(),
+            dir_seen,
             scan_cluster: 2,
             orphans_done: false,
             finished: false,
@@ -128,13 +137,25 @@ impl<'m> Walk<'m> {
         if short == "." || short == ".." {
             return None;
         }
-        // Verify the LFN↔8.3 binding: a mismatched checksum means the LFN
-        // slots belong to a different (probably deleted) entry.
-        let lfn_checksum_ok = lfn_parts
-            .first()
-            .map(|p| p.checksum == Self::lfn_checksum(&e.raw_name));
+        // Verify the LFN↔8.3 binding: EVERY LFN slot must carry the same
+        // checksum, equal to the checksum of the 8.3 name it precedes.
+        // A mismatch means the slots belong to a different (probably
+        // deleted) entry — the long name must NOT be trusted.
+        let expected_sum = Self::lfn_checksum(&e.raw_name);
+        let lfn_checksum_ok = (!lfn_parts.is_empty()).then(|| {
+            lfn_parts
+                .iter()
+                .all(|p| p.checksum == expected_sum && p.checksum == lfn_parts[0].checksum)
+        });
         let lfn = dirent::assemble_lfn(&lfn_parts);
-        let name = lfn.clone().unwrap_or_else(|| short.clone());
+        // Trust the long name only when the checksum verifies. (A deleted
+        // LFN slot's checksum byte survives — only `seq` is destroyed — so
+        // partial fragments still verify; `lfn_partial` flags the risk.)
+        let name = if lfn_checksum_ok == Some(true) {
+            lfn.clone().unwrap_or_else(|| short.clone())
+        } else {
+            short.clone()
+        };
         let path = util::join_path(cur_path, &name);
         let kind = if e.is_dir() {
             EntryKind::Directory
@@ -191,7 +212,8 @@ impl<'m> Walk<'m> {
         } else {
             status = FsEntryStatus::Live;
             let cap = if kind == EntryKind::File {
-                (e.size as u64).div_ceil(csz).max(1) as usize
+                usize::try_from((e.size as u64).div_ceil(csz).max(1))
+                    .unwrap_or(usize::MAX)
             } else {
                 usize::MAX
             };
@@ -239,7 +261,11 @@ impl<'m> Walk<'m> {
         };
         entry.magic = self.fs.magic_for(&entry);
 
-        if kind == EntryKind::Directory && !e.deleted && e.first_cluster >= 2 {
+        if kind == EntryKind::Directory
+            && !e.deleted
+            && e.first_cluster >= 2
+            && self.dir_seen.insert(e.first_cluster)
+        {
             self.pending_dirs
                 .push_back((entry.path.clone(), DirLoc::Chain(e.first_cluster)));
         }
@@ -255,8 +281,15 @@ impl<'m> Walk<'m> {
                 vec![(self.fs.bs.root_dir_offset, self.fs.bs.root_dir_size)],
             ),
             DirLoc::Chain(c) => {
-                let (off, len) = self.fs.cluster_range(c);
-                (off, vec![(off, len)])
+                let (off, _) = self.fs.cluster_range(c);
+                // The root dir's whole chain is its provenance — not just
+                // the first cluster.
+                let ranges = self
+                    .fs
+                    .chain(c, usize::MAX)
+                    .map(|ch| self.fs.chain_ranges(&ch))
+                    .unwrap_or_else(|_| vec![(off, self.fs.bs.cluster_size)]);
+                (off, ranges)
             }
         };
         FsEntry {
