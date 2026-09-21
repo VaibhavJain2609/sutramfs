@@ -15,7 +15,9 @@ between a raw acquisition and a filesystem parser:
 - `ByteSource` impls for `Vec<u8>`, `&[u8]`, `std::fs::File` (positioned
   reads; no mmap, no `unsafe`), and `Arc`/`Box` forwarding.
 - `OffsetView` — a bounds-checked window into a source (partition views).
-- `ConcatSource` — glues split images (`disk.001`, `.002`, …) end-to-end.
+- `ConcatSource` — glues split images (`disk.001`, `.002`, …) end-to-end;
+  `ConcatSource::open_split` + `detect_split` discover `name.001`,
+  `name_01` and `split(1)`-style `name_aa` segment sets by name.
 - `SparseFile` — extent-mapped image (data / zero / fill-pattern extents),
   including `SparseFile::from_android_sparse` for Android sparse images.
 - MBR + GPT partition parsing (`partitions`, `open_partitions`) producing
@@ -191,6 +193,28 @@ println!("v{} {} bytes, {}-byte clusters",
 - `dirty`/`corrupt` incompatible flags and unknown feature bits produce
   warnings, not failures.
 - Snapshots are not exposed (the active image is what you read).
+
+## Split raw images
+
+Split acquisitions (`disk.001`/`disk.002`/…, `disk_01`, `disk_aa`/`disk_ab`)
+need no container parser — `ConcatSource::open_split` discovers the
+sibling segments by name, orders them numerically (`split(1)` alpha
+suffixes sort `aa → az → ba`), and concatenates them:
+
+```rust,no_run
+use sutram_io::{detect_split, ConcatSource};
+
+if detect_split("disk.001") {
+    let img = ConcatSource::open_split("disk.001")?;
+    // `img` is a ByteSource over all segments in order.
+}
+# Ok::<(), std::io::Error>(())
+```
+
+The alpha convention is limited to exactly two lowercase letters — a
+wider match would collide with ordinary file extensions. Segments must
+live in one directory and share the stem; `open_split` may be pointed at
+any member.
 
 ## Deleted / recovery semantics
 

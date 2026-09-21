@@ -3,9 +3,10 @@
 //! container formats (Android sparse images, later qcow2/VMDK) sit on.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{ByteSource, Error, Result};
+use crate::{ByteSource, Error, FileSource, Result};
 
 /// A read-only window into another source: bytes `[offset, offset+len)` of
 /// the inner source become `[0, len)` of this view.
@@ -90,6 +91,55 @@ impl ConcatSource {
         }
     }
 
+    /// Number of segments glued together.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Open a **split-raw** image — `disk.001`/`disk.002`/…, `disk_01`,
+    /// `disk_aa`/`disk_ab` (split(1)) — as one concatenated source.
+    ///
+    /// `path` may point at *any* segment: the naming pattern is taken
+    /// from its suffix, then every sibling in the same directory with
+    /// the same stem and a matching numeric (`≥ 2` digits) or
+    /// `split(1)`-style alphabetic (exactly 2 lowercase letters) suffix
+    /// is collected and ordered by segment number (`aa → az → ba …`,
+    /// `001 → 002 → …`). All matched files are concatenated in order,
+    /// whether or not `path` was the first one.
+    ///
+    /// A name without a recognised split suffix returns
+    /// [`io::ErrorKind::InvalidInput`]; a `path` that does not exist on
+    /// disk returns [`io::ErrorKind::NotFound`].
+    pub fn open_split(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        let members = split_members(path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "'{}' is not a split-image segment name \
+                     (expected <name>.<digits>, <name>_<digits> or <name>[_|.]<aa..>)",
+                    path.display()
+                ),
+            )
+        })?;
+        if !members.iter().any(|m| m == path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("split segment '{}' not found", path.display()),
+            ));
+        }
+        let mut parts: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(members.len());
+        for m in &members {
+            parts.push(Arc::new(FileSource::open(m).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot open split segment '{}': {e}", m.display()),
+                )
+            })?));
+        }
+        Ok(Self::new(parts))
+    }
+
     /// Locate the segment containing `offset` → (index, offset within segment).
     fn locate(&self, offset: u64) -> Option<(usize, u64)> {
         // segments.len() is small (split images); linear scan is fine and
@@ -131,6 +181,99 @@ impl ByteSource for ConcatSource {
         }
         Ok(done)
     }
+}
+
+/// Does `path` look like a member of a split-raw image?
+///
+/// True when the file name carries a recognised split suffix
+/// (`<name>.<2+ digits>`, `<name>_<2+ digits>`, or `<name>[.|_]<exactly
+/// 2 lowercase letters>` à la `split(1)`) **and** at least two matching
+/// sibling files — including `path` itself — exist in its directory.
+/// The 2-letter limit keeps ordinary extensions (`.raw`, `.img`, …)
+/// from matching. I/O failures (unreadable directory, non-UTF-8 names)
+/// yield `false`.
+pub fn detect_split(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    match split_members(path) {
+        Ok(Some(members)) => members.len() >= 2 && members.iter().any(|m| m == path),
+        _ => false,
+    }
+}
+
+/// Split-segment ordering key.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SplitKey {
+    /// `<name>.001`, `<name>_07`: ordered numerically (zero-padding is
+    /// irrelevant — the value decides).
+    Numeric(u128),
+    /// `split(1)` style `aa, ab, …, az, ba` (exactly two letters).
+    Alpha(String),
+}
+
+/// Parse `<stem><sep><suffix>` out of a file name. Returns
+/// `(name_up_to_and_including_sep, key)` or `None` when the suffix is
+/// not a recognised split convention.
+fn split_suffix(name: &str) -> Option<(&str, SplitKey)> {
+    // Only the last '.'/'_' may introduce the segment suffix.
+    let sep = name.rfind(['.', '_'])?;
+    if sep == 0 || sep + 1 == name.len() {
+        return None;
+    }
+    let suffix = &name[sep + 1..];
+    if suffix.len() >= 2 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+        let v = suffix.parse::<u128>().ok()?;
+        return Some((&name[..sep + 1], SplitKey::Numeric(v)));
+    }
+    // Exactly two lowercase letters — split(1)'s default; a wider net
+    // would catch ordinary file extensions.
+    if suffix.len() == 2 && suffix.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Some((&name[..sep + 1], SplitKey::Alpha(suffix.to_string())));
+    }
+    None
+}
+
+/// All sibling files in `path`'s directory that share its stem and
+/// suffix convention, ordered by segment number. `Ok(None)` means the
+/// name carries no recognised split suffix.
+fn split_members(path: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let Some((prefix, key)) = split_suffix(name) else {
+        return Ok(None);
+    };
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut members: Vec<(SplitKey, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Some(fname) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if !fname.starts_with(prefix) {
+            continue;
+        }
+        // The sibling must parse to the *same* stem+separator — this
+        // excludes lookalikes like `disk.extra.003` under `disk.`.
+        let Some((p2, k)) = split_suffix(&fname) else {
+            continue;
+        };
+        if p2 != prefix {
+            continue;
+        }
+        // Same convention only: numeric siblings join numeric, alpha join
+        // alpha.
+        let same_kind = matches!(
+            (&key, &k),
+            (SplitKey::Numeric(_), SplitKey::Numeric(_))
+                | (SplitKey::Alpha(..), SplitKey::Alpha(..))
+        );
+        if same_kind {
+            members.push((k, entry.path()));
+        }
+    }
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Some(members.into_iter().map(|(_, p)| p).collect()))
 }
 
 /// What backs one extent of a [`SparseFile`].

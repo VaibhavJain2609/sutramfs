@@ -75,7 +75,7 @@ pub use partition::{
     open_partitions, partitions, Partition, PartitionSource, TableKind,
 };
 pub use source::{into_arc, ByteSource, FileSource, SourceReader};
-pub use views::{ConcatSource, OffsetView, SparseExtent, SparseFile, SparseKind};
+pub use views::{detect_split, ConcatSource, OffsetView, SparseExtent, SparseFile, SparseKind};
 
 #[cfg(test)]
 mod tests;

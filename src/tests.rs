@@ -1822,3 +1822,92 @@ fn qcow2_bad_magic_and_geometry() {
         Err(Error::Corrupt { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Split-raw concatenation tests (real temp files — the API is path-based)
+// ---------------------------------------------------------------------------
+
+fn split_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("sutram-split-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn split_raw_numeric_segments_concatenate() {
+    let dir = split_dir("num");
+    // Write out of order to prove ordering is by suffix, not dir order.
+    std::fs::write(dir.join("disk.002"), b"world!").unwrap();
+    std::fs::write(dir.join("disk.001"), b"hello ").unwrap();
+    std::fs::write(dir.join("disk.003"), b"!!").unwrap();
+    // lookalikes that must NOT join the set
+    std::fs::write(dir.join("disk.extra.004"), b"nope").unwrap();
+    std::fs::write(dir.join("disk.001.txt"), b"nope").unwrap();
+    std::fs::write(dir.join("other.001"), b"nope").unwrap();
+
+    assert!(detect_split(dir.join("disk.001")));
+    // open_split accepts any member, not just the first
+    let c = ConcatSource::open_split(dir.join("disk.002")).unwrap();
+    assert_eq!(c.segment_count(), 3);
+    assert_eq!(c.len(), 14);
+    assert_eq!(c.read_slice(0, 14).unwrap(), b"hello world!!!");
+    // cross-segment read
+    assert_eq!(c.read_slice(4, 8).unwrap(), b"o world!");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn split_raw_alpha_and_underscore_segments() {
+    let dir = split_dir("alpha");
+    std::fs::write(dir.join("img_ab"), b"AB").unwrap();
+    std::fs::write(dir.join("img_aa"), b"aa").unwrap();
+    std::fs::write(dir.join("img_ac"), b"AC").unwrap();
+    assert!(detect_split(dir.join("img_aa")));
+    let c = ConcatSource::open_split(dir.join("img_aa")).unwrap();
+    assert_eq!(c.read_slice(0, 6).unwrap(), b"aaABAC");
+
+    // underscore + digits
+    let dir2 = split_dir("und");
+    std::fs::write(dir2.join("raw_02"), b"22").unwrap();
+    std::fs::write(dir2.join("raw_01"), b"11").unwrap();
+    assert!(detect_split(dir2.join("raw_01")));
+    let c = ConcatSource::open_split(dir2.join("raw_01")).unwrap();
+    assert_eq!(c.read_slice(0, 4).unwrap(), b"1122");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn split_raw_detection_edges() {
+    let dir = split_dir("edges");
+    // a lone segment is a valid name but detect_split wants ≥2 members
+    std::fs::write(dir.join("solo.001"), b"x").unwrap();
+    assert!(!detect_split(dir.join("solo.001")));
+    // open_split still opens it (a one-part concat is harmless)
+    let c = ConcatSource::open_split(dir.join("solo.001")).unwrap();
+    assert_eq!(c.read_slice(0, 1).unwrap(), b"x");
+
+    // no recognised suffix → InvalidInput, detect → false
+    std::fs::write(dir.join("plain.raw"), b"y").unwrap();
+    std::fs::write(dir.join("plain2.raw"), b"y").unwrap();
+    assert!(!detect_split(dir.join("plain.raw")));
+    match ConcatSource::open_split(dir.join("plain.raw")) {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        Ok(_) => panic!("plain.raw must not open as a split image"),
+    }
+
+    // recognised name but file absent → NotFound
+    match ConcatSource::open_split(dir.join("gone.001")) {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        Ok(_) => panic!("gone.001 must not open"),
+    }
+    assert!(!detect_split(dir.join("gone.001")));
+
+    // EWF names must not be mistaken for split segments
+    std::fs::write(dir.join("case.E01"), b"e").unwrap();
+    std::fs::write(dir.join("case.E02"), b"e").unwrap();
+    assert!(!detect_split(dir.join("case.E01")));
+    std::fs::remove_dir_all(&dir).ok();
+}
