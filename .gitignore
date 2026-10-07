@@ -1,0 +1,14 @@
+# Build output
+/target/
+gui/node_modules/
+gui/.next/
+gui/tsconfig.tsbuildinfo
+
+# Machine-local cargo config (absolute paths in [patch.crates-io])
+.cargo/
+
+# Large forensic disk images — track via git-lfs if needed
+differential/images/
+
+# OS junk
+.DS_Store

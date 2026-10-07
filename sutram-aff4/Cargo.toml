@@ -1,0 +1,14 @@
+[package]
+name = "sutram-aff4"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "AFF4-L forensic evidence-container reader (ZIP + information.turtle manifest, hash verification)"
+keywords = ["forensics", "aff4", "dfir", "evidence", "container"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io      = { path = "../sutram-io",      version = "0.1" }
+sutram-fs      = { path = "../sutram-fs",      version = "0.1" }
+sutram-archive = { path = "../sutram-archive", version = "0.1" }

@@ -1,0 +1,24 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage[margin=1in]{geometry}
+
+\title{Temporary nginx Docker Container Verification}
+\author{Devin}
+\date{October 6, 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Verification}
+A temporary nginx container (\texttt{tmp-nginx}) was started with
+\texttt{docker run -d --rm -p 8080:80 nginx}. The screenshot below shows the
+Terminal window after the image pull, with \texttt{docker ps} confirming the
+container is up and listening on port 8080.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{terminal_docker_ps.png}
+\caption{Terminal window showing \texttt{docker ps} output with \texttt{tmp-nginx} running.}
+\end{figure}
+
+\end{document}

@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #080a0f;
+  --color-panel: #0e1219;
+  --color-panel2: #131824;
+  --color-panel3: #1a2130;
+  --color-edge: #1e2738;
+  --color-edge2: #2b3850;
+  --color-fg: #dde3ee;
+  --color-dim: #7d89a1;
+  --color-faint: #4d5871;
+  --color-accent: #4d8dff;
+  --color-accent2: #7b61ff;
+  --color-live: #3ecf8e;
+  --color-deleted: #ff5d5d;
+  --color-orphan: #f0b34c;
+  --color-warn: #f0b34c;
+  --color-symlink: #b48cff;
+  --font-sans: -apple-system, "SF Pro Text", Inter, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+a {
+  color: var(--color-accent);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-edge2) transparent;
+}
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-edge2);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes fadein {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+.fadein { animation: fadein 0.18s ease-out; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.pulse-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+.skeleton {
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--color-panel2) 25%, var(--color-panel3) 50%, var(--color-panel2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+
+.row-live { border-left: 2px solid transparent; }
+.row-deleted { border-left: 2px solid var(--color-deleted); }
+.row-deleted-intact { border-left: 2px solid var(--color-orphan); }
+
+.resize-x {
+  resize: horizontal;
+  overflow: hidden;
+  min-width: 220px;
+  max-width: 640px;
+}
+
+@media print {
+  body { background: #fff !important; color: #111 !important; }
+  aside, .no-print { display: none !important; }
+  section, .panel-print {
+    border-color: #ccc !important;
+    background: #fff !important;
+    color: #111 !important;
+  }
+  * { color: #111 !important; }
+}
