@@ -1,0 +1,25 @@
+[package]
+name = "sutram-btrfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "BTRFS forensic filesystem parser (COW history recovery, orphan items, extent backrefs, compressed extents, magic verdicts)"
+keywords = ["forensics", "filesystem", "btrfs", "dfir", "carving"]
+categories = ["filesystem", "parsing"]
+exclude = ["fuzz/"]
+
+[dependencies]
+sutram-io    = { path = "../sutram-io",    version = "0.1" }
+sutram-fs    = { path = "../sutram-fs",    version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
+# Pure-Rust codecs for BTRFS compressed extents + CRC32C integrity checks.
+# Justification (CONVENTIONS.md §1): no `*-sys`/C deps; all are pure Rust.
+crc32fast = "1"       # CRC32C: superblock + tree-block checksum verification
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }  # zlib extents
+ruzstd = "0.9"        # zstd extents
+lzokay = "2"          # LZO extents (per-page sub-block streams)
+
+[dev-dependencies]
+crc32fast = "1"       # synthetic-image checksums
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
