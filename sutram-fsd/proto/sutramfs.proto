@@ -1,0 +1,292 @@
+// sutramfs.proto — the `sutramfsd` daemon's gRPC surface.
+//
+// One service, six calls, mirroring the `sutram_fs::FsParser`/`FileSystem`
+// trait surface:
+//
+//   Detect(ImageRef)                  -> Detections
+//   Mount(ImageRef, MountOptions)     -> MountHandle
+//   Walk(MountHandle, filters)        -> stream FsEntryProto
+//   Read(MountHandle, path, off, len) -> stream ReadChunk (bytes)
+//   ReadRaw(MountHandle, off, len)    -> stream ReadChunk (bytes)
+//   Carve(MountHandle, region)        -> stream CarveHitProto
+//   Info(MountHandle)                 -> FsInfoProto
+//   Unmount(MountHandle)              -> UnmountReply
+//
+// Evidence correlation: callers SHOULD attach gRPC metadata keys
+// `x-evidence-id` and `x-job-id` to requests. The daemon records them on the
+// mount handle and echoes them back in every response's `meta` map.
+//
+// Enum vocabulary is carried as strings ("live", "deleted", "fat", …) so
+// clients written before a new parser/kind exists still decode.
+
+syntax = "proto3";
+
+package sutramfs.v1;
+
+service SutramFs {
+  // Probe a source with every registered parser; results sorted by
+  // confidence, strongest first.
+  rpc Detect(ImageRef) returns (Detections);
+  // Mount a source; returns a handle honoured by Walk/Read/Info/Unmount.
+  rpc Mount(MountRequest) returns (MountHandle);
+  // Stream the entry census: live tree, deleted entries, orphans, and
+  // lenient-mode error records (entry.error set, other fields empty).
+  rpc Walk(WalkRequest) returns (stream FsEntryProto);
+  // Stream a file's (recoverable) content in bounded chunks.
+  rpc Read(ReadRequest) returns (stream ReadChunk);
+  // Stream raw volume bytes at absolute offsets — for extracting carved
+  // objects and inspecting structures that are not part of the file tree.
+  rpc ReadRaw(ReadRawRequest) returns (stream ReadChunk);
+  // Scan a region for embedded-file signatures; hits carry resolved
+  // extents (footer-bounded, declared-size, or capped).
+  rpc Carve(CarveRequest) returns (stream CarveHitProto);
+  // Volume summary for a mounted handle.
+  rpc Info(HandleRequest) returns (FsInfoProto);
+  // Drop a handle before its TTL expires.
+  rpc Unmount(HandleRequest) returns (UnmountReply);
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+// ---------------------------------------------------------------------------
+
+/// Where the bytes live. `path` is resolved on the *server* — the daemon is
+/// designed for trusted local/trusted-network use. `offset`/`length` carve a
+/// partition window out of the source before parsing.
+message ImageRef {
+  oneof source {
+    // Server-local path to a disk image, opened read-only.
+    string path = 1;
+    // Small image carried inside the request (bounded by the server's
+    // max-message size, default 16 MiB).
+    bytes inline = 2;
+  }
+  // Byte offset of a partition/sub-image within the source. 0 = start.
+  uint64 offset = 3;
+  // Window length; 0 = to end of source.
+  uint64 length = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Detect / Mount
+// ---------------------------------------------------------------------------
+
+message Detection {
+  // Parser name: "fat", "exfat", "ntfs", "ext4", "xfs", "btrfs", "apfs",
+  // "hfs", "f2fs".
+  string parser = 1;
+  // "none" | "low" | "medium" | "high" | "certain".
+  string confidence = 2;
+}
+
+message Detections {
+  repeated Detection results = 1;
+  // Echoed request metadata (x-evidence-id, x-job-id).
+  map<string, string> meta = 2;
+}
+
+message MountOptionsProto {
+  // Fail fast on corruption instead of emitting partial results.
+  bool strict = 1;
+  // Fill FsEntryProto.magic via bounded header reads.
+  bool check_magic = 2;
+  // Emit orphan/lost artefacts under /$ORPHANED/.
+  bool include_orphans = 3;
+}
+
+message MountRequest {
+  ImageRef image = 1;
+  MountOptionsProto options = 2;
+  // Force a parser by name; empty = pick the highest-confidence detection.
+  string parser = 3;
+}
+
+message MountHandle {
+  // Opaque handle id for Walk/Read/Info/Unmount requests.
+  string id = 1;
+  // Parser that owns the mount, e.g. "fat".
+  string parser = 2;
+  // Volume fs_type from FsInfo, e.g. "FAT32".
+  string fs_type = 3;
+  // Unix seconds when the handle's TTL expires.
+  uint64 expires_at_unix = 4;
+  // Evidence correlation: x-evidence-id / x-job-id echoed here and stored
+  // with the handle for its lifetime.
+  map<string, string> meta = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Handles
+// ---------------------------------------------------------------------------
+
+message HandleRequest {
+  string id = 1;
+}
+
+message UnmountReply {
+  // False when the handle was unknown or already expired.
+  bool unmounted = 1;
+  map<string, string> meta = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Walk
+// ---------------------------------------------------------------------------
+
+message WalkRequest {
+  string handle_id = 1;
+  // "all" (default) | "live" | "deleted".
+  string status_filter = 2;
+  // "all" (default) | "file" | "directory" | "symlink" | "other".
+  string kind_filter = 3;
+  // Only emit entries whose path starts with this prefix ("" = all).
+  string path_prefix = 4;
+  // Stop after this many entries; 0 = unlimited.
+  uint32 max_entries = 5;
+}
+
+message Range {
+  uint64 offset = 1;
+  uint64 len = 2;
+}
+
+message TimestampProto {
+  // False when the on-disk field was unset/zero — never fabricated.
+  bool has_value = 1;
+  int64 unix_nanos = 2;
+  uint64 raw_value = 3;
+  // e.g. "fat-dos-datetime", "ntfs-filetime".
+  string raw_encoding = 4;
+  uint64 granularity_nanos = 5;
+}
+
+message TimestampsProto {
+  TimestampProto modified = 1;
+  TimestampProto accessed = 2;
+  TimestampProto created = 3;
+  TimestampProto changed = 4;
+  TimestampProto deleted = 5;
+}
+
+message MagicVerdictProto {
+  bool present = 1;
+  string declared = 2;
+  string detected = 3;
+  bool mismatch = 4;
+  // "info" | "suspicious" | "high".
+  string severity = 5;
+  repeated string reasons = 6;
+}
+
+message FsEntryProto {
+  string path = 1;
+  string name = 2;
+  uint64 entry_id = 3;
+  // "file" | "directory" | "symlink" | "other".
+  string kind = 4;
+  uint64 size = 5;
+  // Absolute byte offset of the metadata record that produced this entry.
+  uint64 disk_offset = 6;
+  // Data extents (absolute offset/len); deleted entries list only
+  // still-recoverable extents.
+  repeated Range allocated_ranges = 7;
+  TimestampsProto timestamps = 8;
+  // "live" | "deleted".
+  string status = 9;
+  // Deleted only: "intact" | "partially_overwritten" | "unrecoverable" |
+  // "unknown". Empty for live entries.
+  string recovery = 10;
+  // For partially_overwritten: bytes still recoverable / original size.
+  uint64 recovered_bytes = 11;
+  uint64 total_bytes = 12;
+  // Format-specific extras (attributes, orphan flags, journal keys…).
+  map<string, string> meta = 13;
+  MagicVerdictProto magic = 14;
+  // Lenient-mode corruption record: set on Err items, everything else empty.
+  string error = 15;
+}
+
+// ---------------------------------------------------------------------------
+// Read
+// ---------------------------------------------------------------------------
+
+message ReadRequest {
+  string handle_id = 1;
+  // Path as reported by Walk ("/HELLO.TXT", "/$ORPHANED/chain_20", …).
+  string path = 2;
+  // Logical file offset to start at.
+  uint64 offset = 3;
+  // Total bytes wanted; 0 = to end of recoverable data.
+  uint64 len = 4;
+  // Preferred bytes per stream message; clamped server-side to
+  // [1, 1 MiB], default 64 KiB.
+  uint32 chunk_size = 5;
+}
+
+message ReadChunk {
+  // Logical file offset of `data`'s first byte.
+  uint64 offset = 1;
+  bytes data = 2;
+  // True on the final chunk.
+  bool eof = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Raw read / carving
+// ---------------------------------------------------------------------------
+
+message ReadRawRequest {
+  string handle_id = 1;
+  // Absolute byte offset within the mounted source window.
+  uint64 offset = 2;
+  // Bytes wanted; 0 = to end of source.
+  uint64 len = 3;
+  // Preferred bytes per stream message; clamped like ReadRequest.
+  uint32 chunk_size = 4;
+}
+
+message CarveRequest {
+  string handle_id = 1;
+  // "unallocated" (default) | "whole" | "range".
+  string region = 2;
+  // Used when region = "range".
+  uint64 offset = 3;
+  uint64 length = 4;
+  // Probe alignment in bytes; 0 = parser default (512).
+  uint64 align = 5;
+}
+
+message CarveHitProto {
+  // Absolute offset of the object's first byte.
+  uint64 offset = 1;
+  // Resolved extent in bytes.
+  uint64 len = 2;
+  // Magic kind name, e.g. "png", "zip".
+  string kind = 3;
+  // Preferred extraction extension, e.g. ".png".
+  string ext = 4;
+  // True when `len` was resolved from the format's structure (footer,
+  // declared size, chunk chain); false when capped by region/max extent.
+  bool exact = 5;
+  // First bytes of the hit (bounded) for client-side inspection.
+  bytes header = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Info
+// ---------------------------------------------------------------------------
+
+message FsInfoProto {
+  string fs_type = 1;
+  string label = 2;
+  string uuid = 3;
+  uint64 block_size = 4;
+  uint64 total_blocks = 5;
+  bool has_free_blocks = 6;
+  uint64 free_blocks = 7;
+  bool has_total_nodes = 8;
+  uint64 total_nodes = 9;
+  map<string, string> fs_meta = 10;
+  // Evidence correlation echo.
+  map<string, string> meta = 11;
+}

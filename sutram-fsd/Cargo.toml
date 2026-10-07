@@ -1,0 +1,35 @@
+[package]
+name = "sutram-fsd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "gRPC daemon exposing the SUTRAM-FS forensic parser family (detect/mount/walk/read/info/unmount)"
+keywords = ["forensics", "filesystem", "grpc", "daemon", "dfir"]
+categories = ["filesystem", "network-programming"]
+
+[dependencies]
+sutram-io    = { path = "../sutram-io",    version = "0.1" }
+sutram-fs    = { path = "../sutram-fs",    version = "0.1" }
+sutram-fat   = { path = "../sutram-fat",   version = "0.1" }
+sutram-exfat = { path = "../sutram-exfat", version = "0.1" }
+sutram-ntfs  = { path = "../sutram-ntfs",  version = "0.1" }
+sutram-ext4  = { path = "../sutram-ext4",  version = "0.1" }
+sutram-xfs   = { path = "../sutram-xfs",   version = "0.1" }
+sutram-btrfs = { path = "../sutram-btrfs", version = "0.1" }
+sutram-apfs  = { path = "../sutram-apfs",  version = "0.1" }
+sutram-hfs   = { path = "../sutram-hfs",   version = "0.1" }
+sutram-f2fs  = { path = "../sutram-f2fs",  version = "0.1" }
+# gRPC stack (pure Rust): tonic + prost over tokio. Network-resolvable
+# deps; verified resolvable at authoring time.
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "sutramfsd"
+path = "src/main.rs"
