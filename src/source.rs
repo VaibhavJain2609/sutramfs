@@ -169,7 +169,22 @@ impl ByteSource for File {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         use std::os::unix::fs::FileExt;
-        FileExt::read_at(self, buf, offset)
+        match FileExt::read_at(self, buf, offset) {
+            // Raw character devices (`/dev/rdisk*`) reject unaligned reads
+            // with EINVAL — retry through a sector-aligned bounce window.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                const SEC: u64 = 512;
+                let a_start = offset & !(SEC - 1);
+                let a_end = (offset + buf.len() as u64).div_ceil(SEC) * SEC;
+                let mut tmp = vec![0u8; (a_end - a_start) as usize];
+                let n = FileExt::read_at(self, &mut tmp, a_start)?;
+                let base = (offset - a_start) as usize;
+                let got = n.saturating_sub(base).min(buf.len());
+                buf[..got].copy_from_slice(&tmp[base..base + got]);
+                Ok(got)
+            }
+            r => r,
+        }
     }
 }
 
@@ -193,16 +208,61 @@ impl ByteSource for File {
 pub struct FileSource {
     file: Mutex<File>,
     len: u64,
+    /// Raw character devices (macOS `/dev/rdisk*`, Linux `/dev/raw*`) reject
+    /// reads whose offset or length is not a multiple of the sector size —
+    /// reads must go through a sector-aligned bounce window.
+    sector_bounce: bool,
 }
 
 impl FileSource {
+    /// Sector size assumed for raw-device bounce alignment.
+    const RAW_SECTOR: u64 = 512;
+
     /// Wrap an already-open `File`.
     pub fn new(file: File) -> io::Result<Self> {
-        let len = file.metadata()?.len();
+        let meta = file.metadata()?;
+        let mut len = meta.len();
+        #[cfg(unix)]
+        let sector_bounce = {
+            use std::os::unix::fs::FileTypeExt;
+            meta.file_type().is_char_device()
+        };
+        #[cfg(not(unix))]
+        let sector_bounce = false;
+        #[cfg(unix)]
+        if len == 0 {
+            len = Self::probe_len(&file);
+        }
         Ok(Self {
             file: Mutex::new(file),
             len,
+            sector_bounce,
         })
+    }
+
+    /// Block and character device nodes (`/dev/diskN`, `/dev/rdiskN`) report
+    /// `st_size == 0` and `SEEK_END` does not resolve their size on macOS, so
+    /// binary-search the readable extent with positioned reads instead —
+    /// ~50 sector reads once at open. Returns 0 when nothing is readable.
+    #[cfg(unix)]
+    fn probe_len(file: &File) -> u64 {
+        use std::os::unix::fs::FileExt;
+        const SECTOR: u64 = 512;
+        let mut buf = [0u8; SECTOR as usize];
+        match FileExt::read_at(file, &mut buf, 0) {
+            Ok(n) if n > 0 => {}
+            _ => return 0,
+        }
+        // Invariant: sector `lo` is readable, `hi` is not.
+        let (mut lo, mut hi) = (0u64, u64::MAX / SECTOR);
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            match FileExt::read_at(file, &mut buf, mid * SECTOR) {
+                Ok(n) if n > 0 => lo = mid,
+                _ => hi = mid,
+            }
+        }
+        (lo + 1) * SECTOR
     }
 
     /// Open a path read-only.
@@ -220,13 +280,39 @@ impl ByteSource for FileSource {
         if offset >= self.len {
             return Ok(0);
         }
+        let want = buf.len().min((self.len - offset) as usize);
+        if want == 0 {
+            return Ok(0);
+        }
         let mut f = self
             .file
             .lock()
             .map_err(|_| io::Error::other("FileSource lock poisoned"))?;
-        f.seek(SeekFrom::Start(offset))?;
-        let want = buf.len().min((self.len - offset) as usize);
-        f.read(&mut buf[..want])
+        if !self.sector_bounce {
+            f.seek(SeekFrom::Start(offset))?;
+            return f.read(&mut buf[..want]);
+        }
+        // Raw device: widen the request to sector boundaries, read the
+        // aligned window, then slice out the requested range.
+        let sec = Self::RAW_SECTOR;
+        let a_start = offset & !(sec - 1);
+        let a_end = (offset + want as u64).div_ceil(sec) * sec;
+        let a_len = (a_end - a_start) as usize;
+        let mut tmp = vec![0u8; a_len];
+        f.seek(SeekFrom::Start(a_start))?;
+        let mut filled = 0usize;
+        while filled < a_len {
+            match f.read(&mut tmp[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let base = (offset - a_start) as usize;
+        let got = filled.saturating_sub(base).min(want);
+        buf[..got].copy_from_slice(&tmp[base..base + got]);
+        Ok(got)
     }
 }
 

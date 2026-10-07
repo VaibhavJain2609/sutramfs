@@ -1911,3 +1911,144 @@ fn split_raw_detection_edges() {
     assert!(!detect_split(dir.join("case.E01")));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// open_image — format-sniffing dispatch on real temp files
+// ---------------------------------------------------------------------------
+
+fn image_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("sutram-open-image-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn open_image_raw_passthrough() {
+    // No recognised signature → the raw file comes straight back.
+    let dir = image_dir("raw");
+    let p = dir.join("disk.dd");
+    let media: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&p, &media).unwrap();
+    let src = open_image(&p).unwrap();
+    assert_eq!(src.len(), media.len() as u64);
+    assert_eq!(src.read_slice(0, media.len()).unwrap(), media);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_e01_gathers_sibling_segments() {
+    // Pointing at .E01 finds .E02 automatically; pointing at .E02 still
+    // starts the acquisition at the discovered .E01.
+    let dir = image_dir("e01");
+    let media = e01_media(2 * E01_CS);
+    let chunks: Vec<&[u8]> = media.chunks(E01_CS).collect();
+    let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+    let s1 = build_e01_segment(&chunks[..1], 1, 2, sectors, "next");
+    let s2 = build_e01_segment(&chunks[1..], 2, 2, sectors, "done");
+    std::fs::write(dir.join("case.E01"), &s1).unwrap();
+    std::fs::write(dir.join("case.E02"), &s2).unwrap();
+    std::fs::write(dir.join("other.E02"), &s2).unwrap(); // wrong stem, excluded
+
+    for probe in ["case.E01", "case.E02"] {
+        let src = open_image(dir.join(probe)).unwrap();
+        assert_eq!(src.len(), media.len() as u64);
+        assert_eq!(src.read_slice(0, media.len()).unwrap(), media);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_e01_missing_continuation_is_clear_error() {
+    // .E01 terminates with `next` but no .E02 sibling exists.
+    let dir = image_dir("e01-gap");
+    let media = e01_media(2 * E01_CS);
+    let chunks: Vec<&[u8]> = media.chunks(E01_CS).collect();
+    let sectors = (media.len() as u64).div_ceil(E01_BPS as u64);
+    let s1 = build_e01_segment(&chunks[..1], 1, 2, sectors, "next");
+    std::fs::write(dir.join("lone.E01"), &s1).unwrap();
+    match open_image(dir.join("lone.E01")) {
+        Err(Error::Io(e)) => {
+            let m = e.to_string();
+            assert!(m.contains("E02"), "{m}");
+        }
+        Err(e) => panic!("expected Io error naming .E02, got {e:?}"),
+        Ok(_) => panic!("expected an error, got an opened image"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_vhd_fixed() {
+    // `conectix` footer → VhdSource; the footer itself is not part of
+    // the virtual disk.
+    let dir = image_dir("vhd");
+    let p = dir.join("disk.vhd");
+    let media: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let mut img = media.clone();
+    img.extend_from_slice(&vhd_footer(2, media.len() as u64, u64::MAX));
+    std::fs::write(&p, &img).unwrap();
+    let src = open_image(&p).unwrap();
+    assert_eq!(src.len(), media.len() as u64);
+    assert_eq!(src.read_slice(0, media.len()).unwrap(), media);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_vhdx() {
+    let dir = image_dir("vhdx");
+    let p = dir.join("disk.vhdx");
+    let bs = 1usize << 20;
+    let b0: Vec<u8> = (0..bs).map(|i| (i % 211) as u8).collect();
+    let mut img = build_vhdx(2 * bs as u64, bs as u32, &[(0, vhdx_bat_entry(6, 3))], false);
+    img[3 * bs..4 * bs].copy_from_slice(&b0);
+    std::fs::write(&p, &img).unwrap();
+    let src = open_image(&p).unwrap();
+    assert_eq!(src.len(), 2 * bs as u64);
+    assert_eq!(src.read_slice(0, bs).unwrap(), b0);
+    assert!(src.read_slice(bs as u64, bs).unwrap().iter().all(|&b| b == 0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_qcow2() {
+    let dir = image_dir("qcow2");
+    let p = dir.join("disk.qcow2");
+    let d0 = qcow_media(QCOW2_CS);
+    let img = build_qcow2(&[Raw(d0.clone()), Unalloc], 3);
+    std::fs::write(&p, &img).unwrap();
+    let src = open_image(&p).unwrap();
+    assert_eq!(src.len(), 2 * QCOW2_CS as u64);
+    assert_eq!(src.read_slice(0, QCOW2_CS).unwrap(), d0);
+    assert!(src
+        .read_slice(QCOW2_CS as u64, QCOW2_CS)
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_split_raw_concatenates() {
+    let dir = image_dir("split");
+    std::fs::write(dir.join("disk.002"), b"world!").unwrap();
+    std::fs::write(dir.join("disk.001"), b"hello ").unwrap();
+    let src = open_image(dir.join("disk.001")).unwrap();
+    assert_eq!(src.read_slice(0, 12).unwrap(), b"hello world!");
+    // any member resolves to the same concatenated image
+    let src2 = open_image(dir.join("disk.002")).unwrap();
+    assert_eq!(src2.read_slice(0, 12).unwrap(), b"hello world!");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_image_missing_file() {
+    let dir = image_dir("gone");
+    match open_image(dir.join("nope.img")) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        Err(e) => panic!("expected NotFound Io error, got {e:?}"),
+        Ok(_) => panic!("expected an error, got an opened image"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

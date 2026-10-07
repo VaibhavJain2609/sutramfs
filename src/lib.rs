@@ -70,7 +70,13 @@ pub mod vhd;
 /// tables are ignored — this reader never writes.
 pub mod qcow2;
 
+/// Format-sniffing disk-image open: raw `dd`, EWF `*.E01` segments,
+/// VHD/VHDX, QCOW2 and split-raw sets all resolve through
+/// [`image::open_image`] into one [`ByteSource`].
+pub mod image;
+
 pub use error::{Error, Result};
+pub use image::open_image;
 pub use partition::{
     open_partitions, partitions, Partition, PartitionSource, TableKind,
 };
