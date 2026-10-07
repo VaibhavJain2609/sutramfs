@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 description = "Android partition-layer parser (sparse images, liblp dynamic partitions, AVB vbmeta, GPT labels)"
 keywords = ["forensics", "android", "partitions", "dfir", "vbmeta"]
 categories = ["filesystem", "parsing"]
+exclude = ["fuzz/"]
 
 [dependencies]
 sutram-io = { path = "../sutram-io", version = "0.1" }

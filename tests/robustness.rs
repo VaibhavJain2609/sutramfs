@@ -382,6 +382,213 @@ fn analyze_container_depth_cap() {
     assert!(analyze(arc(img)).is_err());
 }
 
+// ---------------------------------------------------------------------------
+// Residual guard-arm coverage
+// ---------------------------------------------------------------------------
+
+/// ByteSource whose `read_slice` short-returns — exercises the defensive
+/// "fewer bytes than asked for" arms honest sources never trigger.
+struct ShortReads {
+    inner: Vec<u8>,
+    slice_cap: usize,
+}
+
+impl ByteSource for ShortReads {
+    fn len(&self) -> u64 {
+        self.inner.len() as u64
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.as_slice().read_at(offset, buf)
+    }
+    fn read_slice(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.inner.as_slice().read_slice(offset, len.min(self.slice_cap))
+    }
+}
+
+#[test]
+fn lp_empty_tables_parse() {
+    // A super image with zero logical partitions → the partitions/extents
+    // table descriptors carry num_entries = 0 (early-return arm).
+    let img = super_img(&[], None);
+    let md = read_metadata(&arc(img)).unwrap();
+    assert!(md.partitions.is_empty());
+    assert!(md.extents.is_empty());
+    assert_eq!(md.groups.len(), 1); // builder always emits "default"
+    assert_eq!(md.block_devices.len(), 1);
+}
+
+#[test]
+fn vbmeta_hashtree_descriptor_fields() {
+    // HASHTREE (tag 1): fixed part 104 B + reserved[60] = 164 B, then
+    // partition name / salt / root digest.
+    let name = b"system";
+    let mut f = vec![0u8; 164 + name.len()];
+    common::w32be(&mut f, 0, 1); // dm_verity_version
+    common::w64be(&mut f, 4, 0x4000_0000); // image_size
+    common::w64be(&mut f, 12, 0x4000_0000); // tree_offset
+    common::w64be(&mut f, 20, 0x10_0000); // tree_size
+    common::w32be(&mut f, 28, 4096); // data_block_size
+    common::w32be(&mut f, 32, 4096); // hash_block_size
+    f[56..56 + 6].copy_from_slice(b"sha256"); // hash_algorithm
+    common::w32be(&mut f, 88, name.len() as u32); // partition_name_len
+    common::w32be(&mut f, 92, 32); // salt_len
+    common::w32be(&mut f, 96, 32); // root_digest_len
+    f[164..164 + name.len()].copy_from_slice(name);
+    let mut d = Vec::new();
+    d.extend_from_slice(&1u64.to_be_bytes());
+    d.extend_from_slice(&(f.len() as u64).to_be_bytes());
+    d.extend_from_slice(&f);
+    let img = vbmeta_blob(0, 0, &d);
+    let info = sutram_part::vbmeta::parse(&img.as_slice()).unwrap();
+    assert_eq!(info.descriptors.len(), 1);
+    match &info.descriptors[0] {
+        VbmetaDescriptor::Hashtree {
+            partition_name,
+            hash_algorithm,
+            image_size,
+            ..
+        } => {
+            assert_eq!(partition_name, "system");
+            assert_eq!(hash_algorithm, "sha256");
+            assert_eq!(*image_size, 0x4000_0000);
+        }
+        other => panic!("expected Hashtree, got {other:?}"),
+    }
+    assert_eq!(info.descriptors[0].partition_name(), Some("system"));
+}
+
+#[test]
+fn vbmeta_descriptor_declared_size_overrun() {
+    // A descriptor header claiming more bytes than the region holds →
+    // warning, and the walk stops cleanly.
+    let mut d = Vec::new();
+    d.extend_from_slice(&1u64.to_be_bytes());
+    d.extend_from_slice(&0xFFFFu64.to_be_bytes()); // nbytes runs past region
+    let img = vbmeta_blob(0, 0, &d);
+    let info = sutram_part::vbmeta::parse(&img.as_slice()).unwrap();
+    assert!(info.descriptors.is_empty());
+    assert!(info
+        .warnings
+        .iter()
+        .any(|w| w.contains("runs past region")), "{:?}", info.warnings);
+}
+
+#[test]
+fn find_vbmeta_footer_and_offset0_paths() {
+    // Footer path: valid AVBf footer pointing at a valid blob.
+    let vb = vbmeta_blob(0, 11, &[]);
+    let boot = boot_img_with_vbmeta(&vb);
+    let info = find_vbmeta(&boot.as_slice()).unwrap();
+    assert_eq!(info.rollback_index, 11);
+    assert!(info.footer.is_some());
+    // Footer present but pointing at non-vbmeta bytes → falls back to the
+    // offset-0 probe, which also fails → None.
+    let mut img = vec![0x55u8; 0x8000];
+    let mut footer = [0u8; 64];
+    footer[0..4].copy_from_slice(b"AVBf");
+    common::w32be(&mut footer, 4, 1);
+    common::w64be(&mut footer, 20, 0x100); // vbmeta_offset → garbage bytes
+    common::w64be(&mut footer, 28, 0x200); // vbmeta_size ≥ header, in bounds
+    let tail = img.len() - 64;
+    img[tail..].copy_from_slice(&footer);
+    assert!(find_vbmeta(&img.as_slice()).is_none());
+    // Plain vbmeta blob at offset 0.
+    let vb = vbmeta_blob(0, 3, &[]);
+    assert_eq!(find_vbmeta(&vb.as_slice()).unwrap().rollback_index, 3);
+}
+
+#[test]
+fn vbmeta_footer_short_read_returns_none() {
+    // A source that yields fewer bytes than the tail scan asked for →
+    // footer absent, not an error.
+    let src = ShortReads {
+        inner: vec![0u8; 4096],
+        slice_cap: 32,
+    };
+    assert!(sutram_part::vbmeta::parse_footer(&src).unwrap().is_none());
+}
+
+#[test]
+fn crypt_footer_read_error_returns_none() {
+    // The tail read failing (bad media) → absent footer, not a panic/Err.
+    let src = FailAt {
+        inner: vec![0u8; 0x8000],
+        fail_at: 0x8000 - 0x4000,
+    };
+    assert!(sutram_part::fbe::find_crypt_footer(&src).is_none());
+}
+
+#[test]
+fn lp_no_block_devices_no_overlap_check() {
+    // Empty block-device table → the first_logical_sector sanity check is
+    // skipped entirely (`block_devices.first()` → None).
+    let mut img = sample();
+    patch_all_slots(&mut img, 116 + 4, |b| w32(b, 0, 0)); // bdev num = 0
+    let md = read_metadata(&arc(img.clone())).unwrap();
+    assert!(md.block_devices.is_empty());
+    let (parts, _) = logical_partitions_verbose(arc(img)).unwrap();
+    assert_eq!(parts.len(), 2);
+}
+
+#[test]
+fn vbmeta_hash_descriptor_and_property_name_arms() {
+    // HASH (tag 2): fixed part 116 B, then name/salt/digest — plus a
+    // PROPERTY (tag 0) which has no partition binding.
+    let name = b"boot";
+    let mut f = vec![0u8; 116 + name.len()];
+    common::w64be(&mut f, 0, 0x20_0000); // image_size
+    f[8..8 + 6].copy_from_slice(b"sha256"); // hash_algorithm
+    common::w32be(&mut f, 40, name.len() as u32); // partition_name_len
+    f[116..116 + name.len()].copy_from_slice(name);
+    let mut d = Vec::new();
+    d.extend_from_slice(&2u64.to_be_bytes());
+    d.extend_from_slice(&(f.len() as u64).to_be_bytes());
+    d.extend_from_slice(&f);
+    // PROPERTY: key_len u64, value_len u64, key\0 value\0.
+    let mut p = Vec::new();
+    p.extend_from_slice(&3u64.to_be_bytes()); // key_len
+    p.extend_from_slice(&5u64.to_be_bytes()); // value_len
+    p.extend_from_slice(b"key\0value\0");
+    let pp = p.len().next_multiple_of(8);
+    p.resize(pp, 0);
+    d.extend_from_slice(&0u64.to_be_bytes());
+    d.extend_from_slice(&(p.len() as u64).to_be_bytes());
+    d.extend_from_slice(&p);
+    let img = vbmeta_blob(0, 0, &d);
+    let info = sutram_part::vbmeta::parse(&img.as_slice()).unwrap();
+    assert_eq!(info.descriptors.len(), 2);
+    match &info.descriptors[0] {
+        VbmetaDescriptor::Hash {
+            partition_name, ..
+        } => assert_eq!(partition_name, "boot"),
+        other => panic!("expected Hash, got {other:?}"),
+    }
+    assert_eq!(info.descriptors[0].partition_name(), Some("boot"));
+    match &info.descriptors[1] {
+        VbmetaDescriptor::Property { key, value } => {
+            assert_eq!(key, "key");
+            assert_eq!(value, b"value");
+        }
+        other => panic!("expected Property, got {other:?}"),
+    }
+    assert_eq!(info.descriptors[1].partition_name(), None);
+}
+
+#[test]
+fn find_vbmeta_footer_size_too_small_skips() {
+    // AVBf footer whose vbmeta_size is below the header size → the footer
+    // path is skipped and the offset-0 probe runs instead.
+    let mut img = vec![0u8; 0x8000];
+    let mut footer = [0u8; 64];
+    footer[0..4].copy_from_slice(b"AVBf");
+    common::w32be(&mut footer, 4, 1);
+    common::w64be(&mut footer, 20, 0x100);
+    common::w64be(&mut footer, 28, 16); // < 256-byte vbmeta header
+    let tail = img.len() - 64;
+    img[tail..].copy_from_slice(&footer);
+    assert!(find_vbmeta(&img.as_slice()).is_none());
+}
+
 #[test]
 fn crypt_footer_and_metadata_flags() {
     // userdata partition with a crypt_ftr + a metadata partition → both

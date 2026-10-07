@@ -103,8 +103,10 @@ This layer doesn't undelete files, but it preserves the truth:
   be resolved from a single super image — flagged, mapped as holes.
 - FBE/FDE content is flagged, never decrypted; the `metadata` partition's
   keyblobs are files inside an ext4 filesystem, below this layer's reach.
-- MBR-only tables are surfaced as `Raw` container + partitions with a
-  warning (no dedicated `ContainerKind`).
+- MBR-only tables yield `ContainerKind::Mbr` (with an
+  "unusual — GPT expected" warning) rather than `Raw`, so a report never
+  claims "no partition layer" for a table that produced partitions —
+  but no MBR-specific attributes (boot flags, CHS) are surfaced.
 - Partition role classification is heuristic — OEM-specific names fall to
   `PartitionRole::Other`.
 
