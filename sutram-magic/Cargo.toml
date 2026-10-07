@@ -1,0 +1,11 @@
+[package]
+name = "sutram-magic"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "File-signature detection and extension-vs-content masquerade checking for filesystem forensics"
+keywords = ["forensics", "magic", "filetype", "dfir", "masquerade"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
