@@ -1,0 +1,5 @@
+# cargo-fuzz build artifacts, saved crashes and the grown corpus — all
+# regenerable locally via `cargo +nightly fuzz run parse_image`.
+target
+artifacts
+corpus
