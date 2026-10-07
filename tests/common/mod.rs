@@ -22,6 +22,7 @@
 //! | 3       | SUBDIR      directory                           |
 //! | 4       | DELETED.TXT deleted-intact, "0123456789"        |
 //! | 5       | SUBDIR/INNER.TXT live, "inner"                  |
+//! | 6       | FAKE.TXT    live, MZ/PE bytes → magic mismatch  |
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -97,11 +98,11 @@ pub fn fat12() -> Vec<u8> {
     img[510] = 0x55;
     img[511] = 0xAA;
 
-    // FAT: [0]=media, [1]=EOC; clusters 2..=5 end-of-chain.
+    // FAT: [0]=media, [1]=EOC; clusters 2..=6 end-of-chain.
     img[FAT_OFF] = 0xF8;
     img[FAT_OFF + 1] = 0xFF;
     img[FAT_OFF + 2] = 0xFF;
-    for c in 2..=5u32 {
+    for c in 2..=6u32 {
         fat12_set(&mut img, c, 0xFFF);
     }
 
@@ -109,6 +110,8 @@ pub fn fat12() -> Vec<u8> {
     dirent(&mut img, ROOT_OFF, 0, b"HELLO   TXT", 0x20, 2, 12);
     dirent(&mut img, ROOT_OFF, 1, b"SUBDIR     ", 0x10, 3, 0);
     dirent(&mut img, ROOT_OFF, 2, b"\xE5ELETED TXT", 0x20, 4, 10);
+    // Masquerade file: .TXT extension, real MZ→PE content.
+    dirent(&mut img, ROOT_OFF, 3, b"FAKE    TXT", 0x20, 6, 64);
 
     // File data.
     img[clus_off(2)..clus_off(2) + 12].copy_from_slice(b"hello world!");
@@ -120,6 +123,13 @@ pub fn fat12() -> Vec<u8> {
     dirent(&mut img, d, 1, b"..         ", 0x10, 0, 0);
     dirent(&mut img, d, 2, b"INNER   TXT", 0x20, 5, 5);
     img[clus_off(5)..clus_off(5) + 5].copy_from_slice(b"inner");
+
+    // FAKE.TXT data: MZ header + e_lfanew + "PE\0\0" → a real PE.
+    let f = clus_off(6);
+    img[f] = b'M';
+    img[f + 1] = b'Z';
+    w32(&mut img, f + 0x3C, 0x40); // e_lfanew
+    img[f + 0x40..f + 0x44].copy_from_slice(b"PE\0\0");
 
     img
 }

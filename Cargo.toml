@@ -26,3 +26,10 @@ sutram-xfs = { path = "../sutram-xfs", version = "0.1" }
 sutram-hfs = { path = "../sutram-hfs", version = "0.1" }
 sutram-ntfs = { path = "../sutram-ntfs", version = "0.1" }
 sutram-apfs = { path = "../sutram-apfs", version = "0.1" }
+
+[dev-dependencies]
+# Used only by the sibling parser test-corpus builders that tests/smoke.rs
+# reuses via #[path] (btrfs checksums/zlib extents, hfs decmpfs payloads).
+crc32fast = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+miniz_oxide = "0.9"

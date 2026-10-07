@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use sutram_fs::{DetectConfidence, FsEntry, FsParser, MountOptions};
-use sutram_io::{FileSource, ByteSource};
+use sutram_io::ByteSource;
 
 fn parsers() -> Vec<Box<dyn FsParser>> {
     vec![
@@ -41,7 +41,11 @@ fn usage() -> ! {
 }
 
 fn open_image(path: &str) -> io::Result<Arc<dyn ByteSource>> {
-    Ok(sutram_io::into_arc(FileSource::open(path)?))
+    // sniff raw/E01/VHD/VHDX/QCOW2/split-raw in one place
+    sutram_io::open_image(path).map_err(|e| match e {
+        sutram_io::Error::Io(e) => e,
+        e => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
+    })
 }
 
 /// Optional `-p N`: scope the source to partition N (0-based).
@@ -151,6 +155,8 @@ fn main() -> ExitCode {
         Some("ls") | Some("walk") => run(cmd_ls(&args[1..])),
         Some("cat") | Some("extract") => run(cmd_cat(&args[1..])),
         Some("carve") => run(cmd_carve(&args[1..])),
+        Some("remnants") => run(cmd_remnants(&args[1..])),
+        Some("rebuild") => run(cmd_rebuild(&args[1..])),
         Some("-h") | Some("--help") | None => usage(),
         Some(other) => {
             eprintln!("unknown command '{other}'");
@@ -277,10 +283,22 @@ fn cmd_ls(args: &[String]) -> Result<(), String> {
         }
         i += 1;
     }
+    if !matches!(
+        format.as_str(),
+        "tree" | "json" | "jsonl" | "csv" | "bodyfile" | "mactime"
+    ) {
+        return Err(format!(
+            "unknown output format '{format}' (tree|json|csv|bodyfile)"
+        ));
+    }
     let (c, _) = parse_common(&rest)?;
     let fs = c.mount()?;
     let out = io::stdout();
     let mut w = io::BufWriter::new(out.lock());
+    if format == "csv" {
+        writeln!(w, "entry_id,kind,size,status,mtime,disk_offset,path")
+            .map_err(|e| e.to_string())?;
+    }
     let iter = fs.walk();
     let mut n = 0usize;
     for item in iter {
@@ -292,7 +310,8 @@ fn cmd_ls(args: &[String]) -> Result<(), String> {
                 out::emit(&mut w, &e, &format).map_err(|e| e.to_string())?;
                 n += 1;
             }
-            Err(e) => writeln!(w, "ERROR {e}").map_err(|e| e.to_string())?,
+            // Walk errors go to stderr so json/csv/bodyfile stay parseable.
+            Err(e) => eprintln!("ERROR {e}"),
         }
     }
     if format == "tree" {
@@ -356,7 +375,15 @@ fn cmd_carve(args: &[String]) -> Result<(), String> {
     let (c, _) = parse_common(&rest)?;
     let fs = c.mount()?;
     let src = fs.source();
-    let end = len.map(|l| offset + l).unwrap_or_else(|| src.len());
+    let end = len
+        .map(|l| offset.saturating_add(l).min(src.len()))
+        .unwrap_or_else(|| src.len());
+    if !unalloc && offset >= end {
+        return Err(format!(
+            "--offset {offset:#x} at or beyond image end ({:#x})",
+            src.len()
+        ));
+    }
     let mut hits = 0usize;
     let mut scan = |off: u64, len_: u64| -> Result<(), String> {
         for h in fs.carve_region(off, len_, align).map_err(|e| e.to_string())? {
@@ -374,5 +401,275 @@ fn cmd_carve(args: &[String]) -> Result<(), String> {
         scan(offset, end - offset)?;
     }
     eprintln!("-- {hits} carve hits");
+    Ok(())
+}
+
+fn cmd_remnants(args: &[String]) -> Result<(), String> {
+    let mut offset = 0u64;
+    let mut len: Option<u64> = None;
+    let mut aligned_only = false;
+    let mut exclude_mft = false;
+    let mut sector_size = 0u64;
+    let mut rec_size = 0u64;
+    let mut indx_size = 0u64;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--offset" => {
+                i += 1;
+                offset = args.get(i).and_then(|s| s.parse().ok()).ok_or("--offset")?;
+            }
+            "--len" => {
+                i += 1;
+                len = Some(args.get(i).and_then(|s| s.parse().ok()).ok_or("--len")?);
+            }
+            "--sector-size" => {
+                i += 1;
+                sector_size = args.get(i).and_then(|s| s.parse().ok()).ok_or("--sector-size")?;
+            }
+            "--rec-size" => {
+                i += 1;
+                rec_size = args.get(i).and_then(|s| s.parse().ok()).ok_or("--rec-size")?;
+            }
+            "--indx-size" => {
+                i += 1;
+                indx_size = args.get(i).and_then(|s| s.parse().ok()).ok_or("--indx-size")?;
+            }
+            "--aligned-only" => aligned_only = true,
+            "--exclude-live-mft" => exclude_mft = true,
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let (c, _) = parse_common(&rest)?;
+    let src = open_image(&c.image).map_err(|e| format!("open {}: {e}", c.image))?;
+    let src = maybe_partition(src, c.part)?;
+
+    let mut opts = sutram_ntfs::RemnantScanOpts::default();
+    match sutram_ntfs::probe_geometry(src.as_ref()) {
+        Some((ss, rs, is_)) => {
+            opts.sector_size = ss as usize;
+            opts.record_size = rs;
+            opts.index_size = is_ as usize;
+        }
+        None => eprintln!("warning: no NTFS boot sector at offset 0 — using defaults (sector 512, record 1024, index 4096)"),
+    }
+    if sector_size > 0 {
+        opts.sector_size = sector_size as usize;
+    }
+    if rec_size > 0 {
+        opts.record_size = rec_size;
+    }
+    if indx_size > 0 {
+        opts.index_size = indx_size as usize;
+    }
+    opts.aligned_only = aligned_only;
+
+    if exclude_mft {
+        match sutram_ntfs::NtfsFs::mount(src.clone(), MountOptions::default()) {
+            Ok(fs) => {
+                let ex = sutram_ntfs::live_mft_extents(&fs);
+                eprintln!("-- excluding {} live $MFT extent(s)", ex.len());
+                opts.exclude = ex;
+            }
+            Err(e) => eprintln!("warning: mount failed ({e}); scanning everything"),
+        }
+    }
+
+    let end = len
+        .map(|l| offset.saturating_add(l).min(src.len()))
+        .unwrap_or_else(|| src.len());
+    if offset >= end {
+        return Err(format!("--offset {offset:#x} at or beyond image end ({:#x})", src.len()));
+    }
+
+    let mut last = 0u64;
+    let mut progress = |pos: u64| {
+        if pos - last >= 1024 * 1024 * 1024 {
+            last = pos;
+            eprintln!("... {:.1} GB", pos as f64 / 1e9);
+        }
+    };
+
+    let out = io::stdout();
+    let mut w = io::BufWriter::new(out.lock());
+    let stats = sutram_ntfs::scan_to_jsonl(
+        src.as_ref(),
+        offset,
+        end,
+        &opts,
+        Some(&mut progress),
+        &mut w,
+    )
+    .map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())?;
+    eprintln!(
+        "-- scanned {:.2} GB: {} FILE records, {} INDX blocks",
+        stats.bytes_scanned as f64 / 1e9, stats.file_hits, stats.indx_hits
+    );
+    Ok(())
+}
+
+/// `rebuild`: reconstruct the dead filesystem's directory tree from remnant
+/// records (live scan and/or saved JSONL), then match live files back onto
+/// old paths by (basename, size). Emits a restore plan.
+fn cmd_rebuild(args: &[String]) -> Result<(), String> {
+    let mut offset = 0u64;
+    let mut len: Option<u64> = None;
+    let mut remnant_files: Vec<String> = Vec::new();
+    let mut under: Vec<String> = Vec::new();
+    let mut format = "csv".to_string();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--offset" => {
+                i += 1;
+                offset = args.get(i).and_then(|s| s.parse().ok()).ok_or("--offset")?;
+            }
+            "--len" => {
+                i += 1;
+                len = Some(args.get(i).and_then(|s| s.parse().ok()).ok_or("--len")?);
+            }
+            "--remnants" => {
+                i += 1;
+                remnant_files.push(args.get(i).ok_or("--remnants needs a file")?.clone());
+            }
+            "--under" => {
+                i += 1;
+                under.push(args.get(i).ok_or("--under needs a path")?.clone());
+            }
+            "-o" | "--output" => {
+                i += 1;
+                format = args.get(i).ok_or("-o needs a format")?.clone();
+            }
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if !matches!(format.as_str(), "csv" | "jsonl") {
+        return Err("unknown output format (csv|jsonl)".into());
+    }
+    let (c, _) = parse_common(&rest)?;
+    let src = open_image(&c.image).map_err(|e| format!("open {}: {e}", c.image))?;
+    let src = maybe_partition(src, c.part)?;
+
+    // Mount live FS: needed for the live file list; also gives us the live
+    // $MFT extents to exclude from remnant scanning.
+    let fs = sutram_ntfs::NtfsFs::mount(src.clone(), MountOptions::default())
+        .map_err(|e| format!("mount: {e}"))?;
+    let mut opts = sutram_ntfs::RemnantScanOpts::default();
+    if let Some((ss, rs, is_)) = sutram_ntfs::probe_geometry(src.as_ref()) {
+        opts.sector_size = ss as usize;
+        opts.record_size = rs;
+        opts.index_size = is_ as usize;
+    }
+    opts.exclude = sutram_ntfs::live_mft_extents(&fs);
+
+    // --- gather remnants ---
+    let live_map = fs.live_names();
+    let mut tree = sutram_ntfs::RemnantTree::new();
+    let mut n_file = 0u64;
+    let mut n_indx = 0u64;
+    let mut feed = |r: &sutram_ntfs::Remnant| {
+        match r {
+            sutram_ntfs::Remnant::File(_) => n_file += 1,
+            sutram_ntfs::Remnant::Index(_) => n_indx += 1,
+        }
+        tree.feed(r, Some(&live_map));
+    };
+
+    for path in &remnant_files {
+        let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        for line in std::io::BufRead::lines(std::io::BufReader::new(f)) {
+            let line = line.map_err(|e| e.to_string())?;
+            if let Some(r) = sutram_ntfs::parse_remnant_line(&line) {
+                feed(&r);
+            }
+        }
+        eprintln!("-- loaded {}", path);
+    }
+
+    if remnant_files.is_empty() || offset != 0 || len.is_some() {
+        // live scan too (default: whole source, minus live MFT extents)
+        let end = len
+            .map(|l| offset.saturating_add(l).min(src.len()))
+            .unwrap_or_else(|| src.len());
+        eprintln!("-- scanning {:.1} GB for remnants...", (end - offset) as f64 / 1e9);
+        sutram_ntfs::scan_remnants(src.as_ref(), offset, end, &opts, None, |r| feed(&r))
+            .map_err(|e| e.to_string())?;
+    }
+    tree.normalize();
+    let entries = tree.entries();
+    let n_dirs = entries.iter().filter(|e| e.is_dir).count();
+    eprintln!(
+        "-- tree: {} FILE + {} INDX remnants -> {} entries ({} dirs)",
+        n_file, n_indx, entries.len(), n_dirs
+    );
+
+    // --- live files ---
+    let fsdyn: &dyn sutram_fs::FileSystem = &fs;
+    let mut live = Vec::new();
+    for e in fsdyn.walk().flatten() {
+        if e.kind != sutram_fs::EntryKind::File {
+            continue;
+        }
+        if !under.is_empty() && !under.iter().any(|u| e.path.starts_with(u.as_str())) {
+            continue;
+        }
+        live.push(sutram_ntfs::LiveFile {
+            entry_id: e.entry_id,
+            path: e.path.clone(),
+            name: e.name.clone(),
+            size: e.size,
+        });
+    }
+    eprintln!("-- live candidate files: {}", live.len());
+
+    let plan = sutram_ntfs::match_live(&entries, &live);
+
+    let out = io::stdout();
+    let mut w = io::BufWriter::new(out.lock());
+    match format.as_str() {
+        "csv" => {
+            writeln!(w, "live_path,restore_to,size,live_recno,old_recno,ambiguous")
+                .map_err(|e| e.to_string())?;
+            for p in &plan {
+                writeln!(
+                    w,
+                    "\"{}\",\"{}\",{},{},{},{}",
+                    p.live_path.replace('"', "\"\""),
+                    p.restored_path.replace('"', "\"\""),
+                    p.size,
+                    p.live_entry_id,
+                    p.old_recno,
+                    p.ambiguous
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        _ => {
+            for p in &plan {
+                writeln!(
+                    w,
+                    "{{\"live\":\"{}\",\"restore\":\"{}\",\"size\":{},\"live_recno\":{},\"old_recno\":{},\"ambiguous\":{}}}",
+                    p.live_path.replace('\\', "\\\\").replace('"', "\\\""),
+                    p.restored_path.replace('\\', "\\\\").replace('"', "\\\""),
+                    p.size,
+                    p.live_entry_id,
+                    p.old_recno,
+                    p.ambiguous
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    eprintln!(
+        "-- restore plan: {} files mapped ({} ambiguous)",
+        plan.len(),
+        plan.iter().filter(|p| p.ambiguous).count()
+    );
     Ok(())
 }
