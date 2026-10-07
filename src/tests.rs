@@ -1250,3 +1250,355 @@ fn reader_error_and_pad_paths() {
     assert_eq!(&buf[..2], b"AB");
     assert_eq!(&buf[2..8], &[0u8; 6]);
 }
+
+// ---------------------------------------------------------------------------
+// Coverage expansion round 2: descriptor guards, ref merges, io-error
+// latching, detection ladder, chunk-map edges, path cycles.
+// ---------------------------------------------------------------------------
+
+/// A ByteSource whose reads always fail — exercises the `FsError::Io`
+/// propagation paths (tree walk, chunk-tree scan, extent reader).
+struct FailSrc;
+
+impl sutram_io::ByteSource for FailSrc {
+    fn len(&self) -> u64 {
+        0x100_0000
+    }
+    fn read_at(&self, _off: u64, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("simulated disk failure"))
+    }
+}
+
+/// A ByteSource that works below `fail_at` and errors above — drives the
+/// mid-stream latch (partial Ok then Err on the next read).
+struct GapSrc {
+    fail_at: u64,
+}
+
+impl sutram_io::ByteSource for GapSrc {
+    fn len(&self) -> u64 {
+        0x100_0000
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if off >= self.fail_at {
+            return Err(std::io::Error::other("bad sector"));
+        }
+        buf.fill(0xAA);
+        Ok(buf.len())
+    }
+}
+
+#[test]
+fn treewalk_truncated_descriptors() {
+    use crate::btree::TreeWalk;
+    use sutram_fs::FsError;
+    let map = ident_map();
+    // Leaf whose block read ends mid-item-table: nritems says 10, the
+    // source holds only ~60 bytes of descriptors → "bad item descriptor".
+    let mut img = vec![0u8; 0x4000 + 160];
+    w64(&mut img, 0x4000 + 0x50, 7);
+    w32(&mut img, 0x4000 + 0x60, 10);
+    let mut tw = TreeWalk::new(&img, &map, 4096, 1);
+    tw.for_each_item(0x4000, &mut |_| {});
+    assert!(tw
+        .errors
+        .iter()
+        .any(|e| matches!(e, FsError::Corrupt { msg, .. } if msg.contains("item descriptor"))));
+    // Internal node — same truncation hits the keyptr loop instead.
+    let mut img = vec![0u8; 0x4000 + 140];
+    w64(&mut img, 0x4000 + 0x50, 7);
+    w32(&mut img, 0x4000 + 0x60, 8);
+    img[0x4000 + 0x64] = 1;
+    let mut tw = TreeWalk::new(&img, &map, 4096, 1);
+    tw.for_each_item(0x4000, &mut |_| {});
+    assert!(tw
+        .errors
+        .iter()
+        .any(|e| matches!(e, FsError::Corrupt { msg, .. } if msg.contains("key pointer"))));
+    // Block shorter than the 101-byte header → truncated error.
+    let img = vec![0u8; 0x4000 + 40];
+    let mut tw = TreeWalk::new(&img, &map, 4096, 1);
+    tw.for_each_item(0x4000, &mut |_| {});
+    assert_eq!(tw.errors.len(), 1);
+}
+
+#[test]
+fn treewalk_and_chunk_tree_io_errors() {
+    use crate::btree::TreeWalk;
+    use crate::chunk::{dev_items, read_chunk_tree};
+    use sutram_fs::FsError;
+    let src = FailSrc;
+    let map = ident_map();
+    // Tree walk: read failure becomes a recorded error, walk continues.
+    let mut tw = TreeWalk::new(&src, &map, 4096, 1);
+    tw.for_each_item(0x4000, &mut |_| {});
+    assert_eq!(tw.errors.len(), 1);
+    // Chunk tree: read failure → FsError::Io.
+    let mut m = ChunkMap::default();
+    m.add_chunk(0, 0x100_0000, 0);
+    let errs = read_chunk_tree(&src, 0x4000, &mut m, 4096);
+    assert!(errs.iter().any(|e| matches!(e, FsError::Io(_))));
+    // dev_items swallows the read error and yields nothing.
+    assert!(dev_items(&src, 0x4000, &m, 4096).is_empty());
+}
+
+#[test]
+fn chunk_map_edges() {
+    use crate::chunk::{ChunkEntry, ChunkMap};
+    let mut m = ChunkMap::default();
+    // Zero-length chunk is refused by add().
+    m.add(ChunkEntry {
+        logical: 0,
+        length: 0,
+        ty: block_group::DATA,
+        stripe_len: 0,
+        sub_stripes: 0,
+        stripe_offsets: vec![0],
+        parity: false,
+    });
+    assert!(m.chunks.is_empty());
+    // Identical logical+length registered twice keeps the first.
+    m.add_chunk(0, 0x1000, 0);
+    m.add_chunk(0, 0x1000, 0x9999);
+    assert_eq!(m.chunks.len(), 1);
+    assert_eq!(m.logical_to_physical(0), Some(0));
+    // Parity chunk: untranslatable → hole.
+    m.add(ChunkEntry {
+        logical: 0x100000,
+        length: 0x4000,
+        ty: block_group::DATA | block_group::RAID5,
+        stripe_len: 0x1000,
+        sub_stripes: 0,
+        stripe_offsets: vec![0x200000, 0x300000],
+        parity: true,
+    });
+    assert_eq!(m.logical_to_physical(0x100000), None);
+    // translate_range skips the parity hole and resumes at the next chunk.
+    m.add_chunk(0x104000, 0x1000, 0x500000);
+    assert_eq!(m.translate_range(0x100000, 0x5000), vec![(0x500000, 0x1000)]);
+    // Chunk with no stripes at all → untranslatable.
+    m.add(ChunkEntry {
+        logical: 0x200000,
+        length: 0x1000,
+        ty: block_group::DATA,
+        stripe_len: 0,
+        sub_stripes: 0,
+        stripe_offsets: vec![],
+        parity: false,
+    });
+    assert_eq!(m.logical_to_physical(0x200000), None);
+    // covered_ranges reports every registered chunk.
+    assert_eq!(m.covered_ranges().len(), 4);
+}
+
+#[test]
+fn index_extent_tree_inline_shared_owner_and_merge() {
+    use crate::index::{index_extent_tree, ExtentRef};
+    // EXTENT_ITEM body carrying inline SHARED_BLOCK_REF + EXTENT_OWNER_REF
+    // then an unknown ref tag that must stop the scan.
+    let mut body = vec![0u8; 24];
+    w64(&mut body, 8, 7);
+    w64(&mut body, 16, 1);
+    body.push(ty::SHARED_BLOCK_REF);
+    body.extend_from_slice(&0x9000u64.to_le_bytes());
+    body.push(ty::EXTENT_OWNER_REF);
+    body.extend_from_slice(&5u64.to_le_bytes());
+    body.push(0xEE); // unknown inline ref → break
+    body.extend_from_slice(&[0u8; 8]);
+    let mut edr = vec![0u8; 28];
+    w64(&mut edr, 0, 5);
+    w64(&mut edr, 8, 42);
+    w32(&mut edr, 24, 1);
+    let img = leaf_src(
+        0x4000,
+        2,
+        7,
+        &[
+            (0x500000, ty::EXTENT_ITEM, 4096, body),
+            // Ref items for objectids with no EXTENT_ITEM → placeholder
+            // records via or_insert_with.
+            (0xA00000, ty::SHARED_DATA_REF, 0, {
+                let mut d = vec![0u8; 8];
+                w64(&mut d, 0, 0x9000);
+                d
+            }),
+            (0xB00000, ty::TREE_BLOCK_REF, 5, Vec::new()),
+            (0xC00000, ty::SHARED_BLOCK_REF, 0x9000, Vec::new()),
+            // A ref arriving *before* its EXTENT_ITEM → the item must
+            // merge into the placeholder via and_modify.
+            (0xD00000, ty::EXTENT_DATA_REF, 0x11, edr),
+            (0xD00000, ty::EXTENT_ITEM, 4096, {
+                let mut e = vec![0u8; 24];
+                w64(&mut e, 8, 7);
+                w64(&mut e, 16, 1);
+                e
+            }),
+        ],
+    );
+    let map = ident_map();
+    let idx = index_extent_tree(&img, &map, 4096, 1, 0x4000);
+    let rec = idx.recs.get(&0x500000).unwrap();
+    assert!(rec.refs.iter().any(|r| matches!(r, ExtentRef::SharedBlock { parent: 0x9000 })));
+    assert!(rec.refs.iter().any(|r| matches!(r, ExtentRef::Owner { root: 5 })));
+    assert_eq!(rec.refs.len(), 2, "unknown inline ref must stop the scan");
+    assert!(idx.recs[&0xA00000]
+        .refs
+        .iter()
+        .any(|r| matches!(r, ExtentRef::SharedData { parent: 0x9000 })));
+    assert!(idx.recs[&0xB00000]
+        .refs
+        .iter()
+        .any(|r| matches!(r, ExtentRef::TreeBlock { root: 5 })));
+    assert!(idx.recs[&0xC00000]
+        .refs
+        .iter()
+        .any(|r| matches!(r, ExtentRef::SharedBlock { parent: 0x9000 })));
+    let merged = &idx.recs[&0xD00000];
+    assert_eq!(merged.len, 4096); // EXTENT_ITEM merged over the placeholder
+    assert!(merged.refs.iter().any(|r| matches!(r, ExtentRef::Data { inode: 42, .. })));
+    // root_logical == 0 → empty indexes, no walk attempted.
+    assert!(index_extent_tree(&img, &map, 4096, 1, 0).recs.is_empty());
+    use crate::index::{index_free_space_tree, index_root_tree};
+    assert!(index_root_tree(&img, &map, 4096, 1, 0).roots.is_empty());
+    assert!(index_free_space_tree(&img, &map, 4096, 1, 0, 4096).0.is_empty());
+}
+
+#[test]
+fn build_path_two_node_cycle() {
+    use crate::index::{InodeRec, NameRef, TreeIndex};
+    let mut t = TreeIndex {
+        objectid: 5,
+        root_logical: 0x4000,
+        generation: 7,
+        mount_name: String::new(),
+        is_live: true,
+        readonly: false,
+        is_snapshot: false,
+        inodes: Default::default(),
+        dir_children: Default::default(),
+        orphans: Default::default(),
+        errors: Vec::new(),
+    };
+    // a → b → a: the visited set must terminate the parent walk.
+    t.inodes.insert(300, InodeRec {
+        names: vec![NameRef { parent: 301, name: "aaa".into(), phys: 0 }],
+        ..Default::default()
+    });
+    t.inodes.insert(301, InodeRec {
+        names: vec![NameRef { parent: 300, name: "bbb".into(), phys: 0 }],
+        ..Default::default()
+    });
+    let (path, _) = t.build_path(300);
+    assert!(path.contains("aaa"), "{path}");
+    // subvolume mount prefix is prepended to non-root paths.
+    t.mount_name = "vol".into();
+    let (path, _) = t.build_path(300);
+    assert!(path.starts_with("/vol/"), "{path}");
+    let (path, name) = t.build_path(256);
+    assert_eq!(name, "vol");
+    assert_eq!(path, "/vol");
+}
+
+#[test]
+fn extent_reader_latched_error_and_empty_seg() {
+    use crate::index::Extent;
+    use crate::read::ExtentReader;
+    use std::io::Read;
+    use std::sync::Arc;
+    let map = ident_map();
+    let mk = |num: u64| Extent {
+        file_offset: 0,
+        num_bytes: num,
+        ty: extent_ty::REGULAR,
+        compression: compression::NONE,
+        encryption: 0,
+        generation: 7,
+        logical: 0x4000,
+        disk_len: num,
+        extent_offset: 0,
+        ram_bytes: num,
+        inline_data: None,
+        phys_ranges: vec![(0x4000, 8), (0x8000, 8)],
+        item_phys: 0,
+    };
+    // Second range faults after partial production → Ok(8) then the
+    // latched error surfaces on the next read.
+    let src: Arc<dyn sutram_io::ByteSource> = Arc::new(GapSrc { fail_at: 0x8000 });
+    let ex = mk(16);
+    let mut r = ExtentReader::new(src, &map, vec![(ex, vec![(0x4000, 8), (0x8000, 8)])], 16);
+    let mut buf = [0u8; 16];
+    assert_eq!(r.read(&mut buf).unwrap(), 8);
+    assert_eq!(&buf[..8], &[0xAA; 8]);
+    assert!(r.read(&mut buf).is_err());
+    // A zero-length extent is skipped by the segment advance loop.
+    let src: Arc<dyn sutram_io::ByteSource> = Arc::new(vec![0u8; 0x1000]);
+    let ex = Extent { num_bytes: 0, phys_ranges: vec![], ..mk(0) };
+    let mut r = ExtentReader::new(src, &map, vec![(ex, vec![])], 4);
+    let mut buf = [0u8; 4];
+    assert_eq!(r.read(&mut buf).unwrap(), 0);
+}
+
+#[test]
+fn decompress_lzo_terminator_and_bad_subblock() {
+    use crate::decompress::decompress;
+    // in_len == 0 is the stream terminator — clean empty output.
+    let mut input = Vec::new();
+    input.extend_from_slice(&8u32.to_le_bytes());
+    input.extend_from_slice(&0u32.to_le_bytes());
+    assert!(decompress(2, &input, 64).unwrap().is_empty());
+    // A sub-block that fails lzokay and is too short for the raw-copy
+    // fallback → Corrupt, never panic.
+    let mut input = Vec::new();
+    input.extend_from_slice(&16u32.to_le_bytes());
+    input.extend_from_slice(&4u32.to_le_bytes());
+    input.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00]);
+    let r = decompress(2, &input, 4096);
+    assert!(r.is_err() || r.unwrap().len() < 4096);
+}
+
+#[test]
+fn detect_confidence_ladder() {
+    use crate::superblock::detect;
+    use sutram_fs::DetectConfidence;
+    // Garbage → None.
+    assert_eq!(detect(&vec![0u8; 0x20000]), DetectConfidence::None);
+    // Magic + plausible geometry + bad checksum → High.
+    let mut img = vec![0u8; 0x20000];
+    let s = 0x10000usize;
+    img[s + MAGIC_OFFSET..s + MAGIC_OFFSET + 8].copy_from_slice(BTRFS_MAGIC);
+    w32(&mut img, s + 0x90, 4096);
+    w32(&mut img, s + 0x94, 4096);
+    w64(&mut img, s + 0x50, 0x4000);
+    w64(&mut img, s + 0x58, 0x5000);
+    w64(&mut img, s + 0x70, 0x100_0000);
+    assert_eq!(detect(&img), DetectConfidence::High);
+    // + valid checksum → Certain.
+    let c = crc32fast::hash(&img[s + CSUM_SIZE..s + SUPERBLOCK_SIZE]);
+    img[s..s + 4].copy_from_slice(&c.to_le_bytes());
+    assert_eq!(detect(&img), DetectConfidence::Certain);
+    // Implausible geometry → Medium even with a good checksum.
+    w32(&mut img, s + 0x94, 1234);
+    let c = crc32fast::hash(&img[s + CSUM_SIZE..s + SUPERBLOCK_SIZE]);
+    img[s..s + 4].copy_from_slice(&c.to_le_bytes());
+    assert_eq!(detect(&img), DetectConfidence::Medium);
+    // Foreign csum type → unverifiable → High.
+    w32(&mut img, s + 0x94, 4096);
+    w16(&mut img, s + 0xC4, 1);
+    assert_eq!(detect(&img), DetectConfidence::High);
+}
+
+#[test]
+fn parser_name_and_clone_err_variants() {
+    use crate::fs::clone_err;
+    use sutram_fs::{FsError, FsParser};
+    assert_eq!(crate::BtrfsParser.name(), "btrfs");
+    for e in [
+        FsError::Unsupported { msg: "x".into() },
+        FsError::InvalidInput { msg: "x".into() },
+        FsError::Corrupt { offset: 1, msg: "x".into() },
+        FsError::Truncated { offset: 1, needed: 2, available: 1 },
+    ] {
+        let c = clone_err(&e);
+        assert_eq!(std::mem::discriminant(&c), std::mem::discriminant(&e));
+    }
+}

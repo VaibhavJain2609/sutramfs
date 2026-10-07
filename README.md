@@ -140,9 +140,11 @@ report formatters (`output.py`, `statistics.py`).
 
 ## Limitations
 
-- **RAID5/6/parity and RAID1C3/4** chunk profiles are recognised but
-  cannot be translated — trees/extents living only on such chunks are
-  reported as errors.
+- **RAID5/6 parity** chunk profiles are recognised but cannot be
+  translated — trees/extents living only on such chunks are reported as
+  errors. Mirrored profiles (RAID1, RAID1C3/4, DUP) read the first
+  mirror, which is correct since the copies are byte-identical;
+  **RAID0/RAID10** are translated with real stripe math.
 - **Multi-device** images: the primary device is parsed; stripes map to
   their own device offsets but only device 0's source is mounted.
 - **Compressed extents**: LZO follows the standard page-framed layout;

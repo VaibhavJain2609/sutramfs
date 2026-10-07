@@ -462,6 +462,223 @@ fn strict_mount_fails_on_dead_root_tree() {
     assert!(BtrfsParser.mount_with(src, &opts).is_err());
 }
 
+// ---------- meta / provenance expansion ----------
+
+#[test]
+fn inode_flags_and_encrypted_extent_meta() {
+    let entries = all_entries();
+    let e = find_path(&entries, "/locked.dat");
+    assert_eq!(e.meta["attributes"], "NOCOMPRESS,IMMUTABLE");
+    assert_eq!(e.meta["encrypted"], "true");
+}
+
+#[test]
+fn nested_zero_size_passwd_walked_but_skipped_by_id_map() {
+    // /root/etc/passwd exists as a live entry but has size 0, so the
+    // id-map loader must skip it (the real /etc/passwd still resolves).
+    let entries = all_entries();
+    find_path(&entries, "/root/etc/passwd");
+    find_path(&entries, "/root/etc");
+    let e = find_path(&entries, "/hello.txt");
+    assert_eq!(e.meta["user"], "admin");
+}
+
+// ---------- detection / superblock edge cases ----------
+
+#[test]
+fn detect_bad_csum_and_foreign_csum_type_are_high() {
+    // Valid magic + plausible geometry + broken CRC32C → High.
+    let mut img = common::build_image();
+    img[common::SB] ^= 0xFF;
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert_eq!(BtrfsParser.detect(src.as_ref()), DetectConfidence::High);
+    // xxhash superblock: geometry fine but unverifiable → High.
+    let mut img = common::build_image();
+    common::w16(&mut img, common::SB + 0xC4, 1);
+    let csum = crc32fast::hash(&img[common::SB + 32..common::SB + 4096]);
+    img[common::SB..common::SB + 4].copy_from_slice(&csum.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert_eq!(BtrfsParser.detect(src.as_ref()), DetectConfidence::High);
+}
+
+#[test]
+fn detect_magic_only_is_medium() {
+    // Magic present but geometry implausible → Medium (a lookalike must
+    // not reach High).
+    let mut img = vec![0u8; 0x20000];
+    img[common::SB + 0x40..common::SB + 0x48].copy_from_slice(b"_BHRfS_M");
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert_eq!(BtrfsParser.detect(src.as_ref()), DetectConfidence::Medium);
+}
+
+#[test]
+fn mount_rejects_implausible_geometry() {
+    // Valid magic + checksum but nodesize is not a power of two →
+    // mount refuses even though detect() says Medium.
+    let mut img = common::build_image();
+    common::w32(&mut img, common::SB + 0x94, 12345);
+    let csum = crc32fast::hash(&img[common::SB + 32..common::SB + 4096]);
+    img[common::SB..common::SB + 4].copy_from_slice(&csum.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert_eq!(BtrfsParser.detect(src.as_ref()), DetectConfidence::Medium);
+    assert!(BtrfsParser.mount(src).is_err());
+}
+
+// ---------- COW history / recovery edge cases ----------
+
+#[test]
+fn keyptr_generation_mismatch_flags_entries() {
+    // Rewrite the internal node's keyptr for FS leaf 2 with a stale
+    // generation — the leaf itself is intact (its csum still verifies),
+    // so items surface but are flagged gen_mismatch.
+    let mut img = common::build_image();
+    let p = common::FS_TREE as usize + 101 + 33; // second keyptr
+    common::w64(&mut img, p + 25, 99);
+    let c = crc32fast::hash(&img[common::FS_TREE as usize + 32..common::FS_TREE as usize + 4096]);
+    img[common::FS_TREE as usize..common::FS_TREE as usize + 4].copy_from_slice(&c.to_le_bytes());
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = BtrfsParser.mount(src).unwrap();
+    let items: Vec<_> = fs.walk().collect();
+    assert!(items.iter().any(|i| i.is_err()), "stale keyptr must record an error");
+    let ok: Vec<FsEntry> = items.into_iter().filter_map(|i| i.ok()).collect();
+    let e = ok.iter().find(|e| e.path == "/second.txt").expect("second.txt");
+    assert_eq!(e.meta["generation_mismatch"], "true");
+}
+
+#[test]
+fn second_backup_root_dedups_and_finds_dead_subvol() {
+    // Plant a second, older COW generation reachable via backup root[1]:
+    // a gen-4 root tree + FS tree + a subvolume that no longer exists.
+    let mut img = common::build_image();
+    const GEN4: u64 = 4;
+    const OLD_ROOT2: u64 = 0x403000;
+    const OLD_FS2: u64 = 0x421000;
+    const DEADVOL: u64 = 0x431000;
+    const D_DEAD: u64 = 0x510000;
+    let dir_mode = 0o40755u32;
+    let file_mode = 0o100644u32;
+
+    common::leaf(
+        &mut img,
+        OLD_ROOT2,
+        1,
+        GEN4,
+        &[
+            (common::OBJID_EXTENT_TREE, common::T_ROOT_ITEM, 0,
+             common::root_item(common::EXTENT_TREE, GEN4, 0, 0, false)),
+            (common::OBJID_FS_TREE, common::T_ROOT_ITEM, 0,
+             common::root_item(OLD_FS2, GEN4, 0, 0, false)),
+            (5, common::T_ROOT_REF, 300, common::root_ref(256, "deadvol")),
+            (300, common::T_ROOT_ITEM, 0,
+             common::root_item(DEADVOL, GEN4, 0, 0, false)),
+        ],
+    );
+    // gen-4 FS tree: ino 258 duplicates the gen-5 recovery (must dedup),
+    // ino 280 has a size but no EXTENT_DATA → Unrecoverable.
+    common::leaf(
+        &mut img,
+        OLD_FS2,
+        common::OBJID_FS_TREE,
+        GEN4,
+        &[
+            (256, common::T_INODE_ITEM, 0, common::inode_item(1, GEN4, 0, dir_mode, 1, 0, 0)),
+            (256, common::T_DIR_ITEM, 100, common::dir_item(258, "secret.txt", 1, &[])),
+            (256, common::T_DIR_ITEM, 101, common::dir_item(280, "noext.txt", 1, &[])),
+            (258, common::T_INODE_ITEM, 0, common::inode_item(3, GEN4, 18, file_mode, 1, 0, 0)),
+            (258, common::T_INODE_REF, 256, common::inode_ref(0, "secret.txt")),
+            (280, common::T_INODE_ITEM, 0, common::inode_item(4, GEN4, 100, file_mode, 1, 0, 0)),
+            (280, common::T_INODE_REF, 256, common::inode_ref(0, "noext.txt")),
+        ],
+    );
+    // The dead subvolume's own tree.
+    common::leaf(
+        &mut img,
+        DEADVOL,
+        300,
+        GEN4,
+        &[
+            (256, common::T_INODE_ITEM, 0, common::inode_item(1, GEN4, 0, dir_mode, 1, 0, 0)),
+            (256, common::T_DIR_ITEM, 100, common::dir_item(257, "gone.txt", 1, &[])),
+            (257, common::T_INODE_ITEM, 0, common::inode_item(2, GEN4, 6, file_mode, 1, 0, 0)),
+            (257, common::T_INODE_REF, 256, common::inode_ref(0, "gone.txt")),
+            (257, common::T_EXTENT_DATA, 0,
+             common::extent_regular(GEN4, 4096, 0, D_DEAD, 4096, 0, 6)),
+        ],
+    );
+    img[D_DEAD as usize..D_DEAD as usize + 6].copy_from_slice(b"DEAD!!");
+    // backup root[1] at 0xB2B + 168.
+    let b1 = common::SB + 0xB2B + 168;
+    common::w64(&mut img, b1, OLD_ROOT2);
+    common::w64(&mut img, b1 + 8, GEN4);
+    common::w64(&mut img, b1 + 16, common::CHUNK_TREE);
+    common::w64(&mut img, b1 + 24, GEN4);
+    common::w64(&mut img, b1 + 32, common::EXTENT_TREE);
+    common::w64(&mut img, b1 + 40, GEN4);
+    common::w64(&mut img, b1 + 48, OLD_FS2);
+    common::w64(&mut img, b1 + 56, GEN4);
+    let c = crc32fast::hash(&img[common::SB + 32..common::SB + 4096]);
+    img[common::SB..common::SB + 4].copy_from_slice(&c.to_le_bytes());
+
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = BtrfsParser.mount(src).unwrap();
+    let items: Vec<_> = fs.walk().collect::<Result<_, _>>().unwrap();
+
+    // secret.txt recovered exactly once (gen-4 duplicate deduplicated).
+    assert_eq!(
+        items.iter().filter(|e| e.path == "/secret.txt").count(),
+        1,
+        "gen-4 copy of ino 258 must not re-emit"
+    );
+    // Dead subvolume surfaced under its ref-name.
+    let gone = items.iter().find(|e| e.path == "/deadvol/gone.txt").expect("gone.txt");
+    assert!(gone.is_deleted());
+    let mut data = Vec::new();
+    fs.read_file(gone).unwrap().read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"DEAD!!");
+    // Sized inode with no EXTENT_DATA → honest Unrecoverable.
+    let nx = items.iter().find(|e| e.path == "/noext.txt").expect("noext.txt");
+    assert_eq!(
+        nx.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unrecoverable
+        }
+    );
+    assert!(nx.meta["recovery_note_0"].contains("EXTENT_DATA"));
+}
+
+#[test]
+fn missing_extent_tree_yields_unknown_recovery() {
+    // Rebuild the root tree leaf with the extent-tree root's bytenr
+    // zeroed — deleted recovery must degrade to Unknown, not guess.
+    let mut img = common::build_image();
+    common::leaf(
+        &mut img,
+        common::ROOT_TREE,
+        1,
+        common::GEN_CUR,
+        &[
+            (common::OBJID_EXTENT_TREE, common::T_ROOT_ITEM, 0,
+             common::root_item(0, common::GEN_CUR, 0, 0, false)),
+            (common::OBJID_FS_TREE, common::T_ROOT_ITEM, 0,
+             common::root_item(common::FS_TREE, common::GEN_CUR, 1, 0, false)),
+            (5, common::T_ROOT_REF, 257, common::root_ref(256, "snap1")),
+            (257, common::T_ROOT_ITEM, 0,
+             common::root_item(common::SNAP_TREE, common::GEN_CUR, 0, common::SUBVOL_RDONLY, true)),
+        ],
+    );
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = BtrfsParser.mount(src).unwrap();
+    let items: Vec<_> = fs.walk().collect::<Result<_, _>>().unwrap();
+    let e = items.iter().find(|e| e.path == "/secret.txt").expect("secret.txt");
+    assert_eq!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unknown
+        }
+    );
+    assert!(e.meta["recovery_note_0"].contains("extent tree unavailable"));
+}
+
 #[test]
 fn read_file_rejects_dir_and_bad_id() {
     let entries = all_entries();

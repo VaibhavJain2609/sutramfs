@@ -71,6 +71,7 @@ pub const D_PASSWD: u64 = 0x50b000; // /etc/passwd
 pub const D_GROUP: u64 = 0x50c000; // /etc/group
 pub const D_SHARED: u64 = 0x50d000; // deleted file whose extent is still allocated
 pub const D_WEIRD: u64 = 0x50e000; // live file, unsupported compression algo
+pub const D_LOCKED: u64 = 0x50f000; // live file, inode flags + encrypted extent
 /// A byte range with no extent item and no data — must be unallocated.
 pub const FREE_AREA: u64 = 0x600000;
 
@@ -408,6 +409,9 @@ pub fn build_image() -> Vec<u8> {
             (OBJID_FS_TREE, T_ROOT_ITEM, 0, root_item(OLD_FS_TREE, GEN_OLD, 0, 0, false)),
             (5, T_ROOT_REF, 257, root_ref(256, "snap1")),
             (257, T_ROOT_ITEM, 0, root_item(SNAP_TREE, GEN_OLD, 0, SUBVOL_RDONLY, true)),
+            // A root *newer* than the live generation — must be skipped
+            // when harvesting COW history ("not actually older").
+            (301, T_ROOT_ITEM, 0, root_item(0x435000, 9, 0, 0, false)),
         ],
     );
 
@@ -446,6 +450,8 @@ pub fn build_image() -> Vec<u8> {
             (256, T_DIR_ITEM, 107, dir_item(267, "second.txt", 1, &[])),
             (256, T_DIR_ITEM, 108, dir_item(268, "etc", 2, &[])),
             (256, T_DIR_ITEM, 109, dir_item(274, "weird.bin", 1, &[])),
+            (256, T_DIR_ITEM, 114, dir_item(275, "locked.dat", 1, &[])),
+            (256, T_DIR_ITEM, 115, dir_item(276, "root", 2, &[])),
             (256, T_DIR_INDEX, 2, dir_item(257, "hello.txt", 1, &[])),
             // hello.txt — live file
             (257, T_INODE_ITEM, 0, inode_item(2, GEN_CUR, 12, file_mode, 1, 1000, 1000)),
@@ -459,6 +465,29 @@ pub fn build_image() -> Vec<u8> {
             (261, T_INODE_ITEM, 0, inode_item(4, GEN_CUR, 22, file_mode, 1, 0, 0)),
             (261, T_INODE_REF, 256, inode_ref(0, "newfile.bin")),
             (261, T_EXTENT_DATA, 0, extent_regular(GEN_CUR, 4096, 0, D_NEWFILE, 4096, 0, 22)),
+            // locked.dat — inode flags (NOCOMPRESS|IMMUTABLE) + an
+            // extent flagged encrypted → meta["attributes"]/["encrypted"].
+            (275, T_INODE_ITEM, 0, {
+                let mut i = inode_item(15, GEN_CUR, 10, file_mode, 1, 0, 0);
+                w64(&mut i, 64, (1 << 3) | (1 << 6)); // NOCOMPRESS|IMMUTABLE
+                i
+            }),
+            (275, T_INODE_REF, 256, inode_ref(0, "locked.dat")),
+            (275, T_EXTENT_DATA, 0, {
+                let mut e = extent_regular(GEN_CUR, 4096, 0, D_LOCKED, 4096, 0, 10);
+                e[17] = 1; // encryption flag
+                e
+            }),
+            // /root/etc/passwd — size 0 so load_id_maps skips it (the
+            // real passwd under /etc is what resolves names).
+            (276, T_INODE_ITEM, 0, inode_item(16, GEN_CUR, 0, dir_mode, 1, 0, 0)),
+            (276, T_INODE_REF, 256, inode_ref(0, "root")),
+            (276, T_DIR_ITEM, 200, dir_item(277, "etc", 2, &[])),
+            (277, T_INODE_ITEM, 0, inode_item(17, GEN_CUR, 0, dir_mode, 1, 0, 0)),
+            (277, T_INODE_REF, 276, inode_ref(0, "etc")),
+            (277, T_DIR_ITEM, 200, dir_item(278, "passwd", 1, &[])),
+            (278, T_INODE_ITEM, 0, inode_item(18, GEN_CUR, 0, file_mode, 1, 0, 0)),
+            (278, T_INODE_REF, 277, inode_ref(0, "passwd")),
         ],
     );
 
@@ -614,6 +643,8 @@ pub fn build_image() -> Vec<u8> {
             (D_SHARED, T_EXTENT_DATA_REF, 0xbcde, extent_data_ref(OBJID_FS_TREE, 999, 0)),
             (D_WEIRD, T_EXTENT_ITEM, 4096, extent_item(GEN_CUR, data_flags)),
             (D_WEIRD, T_EXTENT_DATA_REF, 0xcdef, extent_data_ref(OBJID_FS_TREE, 274, 0)),
+            (D_LOCKED, T_EXTENT_ITEM, 4096, extent_item(GEN_CUR, data_flags)),
+            (D_LOCKED, T_EXTENT_DATA_REF, 0xd0a7, extent_data_ref(OBJID_FS_TREE, 275, 0)),
         ],
     );
 
@@ -638,6 +669,7 @@ pub fn build_image() -> Vec<u8> {
     put(&mut img, D_GROUP, b"root:x:0:\nadmin:x:1000:\n");
     put(&mut img, D_SHARED, b"SHARED-DATA-!");
     put(&mut img, D_WEIRD, b"\xFA\xFBweird-compressed-blob-not-really");
+    put(&mut img, D_LOCKED, b"LOCKED-DAT");
 
     img
 }

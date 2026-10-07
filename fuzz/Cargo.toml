@@ -11,6 +11,12 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[[bin]]
+name = "parse_image"
+path = "fuzz_targets/parse_image.rs"
+test = false
+doc = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 sutram-btrfs = { path = ".." }

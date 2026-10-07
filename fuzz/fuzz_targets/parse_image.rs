@@ -8,6 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use std::io::Read;
 use sutram_fs::FsParser;
 use sutram_io::ByteSource;
 
@@ -23,9 +24,9 @@ fuzz_target!(|data: &[u8]| {
         let _ = fs.unallocated_ranges();
         for item in fs.walk().take(MAX_ENTRIES) {
             if let Ok(e) = item {
-                if let Ok(mut r) = fs.read_file(&e) {
+                if let Ok(r) = fs.read_file(&e) {
                     let mut sink = Vec::new();
-                    let _ = std::io::Read::take(&mut r, MAX_READ).read_to_end(&mut sink);
+                    let _ = r.take(MAX_READ).read_to_end(&mut sink);
                 }
             }
         }

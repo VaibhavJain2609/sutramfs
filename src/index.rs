@@ -864,8 +864,8 @@ pub fn index_free_space_tree(
                         for b in 0..8 {
                             if byte & (1 << b) != 0 {
                                 let bit = i * 8 + b;
-                                let off = e.offset + bit as u64 * sectorsize;
-                                if off < e.offset + e.length {
+                                let off = e.offset.saturating_add(bit as u64 * sectorsize);
+                                if off < e.offset.saturating_add(e.length) {
                                     free.push((off, sectorsize));
                                 }
                             }
