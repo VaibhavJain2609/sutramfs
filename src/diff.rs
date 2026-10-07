@@ -19,11 +19,11 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use sutram_analyze::Sha256;
 use sutram_fs::{EntryKind, FileSystem, FsEntry, FsEntryStatus};
 
 use crate::json::Json;
 use crate::report::{kind_label, recovery_label};
-use crate::sha256::{to_hex, Sha256};
 
 /// Knobs for [`diff`].
 #[derive(Debug, Clone)]
@@ -253,7 +253,7 @@ fn content_hash(fs: &dyn FileSystem, e: &FsEntry, max: u64) -> Option<String> {
             Err(_) => return None,
         }
     }
-    Some(to_hex(&h.finish()))
+    Some(h.finalize_hex())
 }
 
 /// Field-by-field comparison of two same-status entries → change strings.

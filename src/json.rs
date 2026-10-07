@@ -34,13 +34,6 @@ impl Json {
         v.map(f).unwrap_or(Json::Null)
     }
 
-    /// Serialize compactly.
-    pub fn to_string(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out);
-        out
-    }
-
     /// Serialize with 2-space indentation.
     pub fn to_string_pretty(&self) -> String {
         let mut out = String::new();
@@ -123,6 +116,16 @@ impl Json {
             }
             _ => self.write(out),
         }
+    }
+}
+
+/// Compact serialization — `j.to_string()` emits the same bytes the old
+/// inherent method did.
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = String::new();
+        self.write(&mut out);
+        f.write_str(&out)
     }
 }
 

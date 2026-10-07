@@ -6,11 +6,12 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Forensic report generator and image differ for SUTRAM-FS filesystems"
 keywords = ["forensics", "filesystem", "report", "diff", "dfir"]
-categories = ["filesystem"]
+categories = ["filesystem", "parsing"]
 
 [dependencies]
-sutram-io = { path = "../sutram-io", version = "0.1" }
-sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-io      = { path = "../sutram-io",      version = "0.1" }
+sutram-fs      = { path = "../sutram-fs",      version = "0.1" }
+sutram-analyze = { path = "../sutram-analyze", version = "0.1" }
 
 [dev-dependencies]
 sutram-fat = { path = "../sutram-fat", version = "0.1" }

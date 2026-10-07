@@ -6,11 +6,10 @@
 use std::io::Read;
 use std::time::SystemTime;
 
+use sutram_analyze::Sha256;
 use sutram_fs::{
     EntryKind, FileSystem, FsEntry, FsEntryStatus, FsInfo, RecoveryState, Severity,
 };
-
-use crate::sha256::{to_hex, Sha256};
 
 /// Meta keys whose *value* makes an entry anomalous: `(key, trigger,
 /// human-readable reason)`.
@@ -337,7 +336,7 @@ fn hash_entry(fs: &dyn FileSystem, e: &FsEntry, max_bytes: u64) -> (Option<Strin
             Err(_) => return (None, hashed),
         }
     }
-    (Some(to_hex(&h.finish())), hashed)
+    (Some(h.finalize_hex()), hashed)
 }
 
 /// Is `e` an orphan artefact? Convention: `/$ORPHANED/`/`/$LOST/` paths or

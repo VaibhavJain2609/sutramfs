@@ -140,3 +140,143 @@ pub fn image_b() -> Vec<u8> {
     img[clus_off(7)..clus_off(7) + 10].copy_from_slice(b"new file!!");
     img
 }
+
+// ---------------------------------------------------------------------------
+// In-memory stub FileSystem — reaches report/diff branches no synthetic FAT
+// image can produce (every RecoveryState, suspicious meta keys, walk errors,
+// mid-read failures, symlink/other kinds, fabricated magic verdicts).
+// ---------------------------------------------------------------------------
+
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Cursor, Read};
+use std::sync::Arc;
+
+use sutram_fs::{
+    EntryKind, FileSystem, FsEntry, FsEntryStatus, FsError, FsInfo, Result, Timestamps,
+};
+
+/// One walk item: an entry or a corruption record.
+pub enum StubItem {
+    /// Yielded as `Ok(entry)` (boxed — `FsEntry` is large).
+    Entry(Box<FsEntry>),
+    /// Yielded as `Err(FsError::Corrupt)` carrying this message.
+    Error(String),
+}
+
+/// What `read_file` serves for one `entry_id`.
+pub enum StubData {
+    /// Clean bytes.
+    Bytes(Vec<u8>),
+    /// Yields `good` bytes then fails — mid-stream read error.
+    Flaky {
+        /// Bytes delivered successfully before the error.
+        good: usize,
+    },
+}
+
+/// Minimal in-memory [`FileSystem`].
+pub struct StubFs {
+    /// Walk items, in order.
+    pub items: Vec<StubItem>,
+    /// `entry_id` → readable data. Absent + not in `fail_ids` → `NotFound`.
+    pub data: HashMap<u64, StubData>,
+    /// `entry_id`s whose `read_file` must error at open.
+    pub fail_ids: HashSet<u64>,
+    /// `info()` result.
+    pub info: FsInfo,
+    /// `source()` backing (only its length matters).
+    pub src: Arc<Vec<u8>>,
+}
+
+impl StubFs {
+    /// Empty stub with a 4 KiB source and a "stub" fs_type.
+    pub fn new() -> Self {
+        StubFs {
+            items: Vec::new(),
+            data: HashMap::new(),
+            fail_ids: HashSet::new(),
+            info: FsInfo {
+                fs_type: "stub".into(),
+                label: Some("STUBVOL".into()),
+                uuid: Some("deadbeef".into()),
+                block_size: 512,
+                total_blocks: 8,
+                free_blocks: Some(4),
+                total_nodes: Some(16),
+                meta: HashMap::from([("stub_key".into(), "stub_val".into())]),
+            },
+            src: Arc::new(vec![0u8; 4096]),
+        }
+    }
+
+    /// Convenience: append an entry to the walk.
+    pub fn push(&mut self, e: FsEntry) {
+        self.items.push(StubItem::Entry(Box::new(e)));
+    }
+}
+
+/// A reader that yields `good` zeroed bytes, then an I/O error.
+struct FlakyReader {
+    left: usize,
+}
+
+impl Read for FlakyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 {
+            return Err(io::Error::other("flaky read"));
+        }
+        let n = self.left.min(buf.len());
+        for b in &mut buf[..n] {
+            *b = 0xAB;
+        }
+        self.left -= n;
+        Ok(n)
+    }
+}
+
+impl FileSystem for StubFs {
+    fn info(&self) -> FsInfo {
+        self.info.clone()
+    }
+    fn source(&self) -> Arc<dyn sutram_fs::ByteSource> {
+        self.src.clone()
+    }
+    fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        Box::new(self.items.iter().map(|it| match it {
+            StubItem::Entry(e) => Ok((**e).clone()),
+            StubItem::Error(m) => Err(FsError::corrupt(0, m.clone())),
+        }))
+    }
+    fn read_file(&self, entry: &FsEntry) -> Result<Box<dyn Read + Send>> {
+        if self.fail_ids.contains(&entry.entry_id) {
+            return Err(FsError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read_file denied",
+            )));
+        }
+        match self.data.get(&entry.entry_id) {
+            Some(StubData::Bytes(d)) => Ok(Box::new(Cursor::new(d.clone()))),
+            Some(StubData::Flaky { good }) => Ok(Box::new(FlakyReader { left: *good })),
+            None => Err(FsError::NotFound {
+                path: entry.path.clone(),
+            }),
+        }
+    }
+}
+
+/// Bare-bones live entry: `path`, `kind`, `size`; everything else default.
+pub fn stub_entry(id: u64, path: &str, kind: EntryKind, size: u64) -> FsEntry {
+    FsEntry {
+        path: path.into(),
+        name: path.rsplit('/').next().unwrap_or(path).into(),
+        entry_id: id,
+        kind,
+        size,
+        disk_offset: id * 32,
+        allocated_ranges: vec![],
+        timestamps: Timestamps::default(),
+        status: FsEntryStatus::Live,
+        meta: HashMap::new(),
+        magic: None,
+    }
+}

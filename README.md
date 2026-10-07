@@ -6,9 +6,10 @@ APFS, whatever `detect` found — and it walks the volume once, producing a
 structured `Report` renderable as JSON, Markdown, or self-contained HTML.
 `diff` compares two mounted images path-by-path.
 
-Zero external dependencies beyond `sutram-io`/`sutram-fs` (SHA-256 is a
-`pub(crate)` inline implementation — the planned `sutram-analyze` hash API
-doesn't exist yet; swapping it in will be invisible downstream).
+No third-party dependencies: only the SUTRAM-FS family crates
+(`sutram-io`/`sutram-fs`, plus `sutram-analyze` whose pure-Rust `Sha256`
+provides the content hashing — reports/diffs hash real bytes with no
+`*-sys` or digest-crate dependency).
 
 ## What a report contains
 
@@ -65,8 +66,9 @@ only surviving extents, so `recovered_bytes`/`total_bytes` and the
 
 ## Known limitations
 
-- Hashing uses the inline `pub(crate)` SHA-256 until `sutram-analyze`
-  exists; `hash_max_bytes` (default 64 MiB) caps per-file reads.
+- Only SHA-256 is emitted (`sutram-analyze` also ships SHA-1/MD5 hashers
+  for callers that need them); `hash_max_bytes` (default 64 MiB) caps
+  per-file reads.
 - `generate`/`diff` buffer the walk into memory — bounded by
   `max_entries` (default 1M); hitting the cap is an anomaly/truncation
   flag, not a panic.
