@@ -592,6 +592,158 @@ fn mount_rejects_corrupt_bpb() {
 }
 
 #[test]
+fn parser_metadata_and_source() {
+    assert_eq!(ExFatParser.name(), "exfat");
+    let fs = mount();
+    // source() hands back the mounted byte source unchanged.
+    assert_eq!(fs.source().len(), image().len());
+}
+
+#[test]
+fn read_file_rejects_directories() {
+    let entries = all_entries();
+    let dir = find(&entries, "DIR1");
+    assert!(matches!(
+        mount().read_file(dir),
+        Err(sutram_fs::FsError::InvalidInput { .. })
+    ));
+    let root = find(&entries, "/");
+    assert!(matches!(
+        mount().read_file(root),
+        Err(sutram_fs::FsError::InvalidInput { .. })
+    ));
+}
+
+/// ByteSource that fails reads overlapping one byte range — simulates a
+/// failing region of media mid-walk.
+struct FailAt {
+    inner: Arc<dyn ByteSource>,
+    off: u64,
+    len: u64,
+}
+
+impl ByteSource for FailAt {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if offset < self.off + self.len && offset + buf.len() as u64 > self.off {
+            return Err(std::io::Error::other("injected media error"));
+        }
+        self.inner.read_at(offset, buf)
+    }
+}
+
+/// Byte offset of the FAT entry for cluster `c`.
+fn fat_off(c: u32) -> u64 {
+    (common::FAT_SECTOR * common::BPS) as u64 + c as u64 * 4
+}
+
+#[test]
+fn walk_error_lenient_continues() {
+    // Break the FAT read for cluster 20: BIGDIR's chain (20→21→33) cannot
+    // be read, so activating the directory must yield an Err *item* in
+    // lenient mode — and the walk must carry on.
+    let src: Arc<dyn ByteSource> = Arc::new(FailAt {
+        inner: image(),
+        off: fat_off(20),
+        len: 4,
+    });
+    let fs = ExFatParser.mount(src).expect("lenient mount");
+    let items: Vec<_> = fs.walk().collect();
+    assert!(
+        items.iter().any(|i| i.is_err()),
+        "expected an Err item for the unreadable directory"
+    );
+    assert!(
+        items.iter().any(|i| matches!(i, Ok(e) if e.name == "HELLO.TXT")),
+        "walk should still deliver live entries"
+    );
+    // The orphan pass also fails to follow the broken chain (Err item)
+    // but still finds cluster 21's surviving tail as an orphan.
+    assert!(items.iter().any(|i| matches!(
+        i,
+        Ok(e) if e.path.starts_with("/$ORPHANED/")
+    )));
+}
+
+#[test]
+fn walk_error_strict_is_terminal() {
+    let src: Arc<dyn ByteSource> = Arc::new(FailAt {
+        inner: image(),
+        off: fat_off(20),
+        len: 4,
+    });
+    let fs = ExFatParser
+        .mount_with(src, &MountOptions::strict())
+        .expect("strict mount (boot checksums intact)");
+    let items: Vec<_> = fs.walk().collect();
+    let first_err = items.iter().position(|i| i.is_err());
+    // Exactly one Err, and it is the last thing the stream produces.
+    assert_eq!(
+        first_err,
+        Some(items.len() - 1),
+        "strict walk must terminate at the first error"
+    );
+    // Live entries scanned before the failure were still delivered.
+    assert!(items.iter().any(|i| matches!(i, Ok(e) if e.name == "HELLO.TXT")));
+}
+
+#[test]
+fn truncated_dir_chain_walks_partial() {
+    // Cut the image 256 B into root's third cluster (32): the directory
+    // read emits the present extent then stops — no panic, partial walk.
+    let mut img = common::build_exfat();
+    img.truncate(common::clus_off(32) + 256);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(entries.iter().any(|e| e.name == "HELLO.TXT"));
+    // Slots in the unread tail (e.g. ATTRFLG.BIN at slot 41) are gone.
+    assert!(!entries.iter().any(|e| e.name == "ATTRFLG.BIN"));
+}
+
+#[test]
+fn short_bitmap_falls_back_to_fat() {
+    // A bitmap that covers only the first ~40 clusters: allocation queries
+    // beyond it fall back to the FAT-nonzero heuristic (documented).
+    let mut img = common::build_exfat();
+    let off = common::doff(&common::ROOT_CLUSTERS, 1);
+    img[off + 24..off + 32].copy_from_slice(&5u64.to_le_bytes()); // 5 bytes
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    // Clusters 18/19 are bitmap-covered and allocated → orphan found.
+    assert!(entries.iter().any(|e| e.name == "chain_18"));
+    // Cluster 44 is beyond the bitmap: FAT[44]=0xFFFFFFF7 → allocated →
+    // the unlinked orphan is still surfaced via the FAT fallback.
+    assert!(entries.iter().any(|e| e.name == "chain_44"));
+    // Free-space enumeration still works for the covered prefix.
+    assert!(!fs.unallocated_ranges().is_empty());
+}
+
+#[test]
+fn stray_name_unusable_falls_back_to_noname() {
+    // A stray secondary run whose name units are all '/' — sanitised to
+    // empty, so the NONAME_<offset> fallback must kick in.
+    let mut img = common::build_exfat();
+    let bd = &common::BIGDIR_CLUSTERS;
+    common::stray_stream_only(&mut img, bd, 37, 37, 64, 512);
+    let noff = common::doff(bd, 38);
+    img[noff] = 0x41;
+    img[noff + 2..noff + 32].fill(0x2F); // 15 UTF-16 '/' units
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = ExFatParser.mount(src).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    let noname: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name.starts_with("NONAME_") && e.path.starts_with("/BIGDIR/"))
+        .collect();
+    // The '/'-name stray plus the original no-name stray.
+    assert_eq!(noname.len(), 2, "{noname:?}");
+}
+
+#[test]
 fn mount_truncated_image() {
     // Image cut before the cluster heap → truncated, not a panic.
     let img = common::build_exfat()[..common::HEAP_SECTOR * common::BPS - 1].to_vec();
@@ -600,6 +752,15 @@ fn mount_truncated_image() {
     // Tiny image → truncated boot read.
     let src: Arc<dyn ByteSource> = Arc::new(vec![0u8; 100]);
     assert!(ExFatParser.mount(src).is_err());
+    // BPB claims 4096-byte sectors but the image ends at 600 B → the
+    // full-sector re-read is reported Truncated, not a panic.
+    let mut img = common::build_exfat()[..600].to_vec();
+    img[0x6C] = 12;
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    assert!(matches!(
+        ExFatParser.mount(src),
+        Err(sutram_fs::FsError::Truncated { .. })
+    ));
 }
 
 #[test]

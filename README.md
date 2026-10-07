@@ -106,6 +106,14 @@ weaker. `read_file` on a deleted entry returns only surviving extents.
 - `read_file` returns surviving extents concatenated — for a
   partially-overwritten file the byte *positions* of lost holes are not
   re-padded (cluster-granular recovery, same as `sutram-fat`).
+- `slack_offset`/`slack_len` are computed for *live* files only — a
+  deleted entry's surviving extents are already its recovery story.
+- Orphan chain pseudo-entries are `EntryKind::Other`, so they carry no
+  `magic` verdict; carve their bytes via `read_file` or
+  `unallocated_ranges()` + `carve_region`.
+- Strict mode makes a *main* boot-region checksum mismatch fatal at
+  mount; a bad backup-region checksum is reported
+  (`meta["backup_checksum_ok"]`) but never fatal.
 - Volume GUID (`0xA0`), vendor and padding entries are parsed past but
   not emitted.
 

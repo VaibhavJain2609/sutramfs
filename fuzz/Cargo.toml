@@ -19,3 +19,9 @@ sutram-fs = { path = "../../sutram-fs" }
 
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "parse_image"
+path = "fuzz_targets/parse_image.rs"
+test = false
+doc = false

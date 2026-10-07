@@ -81,9 +81,13 @@ fn w64(img: &mut [u8], off: usize, v: u64) {
     img[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 /// Test-facing writers (the bare helpers stay private to this module).
+/// Only some test binaries use them — `dead_code` is allowed so an unused
+/// helper never fails `-D warnings` in a binary that doesn't need it.
+#[allow(dead_code)]
 pub fn w32_pub(img: &mut [u8], off: usize, v: u32) {
     w32(img, off, v)
 }
+#[allow(dead_code)]
 pub fn w64_pub(img: &mut [u8], off: usize, v: u64) {
     w64(img, off, v)
 }
