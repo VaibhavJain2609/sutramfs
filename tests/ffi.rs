@@ -12,13 +12,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sutram_capi::ffi::*;
 
 fn image_path() -> PathBuf {
+    image_path_of(common::build())
+}
+
+fn image_path_of(bytes: Vec<u8>) -> PathBuf {
     // Unique file per call: tests run in parallel and each rewrites the
     // image — a shared path would be read mid-write by another test.
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!("sutram-capi-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("fat32-{}.img", N.fetch_add(1, Ordering::SeqCst)));
-    std::fs::write(&p, common::build()).unwrap();
+    std::fs::write(&p, bytes).unwrap();
     p
 }
 
@@ -185,5 +189,173 @@ fn null_safety() {
         .is_null());
         sutram_free_bytes(std::ptr::null_mut(), 0);
         sutram_free_string(std::ptr::null_mut());
+    }
+}
+
+fn last_err() -> String {
+    unsafe {
+        let e = sutram_last_error();
+        if e.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(e).to_string_lossy().into_owned()
+        }
+    }
+}
+
+#[test]
+fn open_image_ex_fs_name_and_partition() {
+    unsafe {
+        // Forced parser name on a bare FS image.
+        let img = c(image_path().to_str().unwrap());
+        let name = c("fat");
+        let fs = sutram_open_image_ex(img.as_ptr(), name.as_ptr(), -1);
+        assert!(!fs.is_null(), "{}", last_err());
+        assert_eq!(CStr::from_ptr(sutram_fs_type(fs)).to_str().unwrap(), "fat");
+        sutram_close(fs);
+
+        // Unknown parser name → NULL + error.
+        let bad = c("no-such-fs");
+        assert!(sutram_open_image_ex(img.as_ptr(), bad.as_ptr(), -1).is_null());
+        assert!(last_err().contains("unknown fs type"), "{}", last_err());
+
+        // MBR disk: partition 0 mounts the FAT inside it.
+        let disk = c(image_path_of(common::build_mbr()).to_str().unwrap());
+        let fs = sutram_open_image_ex(disk.as_ptr(), std::ptr::null(), 0);
+        assert!(!fs.is_null(), "{}", last_err());
+        assert_eq!(CStr::from_ptr(sutram_fs_type(fs)).to_str().unwrap(), "fat");
+        let p = c("/HELLO.TXT");
+        let mut len = 0u64;
+        let buf = sutram_read_file(fs, p.as_ptr(), 1 << 20, &mut len);
+        assert!(!buf.is_null(), "{}", last_err());
+        assert_eq!(std::slice::from_raw_parts(buf, len as usize), b"hello world!");
+        sutram_free_bytes(buf, len);
+        sutram_close(fs);
+
+        // Partition index out of range → NULL + error.
+        assert!(sutram_open_image_ex(disk.as_ptr(), std::ptr::null(), 9).is_null());
+        assert!(last_err().contains("no partition"), "{}", last_err());
+    }
+}
+
+#[test]
+fn open_unrecognised_image_errors() {
+    unsafe {
+        // Garbage content: every parser detects None → open fails.
+        let img = c(image_path_of(vec![0xABu8; 8192]).to_str().unwrap());
+        assert!(sutram_open_image(img.as_ptr()).is_null());
+        assert!(
+            last_err().contains("no parser recognised"),
+            "{}",
+            last_err()
+        );
+        // Detect still returns a JSON report (filesystem: null).
+        let json = take_string(sutram_detect(img.as_ptr()));
+        assert!(json.contains("\"filesystem\":null"), "{json}");
+    }
+}
+
+#[test]
+fn read_file_bounds_and_errors() {
+    unsafe {
+        let img = c(image_path().to_str().unwrap());
+        let fs = sutram_open_image(img.as_ptr());
+        assert!(!fs.is_null(), "{}", last_err());
+
+        // max_bytes truncation: 5 of 12 bytes.
+        let p = c("/HELLO.TXT");
+        let mut len = 0u64;
+        let buf = sutram_read_file(fs, p.as_ptr(), 5, &mut len);
+        assert!(!buf.is_null(), "{}", last_err());
+        assert_eq!(len, 5);
+        assert_eq!(std::slice::from_raw_parts(buf, len as usize), b"hello");
+        sutram_free_bytes(buf, len);
+
+        // Directory path → error, not a crash.
+        let d = c("/SUBDIR");
+        assert!(sutram_read_file(fs, d.as_ptr(), 1 << 20, &mut len).is_null());
+        assert!(!sutram_last_error().is_null());
+
+        // NULL out_len / NULL path with a live handle → error, no UB.
+        assert!(sutram_read_file(fs, p.as_ptr(), 10, std::ptr::null_mut()).is_null());
+        assert!(sutram_read_file(fs, std::ptr::null(), 10, &mut len).is_null());
+
+        // Deleted-but-intact file: recoverable bytes come back.
+        let old = c("/_LD.TXT");
+        let buf = sutram_read_file(fs, old.as_ptr(), 1 << 20, &mut len);
+        assert!(!buf.is_null(), "{}", last_err());
+        assert_eq!(std::slice::from_raw_parts(buf, len as usize), b"0123456789");
+        sutram_free_bytes(buf, len);
+
+        sutram_close(fs);
+    }
+}
+
+#[test]
+fn list_entries_null_cb_and_error_items() {
+    unsafe {
+        let img = c(image_path().to_str().unwrap());
+        let fs = sutram_open_image(img.as_ptr());
+        assert!(!fs.is_null(), "{}", last_err());
+        // Valid handle + NULL callback → -1.
+        assert_eq!(
+            sutram_list_entries(fs, None, std::ptr::null_mut()),
+            -1
+        );
+        assert!(!sutram_last_error().is_null());
+        sutram_close(fs);
+
+        // Image truncated inside the FAT: lenient walk delivers
+        // {"error":…} items through the callback instead of failing.
+        let bad = c(image_path_of(common::build_fat_cut()).to_str().unwrap());
+        let fs = sutram_open_image(bad.as_ptr());
+        assert!(!fs.is_null(), "{}", last_err());
+        SAW_ERROR.store(0, Ordering::SeqCst);
+        let n = sutram_list_entries(fs, Some(error_cb), std::ptr::null_mut());
+        assert!(n >= 1);
+        assert!(
+            SAW_ERROR.load(Ordering::SeqCst) >= 1,
+            "expected ≥1 error item from the truncated image"
+        );
+        // Same via the buffered API.
+        let jsonl = take_string(sutram_list_jsonl(fs, 1_000_000, 1 << 20));
+        assert!(jsonl.contains("{\"error\":"), "{jsonl}");
+        sutram_close(fs);
+    }
+}
+
+static SAW_ERROR: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn error_cb(_user: *mut c_void, json: *const c_char) {
+    let s = CStr::from_ptr(json).to_str().unwrap();
+    if s.contains("\"error\"") {
+        SAW_ERROR.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn last_error_cleared_on_success() {
+    unsafe {
+        // Fail, observe the message, then succeed and see it cleared.
+        assert!(sutram_detect(std::ptr::null()).is_null());
+        assert!(!sutram_last_error().is_null());
+        let img = c(image_path().to_str().unwrap());
+        let json = sutram_detect(img.as_ptr());
+        assert!(!json.is_null());
+        assert!(sutram_last_error().is_null(), "{}", last_err());
+        sutram_free_string(json);
+    }
+}
+
+#[test]
+fn list_jsonl_byte_truncation() {
+    unsafe {
+        let img = c(image_path().to_str().unwrap());
+        let fs = sutram_open_image(img.as_ptr());
+        assert!(!fs.is_null(), "{}", last_err());
+        // max_bytes=1: at most one line is buffered before the cap hits.
+        let s = take_string(sutram_list_jsonl(fs, 1_000_000, 1));
+        assert!(s.is_empty() || s.lines().count() == 1, "{s}");
+        sutram_close(fs);
     }
 }

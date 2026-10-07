@@ -38,7 +38,7 @@ pub fn detect_all(src: &dyn ByteSource) -> Vec<(&'static str, DetectConfidence)>
         .iter()
         .map(|p| (p.name(), p.detect(src)))
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
     v
 }
 
@@ -118,12 +118,10 @@ pub fn for_each_entry(
 pub fn read_file_by_path(m: &Mounted, path: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
     let want = path.trim_start_matches('/');
     let mut found: Option<FsEntry> = None;
-    for item in m.fs.walk() {
-        if let Ok(e) = item {
-            if e.path.trim_start_matches('/') == want {
-                found = Some(e);
-                break;
-            }
+    for e in m.fs.walk().flatten() {
+        if e.path.trim_start_matches('/') == want {
+            found = Some(e);
+            break;
         }
     }
     let entry = found.ok_or_else(|| format!("no such entry: {path}"))?;

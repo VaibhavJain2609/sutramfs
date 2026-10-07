@@ -39,6 +39,9 @@ fn set_fat(img: &mut [u8], cluster: u32, val: u32) {
     w32(img, FAT1_OFF + off, val);
 }
 
+// Each dirent field maps to a distinct argument — the byte-level layout
+// is clearer than a params struct for this small builder.
+#[allow(clippy::too_many_arguments)]
 fn dirent(img: &mut [u8], table_off: usize, slot: usize, name: &[u8; 11], attr: u8, cluster: u32, size: u32, deleted: bool) {
     let o = table_off + slot * 32;
     img[o..o + 11].copy_from_slice(name);
@@ -110,4 +113,33 @@ pub fn build() -> Vec<u8> {
     dirent(&mut img, sub, 2, b"INNER   TXT", ATTR_ARCHIVE, 6, 4, false);
 
     img
+}
+
+/// Wrap [`build`] in a one-partition MBR disk: sector 0 holds a single
+/// FAT32-LBA entry (type 0x0C) covering the filesystem at LBA 1.
+/// Exercises `sutram_open_image_ex`'s `partition` path.
+pub fn build_mbr() -> Vec<u8> {
+    let fs = build();
+    let mut img = vec![0u8; BPS + fs.len()];
+    // MBR partition entry 0 at 0x1BE: status, CHS first, type, CHS last,
+    // LBA start, sector count.
+    let e = 0x1BE;
+    img[e] = 0x80; // bootable
+    img[e + 4] = 0x0C; // FAT32 (LBA)
+    w32(&mut img, e + 8, 1); // starts at LBA 1
+    w32(&mut img, e + 12, (fs.len() / BPS) as u32);
+    img[0x1FE] = 0x55;
+    img[0x1FF] = 0xAA;
+    img[BPS..].copy_from_slice(&fs);
+    img
+}
+
+/// The same image truncated at 280 000 bytes — inside FAT#0 but before
+/// the data region. Declared geometry still claims ~66 000 clusters, so
+/// the walk's orphan scan hits `fat_entry` reads past EOF (the parser's
+/// short-read → `FsError::Truncated` path) while mount stays lenient.
+/// A lenient walk must surface those as `Err` items, not panic or abort.
+pub fn build_fat_cut() -> Vec<u8> {
+    let img = build();
+    img[..280_000].to_vec()
 }

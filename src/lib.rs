@@ -16,5 +16,8 @@ pub mod core;
 pub mod ffi;
 pub mod json;
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(feature = "python")]
 mod python;

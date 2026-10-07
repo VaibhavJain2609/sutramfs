@@ -96,6 +96,10 @@ fn ffi<T>(f: impl FnOnce() -> Result<T, String>, or: T) -> T {
 // ---------------------------------------------------------------------------
 
 /// Crate version string — borrowed, do not free.
+///
+/// # Safety
+/// Takes no pointers and returns a `'static` C string; always safe to
+/// call. `unsafe` only keeps the exported signature uniform.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
@@ -103,6 +107,11 @@ pub unsafe extern "C" fn sutram_version() -> *const c_char {
 
 /// Last error message on this thread — borrowed, do not free.
 /// NULL when the previous call succeeded.
+///
+/// # Safety
+/// Takes no pointers; the returned pointer (if non-NULL) is borrowed and
+/// valid until the next `sutram_*` call on the same thread. The caller
+/// must not free it.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
@@ -121,6 +130,11 @@ pub unsafe extern "C" fn sutram_last_error() -> *const c_char {
 
 /// Detect the filesystem on `path`; returns a JSON string (free with
 /// `sutram_free_string`) or NULL on error.
+///
+/// # Safety
+/// `path` must be NULL or a valid NUL-terminated C string. The returned
+/// string (if non-NULL) transfers ownership to the caller — free it with
+/// `sutram_free_string`, never `free(3)`.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_detect(path: *const c_char) -> *mut c_char {
     ffi(
@@ -136,6 +150,11 @@ pub unsafe extern "C" fn sutram_detect(path: *const c_char) -> *mut c_char {
 
 /// Open and mount `path` with the best-detected parser.
 /// Returns a handle or NULL (see `sutram_last_error`).
+///
+/// # Safety
+/// `path` must be NULL or a valid NUL-terminated C string. The returned
+/// handle (if non-NULL) is owned by the caller — release it with
+/// `sutram_close` exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_open_image(path: *const c_char) -> *mut SutramFs {
     // SAFETY: same contract as sutram_open_image_ex — `path` must be a
@@ -146,6 +165,11 @@ pub unsafe extern "C" fn sutram_open_image(path: *const c_char) -> *mut SutramFs
 /// Open `path` with explicit options: `fs_name` = parser short name or
 /// NULL for auto-detect; `partition` = 0-based partition index or -1 for
 /// the whole image. Returns a handle or NULL.
+///
+/// # Safety
+/// `path` and `fs_name` must each be NULL or a valid NUL-terminated C
+/// string. The returned handle (if non-NULL) is owned by the caller —
+/// release it with `sutram_close` exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_open_image_ex(
     path: *const c_char,
@@ -174,6 +198,11 @@ pub unsafe extern "C" fn sutram_open_image_ex(
 }
 
 /// Free a handle from `sutram_open_image*`; NULL-safe.
+///
+/// # Safety
+/// `fs` must be NULL or a handle returned by `sutram_open_image*` that
+/// has not already been closed. After this call the handle is invalid —
+/// passing it to any other `sutram_*` function is use-after-free.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_close(fs: *mut SutramFs) {
     if fs.is_null() {
@@ -188,6 +217,11 @@ pub unsafe extern "C" fn sutram_close(fs: *mut SutramFs) {
 
 /// Parser name that mounted this image (`"fat"`, `"ntfs"`, …) — borrowed
 /// (valid while the handle lives); NULL on NULL input.
+///
+/// # Safety
+/// `fs` must be NULL or a live handle from `sutram_open_image*`. The
+/// returned pointer is borrowed — do not free it; it stays valid until
+/// `sutram_close(fs)`.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_fs_type(fs: *mut SutramFs) -> *const c_char {
     if fs.is_null() {
@@ -200,6 +234,10 @@ pub unsafe extern "C" fn sutram_fs_type(fs: *mut SutramFs) -> *const c_char {
 }
 
 /// Volume info as a JSON string (free with `sutram_free_string`).
+///
+/// # Safety
+/// `fs` must be NULL or a live handle from `sutram_open_image*`. The
+/// returned string transfers ownership — free with `sutram_free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_info_json(fs: *mut SutramFs) -> *mut c_char {
     ffi(
@@ -230,6 +268,13 @@ pub type SutramEntryCb = Option<unsafe extern "C" fn(user: *mut c_void, json: *c
 
 /// Walk all entries (live + deleted + orphans), invoking `cb` once per
 /// item. Returns the number of callback invocations, or -1 on error.
+///
+/// # Safety
+/// `fs` must be NULL or a live handle; `cb` must be NULL or a valid
+/// function pointer. `user` is forwarded to `cb` verbatim and never
+/// dereferenced by the library — its safety is the caller's contract.
+/// The `json` pointer passed to `cb` is borrowed and valid only for the
+/// duration of that call.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_list_entries(
     fs: *mut SutramFs,
@@ -268,6 +313,10 @@ pub unsafe extern "C" fn sutram_list_entries(
 /// Buffered variant: returns at most `max_entries` entries as one JSONL
 /// string (newline-separated JSON objects), truncated at `max_bytes`
 /// output. Free with `sutram_free_string`. NULL on error.
+///
+/// # Safety
+/// `fs` must be NULL or a live handle. The returned string transfers
+/// ownership — free with `sutram_free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_list_jsonl(
     fs: *mut SutramFs,
@@ -309,6 +358,12 @@ pub unsafe extern "C" fn sutram_list_jsonl(
 /// `*out_len` (may be less than the file size when `max_bytes` truncates).
 /// Returns a buffer freed with `sutram_free_bytes(ptr, len)`, or NULL on
 /// error (entry missing, not a file, read failure).
+///
+/// # Safety
+/// `fs` must be NULL or a live handle; `entry_path` must be NULL or a
+/// valid NUL-terminated C string; `out_len` must be NULL or point to
+/// writable `u64` storage. The returned buffer transfers ownership —
+/// free with `sutram_free_bytes(ptr, *out_len)`.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_read_file(
     fs: *mut SutramFs,
@@ -339,6 +394,11 @@ pub unsafe extern "C" fn sutram_read_file(
 
 /// Free a buffer from `sutram_read_file`. `len` must be the value written
 /// to `out_len`. NULL-safe.
+///
+/// # Safety
+/// `p` must be NULL or a buffer returned by `sutram_read_file`, passed
+/// with the exact `len` reported via `out_len`, and not already freed.
+/// A mismatched `len` corrupts the allocator bookkeeping.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_free_bytes(p: *mut u8, len: u64) {
     if p.is_null() {
@@ -353,6 +413,11 @@ pub unsafe extern "C" fn sutram_free_bytes(p: *mut u8, len: u64) {
 
 /// Free a string returned by this library (`sutram_detect`,
 /// `sutram_info_json`, `sutram_list_jsonl`). NULL-safe.
+///
+/// # Safety
+/// `p` must be NULL or a pointer returned by this library that has not
+/// already been freed. Never pass a `free(3)`-allocated or borrowed
+/// pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sutram_free_string(p: *mut c_char) {
     if p.is_null() {

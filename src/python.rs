@@ -11,6 +11,11 @@
 //! img.read("/HELLO.TXT")                     # → bytes
 //! ```
 
+// The `#[pyfunction]`/`#[pymethods]` macros wrap our `PyResult<T>`
+// returns in generated conversions clippy misattributes to the signature
+// as identity `PyErr -> PyErr` conversions — a false positive.
+#![allow(clippy::useless_conversion)]
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBytes, PyDict};
