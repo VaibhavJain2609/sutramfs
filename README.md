@@ -8,8 +8,8 @@ for the contract every crate follows.
 
 ## What this crate is
 
-A pure-Rust, zero-dependency, `no_std`-shaped signature database and verdict
-engine:
+A pure-Rust, zero-dependency signature database and verdict engine built on
+a compile-time `const` table:
 
 - `detect(&[u8]) -> Option<MagicType>` — identify a buffer from its leading
   bytes; trailer-aware (DMG `koly`, VHD `conectix`, appended-ZIP `EOCD`).
@@ -24,7 +24,12 @@ engine:
     container table knows docx/xlsx/pptx/jar/apk/odt/epub *are* ZIP, and
     doc/xls/ppt/msg *are* OLE2/CFB.
   - Unknown extension or no signature → `Severity::Info`, never silent.
-- `has_trailer(kind, buf)` — footer verification (PNG `IEND`, PDF `%%EOF`).
+- `check_entry_sized(name, header, total_size)` — same verdict, but the
+  caller states the file's full size so missing-trailer notes (PNG `IEND`,
+  PDF `%%EOF`, JPEG `FFD9`) only fire when `header` holds the *whole* file —
+  a 4 KiB probe of a large file never produces a spurious "truncated" flag.
+- `has_trailer(kind, buf)` — footer verification (PNG `IEND`, PDF `%%EOF`)
+  over the last 1 KiB, tolerant of a few trailing pad bytes.
 
 The DB (`SIGNATURES`) covers ≥80 signatures: PE/ELF/Mach-O (all magics +
 fat/class disambiguation), WASM, dex, ZIP & OOXML, PNG/JPEG/GIF/BMP/TIFF/
@@ -59,7 +64,18 @@ assert_eq!(v.severity, Severity::High);
 
 - Signature hits are prefix/trailer based; ambiguous short magics
   (`BM`, `#!`) can produce weak identifications — `detect_all` exposes the
-  ambiguity.
+  ambiguity. (Container subtypes are *not* double-counted: an ODT that is
+  really a ZIP reports `[Odt]`, not a spurious polyglot.)
+- Filesystem/disk signatures sit deep (ISO9660 at `0x8001`, btrfs at
+  `0x10040`): detection needs a buffer that reaches the magic's offset —
+  per-file `check_entry` headers (~4 KiB) will never see them.
+- `detect` reports a single best answer; polyglot files (GIF+ZIP, SFX
+  stubs) are only visible via `detect_all` or the verdict's reasons.
+- Trailer detection (`koly`, `conectix`, EOCD) fires only when the buffer
+  actually contains the file's tail.
+- Declared-by-extension types (`crypt12/14/15`, `.p12/.pfx`, `PlainText`)
+  have no reliable magic — content can never *confirm* them, only
+  contradict them.
 - Format *validation* (e.g. "is this zip well-formed") is out of scope;
   parsers layer on top.
 

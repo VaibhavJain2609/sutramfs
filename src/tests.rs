@@ -392,3 +392,172 @@ fn whatsapp_crypt_declared_only() {
     assert_eq!(v.declared, Some(MagicType::WhatsAppCrypt));
     assert_eq!(v.severity, Severity::Info);
 }
+
+#[test]
+fn severity_ordering_and_suspicious_helper() {
+    assert!(Severity::Info < Severity::Suspicious);
+    assert!(Severity::Suspicious < Severity::High);
+    assert!(!check_entry("a.png", b"\x89PNG\x0D\x0A\x1A\x0A").suspicious());
+    assert!(check_entry("a.png", b"PK\x03\x04rest").suspicious());
+    assert!(check_entry("a.png", b"MZ\x90\0").suspicious());
+}
+
+#[test]
+fn extension_edge_cases() {
+    // Dotfiles and trailing dots have no usable extension.
+    assert_eq!(check_entry(".bashrc", b"x").declared, None);
+    assert_eq!(check_entry("name.", b"x").declared, None);
+    // Path components and case are handled.
+    let v = check_entry("dir/sub/photo.PNG", b"\x89PNG\x0D\x0A\x1A\x0A");
+    assert_eq!(v.declared, Some(MagicType::Png));
+    assert!(!v.mismatch);
+    let v = check_entry("back\\slash.jpg", b"\xFF\xD8\xFF\xE0");
+    assert_eq!(v.declared, Some(MagicType::Jpeg));
+    // Unmapped extension + no magic explains itself.
+    let v = check_entry("blob.xyz", b"no known magic here");
+    assert_eq!(v.declared, None);
+    assert_eq!(v.detected, None);
+    assert!(v.reasons[0].contains("unmapped"));
+}
+
+#[test]
+fn accepts_cross_family_edges() {
+    use MagicType::*;
+    // Format families that legitimately overlap.
+    assert!(Gif87.accepts(Gif89));
+    assert!(Gif89.accepts(Gif87));
+    assert!(TiffLe.accepts(TiffBe));
+    assert!(TiffBe.accepts(TiffLe));
+    assert!(Mov.accepts(Mp4));
+    assert!(ThreeGpp.accepts(Mp4));
+    assert!(Mp4.accepts(Mov));
+    assert!(Mp4.accepts(ThreeGpp));
+    assert!(!Mp4.accepts(Zip));
+    assert!(Pst.accepts(Ole2));
+    assert!(Msg.accepts(Ole2));
+    assert!(Bplist.accepts(Xml));
+    assert!(Html.accepts(Xml));
+    assert!(!Xml.accepts(Html));
+    assert!(!PlainText.accepts(Png));
+    assert!(!Png.accepts(Jpeg));
+    assert!(Script.accepts(ShellScript));
+    for t in [Jar, Apk, Odt, Ods, Odp, Epub] {
+        assert!(Zip.accepts(t), "zip must accept {t:?}");
+    }
+    // The same rules through real verdicts.
+    assert!(!check_entry("a.gif", b"GIF87a....").mismatch);
+    assert!(!check_entry("a.tif", b"MM\0*....").mismatch);
+    let mut f = vec![0, 0, 0, 0x20];
+    f.extend_from_slice(b"ftypisom");
+    assert!(!check_entry("a.mov", &f).mismatch);
+    let mut f = vec![0, 0, 0, 0x20];
+    f.extend_from_slice(b"ftyp3gp4");
+    assert!(!check_entry("a.mp4", &f).mismatch);
+}
+
+#[test]
+fn detect_special_edge_cases() {
+    // Too-short buffers never match specials and never panic.
+    assert_eq!(detect(b""), None);
+    assert_eq!(detect(b"RIFF"), None);
+    assert_eq!(detect(b"\xCA\xFE\xBA\xBE\0\0"), None); // < 8 bytes
+    // The bare 6-byte LUKS magic still matches the table row.
+    assert_eq!(detect(b"LUKS\xBA\xBE"), Some(MagicType::Luks1));
+    // Unknown RIFF form type is still a RIFF media file.
+    assert_eq!(detect(b"RIFF\x10\0\0\0XXXX"), Some(MagicType::Wav));
+    // A FORM that is not AIFF/AIFC is nothing we name.
+    assert_eq!(detect(b"FORM\0\0\x10\08SVXCOMM"), None);
+    // Reserved MPEG version/layer bits are neither MP3 nor AAC.
+    assert_eq!(detect(b"\xFF\xE1\x00\x00"), None);
+    assert_eq!(detect(b"\xFF\xE8\x00\x00"), None);
+}
+
+#[test]
+fn zip_subtype_edge_cases() {
+    let hdr = |name: &[u8], method: u16| {
+        let mut z = b"PK\x03\x04".to_vec();
+        z.extend_from_slice(&[0x14, 0x00]); // version
+        z.extend_from_slice(&[0x00, 0x00]); // flags
+        z.extend_from_slice(&method.to_le_bytes());
+        z.extend_from_slice(&[0; 16]); // time/date/crc/sizes
+        z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(0u16).to_le_bytes());
+        z.extend_from_slice(name);
+        z
+    };
+    // A *compressed* "mimetype" entry is not an ODF marker.
+    let mut z = hdr(b"mimetype", 8);
+    z.extend_from_slice(b"application/epub+zip");
+    assert_eq!(detect(&z), Some(MagicType::Zip));
+    // classes.dex / resources.arsc also identify APKs.
+    assert_eq!(detect(&hdr(b"classes.dex", 8)), Some(MagicType::Apk));
+    assert_eq!(detect(&hdr(b"resources.arsc", 0)), Some(MagicType::Apk));
+    // Legacy OpenOffice MIME strings map to ODF types.
+    let mut z = hdr(b"mimetype", 0);
+    z.extend_from_slice(b"application/vnd.sun.xml.calc");
+    assert_eq!(detect(&z), Some(MagicType::Ods));
+    let mut z = hdr(b"mimetype", 0);
+    z.extend_from_slice(b"application/vnd.sun.xml.impress");
+    assert_eq!(detect(&z), Some(MagicType::Odp));
+    // A name_len that overruns the buffer degrades to generic Zip — no panic.
+    let mut z = b"PK\x03\x04".to_vec();
+    z.extend_from_slice(&[0x14, 0x00, 0x00, 0x00, 0x08, 0x00]);
+    z.extend_from_slice(&[0; 16]);
+    z.extend_from_slice(&(0xFFFFu16).to_le_bytes());
+    z.extend_from_slice(&(0u16).to_le_bytes());
+    assert_eq!(detect(&z), Some(MagicType::Zip));
+    // Buffer shorter than a local-file header still identifies as Zip.
+    assert_eq!(detect(b"PK\x03\x04"), Some(MagicType::Zip));
+}
+
+#[test]
+fn trailer_edge_cases() {
+    // Trailer search tolerates a few trailing pad bytes.
+    let mut png = b"\x89PNG\x0D\x0A\x1A\x0Adata".to_vec();
+    png.extend_from_slice(b"IEND\xAE\x42\x60\x82");
+    png.extend_from_slice(b"\0\0\0\0");
+    assert!(has_trailer(MagicType::Png, &png));
+    // Buffer shorter than the trailer → false, no panic.
+    assert!(!has_trailer(MagicType::Png, b"xx"));
+    // A kind with no trailer entry is simply false.
+    assert!(!has_trailer(MagicType::Elf, b"whatever"));
+    // GIF's single-byte trailer.
+    assert!(has_trailer(MagicType::Gif89, b"GIF89a...\x3B"));
+    // A lone EOCD tail means *some* zip lives here even without a PK header —
+    // the appended-archive / SFX-stub case.
+    let mut junk = vec![0u8; 200];
+    junk.extend_from_slice(b"PK\x05\x06");
+    assert_eq!(detect(&junk), Some(MagicType::Zip));
+    // A whole-file zip without an EOCD raises no trailer note (Zip is
+    // excluded — truncation of the central directory is routine).
+    let v = check_entry_sized("a.zip", b"PK\x03\x04xxxx", 12);
+    assert!(!v.reasons.iter().any(|r| r.contains("trailer")));
+}
+
+#[test]
+fn subtype_detection_is_not_a_polyglot_flag() {
+    // A well-formed ODF container must NOT be flagged "multiple
+    // signatures": the PK row and the subtype answer describe the same
+    // bytes, and its own EOCD trailer is the same archive.
+    let mut odt = b"PK\x03\x04".to_vec();
+    odt.extend_from_slice(&[0x14, 0x00, 0x00, 0x00, 0x00, 0x00]); // stored
+    odt.extend_from_slice(&[0; 16]);
+    odt.extend_from_slice(&(8u16).to_le_bytes());
+    odt.extend_from_slice(&(0u16).to_le_bytes());
+    odt.extend_from_slice(b"mimetype");
+    odt.extend_from_slice(b"application/vnd.oasis.opendocument.text");
+    odt.extend_from_slice(&[0u8; 64]);
+    odt.extend_from_slice(b"PK\x05\x06"); // EOCD inside the 1 KiB tail window
+    assert_eq!(detect_all(&odt), vec![MagicType::Odt]);
+    let v = check_entry("notes.odt", &odt);
+    assert_eq!(v.severity, Severity::Info, "{:?}", v.reasons);
+    // LUKS2 likewise: the versioned answer replaces the generic LUKS row.
+    assert_eq!(detect_all(b"LUKS\xBA\xBE\0\x02"), vec![MagicType::Luks2]);
+    // …while a real GIF+ZIP appended-archive still reports both signatures.
+    let mut poly = b"GIF89a\x01\0\x01\0".to_vec();
+    poly.extend_from_slice(&[0u8; 40]);
+    poly.extend_from_slice(b"PK\x05\x06");
+    let all = detect_all(&poly);
+    assert!(all.contains(&MagicType::Gif89));
+    assert!(all.contains(&MagicType::Zip));
+}

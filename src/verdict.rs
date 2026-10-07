@@ -72,10 +72,18 @@ pub fn detect(buf: &[u8]) -> Option<MagicType> {
 /// single answer; this exposes the ambiguity for forensic review.
 pub fn detect_all(buf: &[u8]) -> Vec<MagicType> {
     let mut out = Vec::new();
-    if let Some(t) = detect_special(buf) {
+    let special = detect_special(buf);
+    if let Some(t) = special {
         out.push(t);
     }
     for s in SIGNATURES {
+        // A table row that merely restates what the special check already
+        // decided from the same leading bytes is *one* signature, not two:
+        // the generic `PK` row vs an ODF/APK subtype answer, the generic
+        // LUKS row vs the versioned LUKS1/LUKS2 answer.
+        if special.is_some_and(|t| row_subsumed_by_special(t, s)) {
+            continue;
+        }
         if let Some(field) = buf.get(s.offset..s.offset + s.magic.len()) {
             if field == s.magic && !out.contains(&s.kind) {
                 out.push(s.kind);
@@ -83,11 +91,40 @@ pub fn detect_all(buf: &[u8]) -> Vec<MagicType> {
         }
     }
     if let Some(t) = trailer_detect(buf) {
-        if !out.contains(&t) {
+        // An EOCD trailer under an identified ZIP-subtype container is the
+        // same archive, not an appended second one.
+        let subsumed = t == MagicType::Zip && out.iter().any(|&x| is_zip_subtype(x));
+        if !subsumed && !out.contains(&t) {
             out.push(t);
         }
     }
     out
+}
+
+/// Types `zip_subtype` may return — archive containers whose `PK` header and
+/// `EOCD` trailer belong to the *same* signature, not independent hits.
+fn is_zip_subtype(t: MagicType) -> bool {
+    matches!(
+        t,
+        MagicType::Apk
+            | MagicType::Jar
+            | MagicType::Odt
+            | MagicType::Ods
+            | MagicType::Odp
+            | MagicType::Epub
+    )
+}
+
+/// `true` when table row `s` only re-describes leading bytes that `special`
+/// already interpreted (a ZIP container subtype or the LUKS version check).
+fn row_subsumed_by_special(special: MagicType, s: &crate::Signature) -> bool {
+    if s.offset != 0 {
+        return false;
+    }
+    if is_zip_subtype(special) {
+        return s.kind == MagicType::Zip;
+    }
+    matches!(special, MagicType::Luks1 | MagicType::Luks2) && s.kind == MagicType::Luks1
 }
 
 /// Check whether `buf`'s tail carries `kind`'s trailer signature

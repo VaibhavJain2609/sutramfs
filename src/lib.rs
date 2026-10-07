@@ -29,10 +29,12 @@
 
 #![forbid(unsafe_code)]
 
+mod carve;
 mod table;
 mod types;
 mod verdict;
 
+pub use carve::{carve_spec, ext, CarveBound, CarveSpec, DeclField};
 pub use table::{Signature, EXT_TO_TYPE, SIGNATURES, TRAILERS};
 pub use types::{Category, MagicType};
 pub use verdict::{
