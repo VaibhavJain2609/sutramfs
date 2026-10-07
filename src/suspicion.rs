@@ -535,6 +535,119 @@ mod tests {
     }
 
     #[test]
+    fn filename_helpers_edge_cases() {
+        assert_eq!(extension("readme.txt").as_deref(), Some("txt"));
+        assert_eq!(extension(".bashrc"), None);
+        assert_eq!(extension("noext"), None);
+        assert_eq!(extension("foo."), None);
+        assert_eq!(extension("/dir/ARCH.TAR").as_deref(), Some("tar")); // lowercased
+        assert!(is_exec_name("tool.EXE")); // case-insensitive
+        assert!(!is_exec_name("readme.txt"));
+        assert!(!has_double_extension("a.b.c")); // .c isn't exec
+        assert!(!has_double_extension("noext"));
+        assert_eq!(in_user_writable_path("/usr/bin/tool"), None);
+        assert!(in_user_writable_path("/downloads/x.bin").is_some());
+    }
+
+    #[test]
+    fn info_magic_adds_no_points() {
+        let mut e = entry(1, "/f.bin");
+        e.magic = Some(MagicVerdict {
+            declared: None,
+            detected: None,
+            mismatch: false,
+            severity: Severity::Info,
+            reasons: vec![],
+        });
+        let s = score_entry(&e, &no_signals());
+        assert_eq!(s.score, 0);
+        assert!(s.reasons.is_empty());
+    }
+
+    #[test]
+    fn suspicious_magic_scores_25() {
+        let mut e = entry(1, "/photo.png");
+        e.magic = Some(MagicVerdict {
+            declared: None,
+            detected: None,
+            mismatch: true,
+            severity: Severity::Suspicious,
+            reasons: vec!["png name, zip content".into()],
+        });
+        let s = score_entry(&e, &no_signals());
+        assert_eq!(s.score, 25);
+        assert!(s.reasons[0].contains("magic severity Suspicious"));
+    }
+
+    #[test]
+    fn code_magic_marks_executable_for_location_rule() {
+        // A detected code type fires the user-writable rule even when the
+        // extension is benign — the magic verdict wins over the name.
+        let mut e = entry(1, "/tmp/innocent.txt");
+        e.magic = Some(MagicVerdict {
+            declared: None,
+            detected: Some(sutram_magic::MagicType::Pe),
+            mismatch: false,
+            severity: Severity::Info,
+            reasons: vec![],
+        });
+        let s = score_entry(&e, &no_signals());
+        assert!(s.reasons.iter().any(|r| r.contains("user-writable")));
+    }
+
+    #[test]
+    fn assess_with_counts_errors_and_applies_reputation() {
+        // FS whose walk injects one corruption record before the entries.
+        struct ErrFs {
+            inner: MemFs,
+        }
+        impl FileSystem for ErrFs {
+            fn info(&self) -> FsInfo {
+                self.inner.info()
+            }
+            fn source(&self) -> Arc<dyn ByteSource> {
+                self.inner.source()
+            }
+            fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+                let mut items: Vec<Result<FsEntry>> =
+                    vec![Err(FsError::corrupt(0x40, "torn record"))];
+                items.extend(self.inner.entries.iter().cloned().map(Ok));
+                Box::new(items.into_iter())
+            }
+            fn read_file(&self, entry: &FsEntry) -> Result<Box<dyn Read + Send>> {
+                self.inner.read_file(entry)
+            }
+        }
+
+        let mut inner = MemFs {
+            entries: vec![],
+            data: HashMap::new(),
+            src: Arc::new(Vec::new()),
+        };
+        let flagged = entry(1, "/totally-boring.bin");
+        inner.data.insert(1, vec![0u8; 256]); // low entropy → only rep fires
+        inner.entries.push(flagged);
+        // An entry with no backing data: entry_entropy fails → tolerated.
+        inner.entries.push(entry(2, "/unreadable.bin"));
+        let fs = ErrFs { inner };
+        let _ = fs.info();
+        let _ = fs.source();
+
+        let a = assess_with(&fs, &|e| {
+            if e.entry_id == 1 {
+                Some(RepVerdict::Malicious)
+            } else {
+                None
+            }
+        });
+        assert_eq!(a.errors, 1);
+        assert_eq!(a.files_examined, 2);
+        assert_eq!(a.scored.len(), 1);
+        assert_eq!(a.scored[0].entry.entry_id, 1);
+        assert_eq!(a.scored[0].suspicion.score, 60);
+    }
+
+    #[test]
     fn assess_walks_and_sorts() {
         let mut fs = MemFs {
             entries: vec![],

@@ -134,7 +134,7 @@ impl Sha256 {
         out
     }
 
-    /// [`finalize`] as lowercase hex.
+    /// [`finalize`](Self::finalize) as lowercase hex.
     pub fn finalize_hex(self) -> String {
         hex(&self.finalize())
     }
@@ -260,7 +260,7 @@ impl Sha1 {
         out
     }
 
-    /// [`finalize`] as lowercase hex.
+    /// [`finalize`](Self::finalize) as lowercase hex.
     pub fn finalize_hex(self) -> String {
         hex(&self.finalize())
     }
@@ -397,7 +397,7 @@ impl Md5 {
         out
     }
 
-    /// [`finalize`] as lowercase hex.
+    /// [`finalize`](Self::finalize) as lowercase hex.
     pub fn finalize_hex(self) -> String {
         hex(&self.finalize())
     }
@@ -910,6 +910,29 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hash_entry_propagates_read_failures() {
+        let fs = MemFs {
+            data: HashMap::new(),
+            src: Arc::new(Vec::new()),
+        };
+        assert_eq!(fs.info().fs_type, "mem");
+        let _ = fs.source();
+        assert_eq!(fs.walk().count(), 0);
+        let e = entry(55, "/missing.bin", 8, EntryKind::File);
+        assert!(matches!(
+            hash_entry(&fs, &e),
+            Err(FsError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn default_hashers_match_new() {
+        assert_eq!(Sha256::default().finalize_hex(), sha256_of(b""));
+        assert_eq!(Sha1::default().finalize_hex(), sha1_of(b""));
+        assert_eq!(Md5::default().finalize_hex(), md5_of(b""));
+    }
+
     // -- EWF verification -------------------------------------------------
     //
     // Minimal E01 builder: uncompressed chunks only (no miniz_oxide needed),
@@ -1095,6 +1118,56 @@ mod tests {
             }
             other => panic!("expected Mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ewf_verify_sha1_mismatch() {
+        // Correct MD5 but a bogus stored SHA-1 → single "sha1" mismatch.
+        let media = vec![5u8; E01_CHUNK];
+        let (d, _) = hash_reader(Cursor::new(&media)).unwrap();
+        let md5: [u8; 16] = digest_bytes(&d.md5).try_into().unwrap();
+        let img = build_e01(&media, Some(md5), Some([0xAB; 20]));
+        match verify_source(into_arc(img)).unwrap() {
+            AcqVerification::Mismatch { mismatches, .. } => {
+                assert_eq!(mismatches.len(), 1);
+                assert_eq!(mismatches[0].algorithm, "sha1");
+                assert_eq!(mismatches[0].computed, d.sha1);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_acquisition_on_disk_file() {
+        // The path-based wrapper: write a tiny E01 to a temp file.
+        let media = vec![42u8; 512 * 3];
+        let (d, _) = hash_reader(Cursor::new(&media)).unwrap();
+        let md5: [u8; 16] = digest_bytes(&d.md5).try_into().unwrap();
+        let img = build_e01(&media, Some(md5), None);
+        let mut p = std::env::temp_dir();
+        p.push(format!("sutram_analyze_verify_{}.E01", std::process::id()));
+        std::fs::write(&p, &img).unwrap();
+        let v = verify_acquisition(&p).unwrap();
+        assert!(v.is_verified(), "{v:?}");
+        std::fs::remove_file(&p).ok();
+        // Missing file → Io error, not a panic.
+        p.set_file_name("sutram_analyze_verify_missing.E01");
+        assert!(matches!(
+            verify_acquisition(&p),
+            Err(FsError::Io(_))
+        ));
+        // A raw (non-EWF) file → NotAvailable.
+        let media2 = vec![0u8; 512];
+        let mut p2 = std::env::temp_dir();
+        p2.push(format!("sutram_analyze_raw_{}.dd", std::process::id()));
+        std::fs::write(&p2, &media2).unwrap();
+        match verify_acquisition(&p2).unwrap() {
+            AcqVerification::NotAvailable { reason } => {
+                assert!(reason.contains("not an EWF"), "{reason}");
+            }
+            other => panic!("expected NotAvailable, got {other:?}"),
+        }
+        std::fs::remove_file(&p2).ok();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! MACB timeline construction from a `walk()` stream.
 //!
-//! Every [`FsEntry`] carries up to five forensic timestamps — modified
+//! Every [`sutram_fs::FsEntry`] carries up to five forensic timestamps — modified
 //! (**M**), accessed (**A**), metadata-changed (**C**), created/birth
 //! (**B**) and deletion time (**D**, e.g. ext4 `dtime`). [`Timeline`]
 //! explodes each populated slot into one [`TimelineEvent`], sorts by
@@ -522,6 +522,127 @@ mod tests {
     }
 
     #[test]
+    fn all_macb_letters_render() {
+        let mut e = entry(1, "/full.txt", EntryKind::File, false);
+        e.timestamps.modified = Some(ts(DAY));
+        e.timestamps.accessed = Some(ts(2 * DAY));
+        e.timestamps.changed = Some(ts(3 * DAY));
+        e.timestamps.created = Some(ts(4 * DAY));
+        e.timestamps.deleted = Some(ts(5 * DAY));
+        let fs = MemFs {
+            entries: vec![e],
+            src: Arc::new(Vec::new()),
+        };
+        let tl = Timeline::build(&fs);
+        assert_eq!(tl.len(), 5);
+        let csv = tl.to_csv();
+        for col in ["m....", ".a...", "..c..", "...b.", "....d"] {
+            assert!(csv.contains(&format!(",{col},/full.txt")), "{col} in {csv}");
+        }
+        // exclude_deleted_time drops the 'd' event only
+        let tl = Timeline::build_with(
+            &fs,
+            &TimelineOptions {
+                include_deleted_time: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(tl.len(), 4);
+        assert!(!tl.to_csv().contains("....d"));
+    }
+
+    #[test]
+    fn truncation_breaks_mid_entry() {
+        // A cap that lands inside one entry's timestamp expansion exits
+        // the walk early at each `emit` site.
+        let mut e = entry(1, "/f", EntryKind::File, false);
+        e.timestamps.modified = Some(ts(DAY));
+        e.timestamps.accessed = Some(ts(2 * DAY));
+        e.timestamps.changed = Some(ts(3 * DAY));
+        e.timestamps.created = Some(ts(4 * DAY));
+        e.timestamps.deleted = Some(ts(5 * DAY));
+        for cap in 0..5usize {
+            let fs = MemFs {
+                entries: vec![e.clone()],
+                src: Arc::new(Vec::new()),
+            };
+            let tl = Timeline::build_with(
+                &fs,
+                &TimelineOptions {
+                    max_events: cap,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(tl.len(), cap, "cap {cap}");
+            assert!(tl.truncated, "cap {cap}");
+        }
+    }
+
+    #[test]
+    fn empty_timeline() {
+        let fs = MemFs {
+            entries: vec![],
+            src: Arc::new(Vec::new()),
+        };
+        assert_eq!(fs.info().fs_type, "mem");
+        let _ = fs.source();
+        let tl = Timeline::build(&fs);
+        assert!(tl.is_empty());
+        assert_eq!(tl.len(), 0);
+        assert_eq!(tl.to_csv(), "date,time,MACB,path\n");
+        assert!(tl.to_jsonl().is_empty());
+        assert!(tl.to_bodyfile().is_empty());
+    }
+
+    #[test]
+    fn csv_and_jsonl_escape_special_chars() {
+        let mut e = entry(1, "/quo\"te\\back\u{1}end", EntryKind::File, false);
+        e.timestamps.modified = Some(ts(0));
+        let fs = MemFs {
+            entries: vec![e],
+            src: Arc::new(Vec::new()),
+        };
+        let tl = Timeline::build(&fs);
+        let csv = tl.to_csv();
+        // quote doubled, whole field quoted
+        assert!(
+            csv.contains("\"/quo\"\"te\\back\u{1}end\""),
+            "{csv}"
+        );
+        let j = tl.to_jsonl();
+        assert!(
+            j.contains("/quo\\\"te\\\\back\\u0001end"),
+            "{j}"
+        );
+    }
+
+    #[test]
+    fn bodyfile_symlink_mode_and_deleted_marker() {
+        let mut l = entry(1, "/link", EntryKind::Symlink, false);
+        l.timestamps.changed = Some(ts(DAY));
+        l.timestamps.created = Some(ts(2 * DAY));
+        let mut d = entry(2, "/gone.bin", EntryKind::File, true);
+        d.timestamps.deleted = Some(ts(3 * DAY));
+        let mut dir = entry(3, "/dir", EntryKind::Directory, false);
+        dir.timestamps.modified = Some(ts(4 * DAY));
+        let fs = MemFs {
+            entries: vec![l, d, dir],
+            src: Arc::new(Vec::new()),
+        };
+        let bf = Timeline::build(&fs).to_bodyfile();
+        // symlink → l/lrwxrwxrwx mode; ctime/crtime columns populated
+        assert!(
+            bf.contains("0|/link|1|l/lrwxrwxrwx|0|0|100|0|0|86400|172800"),
+            "{bf}"
+        );
+        // 'd'-only event still emits a line (zeroed time columns) with
+        // the (deleted) suffix
+        assert!(bf.contains("|/gone.bin (deleted)|2|"), "{bf}");
+        // directory → d/drwxrwxrwx mode
+        assert!(bf.contains("0|/dir|3|d/drwxrwxrwx|"), "{bf}");
+    }
+
+    #[test]
     fn csv_output() {
         let mut e = entry(1, "/hello.txt", EntryKind::File, false);
         // 2024-01-15T10:30:20Z
@@ -618,10 +739,13 @@ mod tests {
         e.timestamps.modified = Some(ts(0));
         let fs = ErrFs {
             inner: MemFs {
-                entries: vec![e],
+                entries: vec![e.clone()],
                 src: Arc::new(Vec::new()),
             },
         };
+        let _ = fs.info();
+        let _ = fs.source();
+        assert!(fs.read_file(&e).is_err());
         let tl = Timeline::build(&fs);
         assert_eq!(tl.errors, 1);
         assert_eq!(tl.len(), 1);

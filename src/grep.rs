@@ -681,6 +681,107 @@ mod tests {
         assert!(hits.is_empty()); // needle beyond the cap
     }
 
+    /// A reader that fails mid-stream, and an FS whose walk can inject
+    /// corruption records — exercises `search`'s Err-item contract.
+    struct FailRead;
+    impl Read for FailRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+
+    struct ErrFs {
+        inner: MemFs,
+        inject_walk_err: bool,
+        fail_read: bool,
+    }
+
+    impl FileSystem for ErrFs {
+        fn info(&self) -> FsInfo {
+            self.inner.info()
+        }
+        fn source(&self) -> Arc<dyn ByteSource> {
+            self.inner.source()
+        }
+        fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+            let mut items: Vec<Result<FsEntry>> =
+                self.inner.entries.iter().cloned().map(Ok).collect();
+            if self.inject_walk_err {
+                items.insert(0, Err(FsError::corrupt(0, "corrupt dirent")));
+            }
+            Box::new(items.into_iter())
+        }
+        fn read_file(&self, entry: &FsEntry) -> Result<Box<dyn Read + Send>> {
+            if self.fail_read {
+                return Ok(Box::new(FailRead));
+            }
+            Err(FsError::NotFound {
+                path: entry.path.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn error_records_pass_through_stream() {
+        let e = file_entry(1, "/f.txt", false);
+        // Walk error + read_file failure → two Err items, no panic.
+        let fs = ErrFs {
+            inner: MemFs {
+                entries: vec![e.clone()],
+                data: HashMap::new(),
+                src: Arc::new(Vec::new()),
+            },
+            inject_walk_err: true,
+            fail_read: false,
+        };
+        let _ = fs.info();
+        let _ = fs.source();
+        let items: Vec<_> = search(
+            &fs,
+            &[Pattern::literal("x")],
+            &SearchOptions::default(),
+        )
+        .collect();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.is_err()));
+
+        // Reader that fails mid-stream → one Err item, then the stream ends.
+        let fs = ErrFs {
+            inner: MemFs {
+                entries: vec![e],
+                data: HashMap::new(),
+                src: Arc::new(Vec::new()),
+            },
+            inject_walk_err: false,
+            fail_read: true,
+        };
+        let items: Vec<_> = search(
+            &fs,
+            &[Pattern::literal("x")],
+            &SearchOptions::default(),
+        )
+        .collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_err());
+    }
+
+    #[test]
+    fn literal_bytes_pattern() {
+        let fs = fs_with(&[("/x.bin", b"\x01\x02NEEDLE\x03", false)]);
+        assert_eq!(fs.info().fs_type, "mem");
+        let _ = fs.source();
+        let hits: Vec<_> = search(
+            &fs,
+            &[Pattern::literal_bytes(b"NEEDLE")],
+            &SearchOptions::default(),
+        )
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].offset, 2);
+        assert_eq!(hits[0].pattern, "\"NEEDLE\"");
+    }
+
     #[test]
     fn utf16le_via_hex() {
         // "pass" as UTF-16LE

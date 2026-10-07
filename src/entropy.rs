@@ -394,4 +394,43 @@ mod tests {
             Err(FsError::InvalidInput { .. })
         ));
     }
+
+    #[test]
+    fn chi_square_empty_is_zero() {
+        assert_eq!(chi_square(&[]), 0.0);
+        assert_eq!(shannon_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn skewed_high_entropy_names_packed_not_encrypted() {
+        // Entropy > 7.5 with chi² far above uniform → the "packed or
+        // compressed rather than encrypted" suspicion wording fires.
+        let mut data: Vec<u8> = (0..=255u8).cycle().take(256 * 100).collect();
+        data.extend(std::iter::repeat_n(0u8, 300));
+        let v = entropy_bytes(&data);
+        assert!(v.entropy > HIGH_ENTROPY, "entropy {}", v.entropy);
+        assert!(v.chi_square > NONUNIFORM_CHI2, "chi2 {}", v.chi_square);
+        assert!(
+            v.suspicion.unwrap().contains("packed/compressed"),
+            "{:?}",
+            v.suspicion
+        );
+    }
+
+    #[test]
+    fn entry_entropy_propagates_read_failures() {
+        // Entry with no backing data → read_file's error reaches the caller.
+        let fs = MemFs {
+            data: HashMap::new(),
+            src: Arc::new(Vec::new()),
+        };
+        assert_eq!(fs.info().fs_type, "mem");
+        let _ = fs.source();
+        assert_eq!(fs.walk().count(), 0);
+        let e = file_entry(77, "/nope.bin", 16);
+        assert!(matches!(
+            entry_entropy(&fs, &e),
+            Err(FsError::NotFound { .. })
+        ));
+    }
 }
