@@ -1,0 +1,46 @@
+sutramfs — SUTRAM-FS forensic filesystem parser CLI
+
+USAGE
+  sutramfs detect  <image> [-p N]                 probe all parsers, show confidences
+  sutramfs parts   <image>                        list MBR/GPT partitions
+  sutramfs android <image>                        Android layout (sparse/super.img/vbmeta/FBE)
+  sutramfs info    <image> [-p N] [-t FS]         mount + show volume summary
+  sutramfs ls      <image> [-p N] [-t FS] [-d] [-o FMT]
+                                                  walk entries (FMT: tree|json|csv|bodyfile)
+                                                  (`walk` is an alias for `ls`)
+  sutramfs cat     <image> <path> [-p N] [-t FS] [--recover]
+                                                  extract recoverable data of a file
+                                                  (`extract` is an alias for `cat`)
+  sutramfs carve   <image> [-p N] [-t FS] [--offset O --len L | --unallocated] [--align A]
+                                                  signature-carve free space or a byte range
+  sutramfs remnants <image> [-p N] [--offset O --len L] [--aligned-only]
+                    [--sector-size N] [--rec-size N] [--indx-size N]
+                    [--exclude-live-mft]
+                                                  carve orphaned NTFS FILE/INDX records
+                                                  (formatted / overwritten-$MFT recovery);
+                                                  emits JSONL to stdout
+  sutramfs rebuild  <image> [-p N] [--remnants FILE]... [--offset O --len L]
+                    [--under PATH]... [-o csv|jsonl]
+                                                  rebuild dead-FS directory tree from
+                                                  remnants (and/or --remnants JSONL files),
+                                                  match live files by name+size, emit
+                                                  restore plan
+
+FLAGS
+  -p, --partition N   scope to partition N (0-based, from `parts`)
+  -t, --type FS       force parser: fat|exfat|ext4|btrfs|f2fs|xfs|hfs|ntfs|apfs
+  -d, --deleted       only deleted/recoverable entries
+  -o, --output FMT    tree (default) | json|jsonl | csv | bodyfile|mactime
+  --recover           (cat) accepted for readability — cat always attempts
+                      recovery reads of deleted entries
+  --strict            abort walk on first corruption (default: lenient)
+  --offset O --len L  (carve) byte range to scan (default: whole image)
+  --unallocated       (carve) scan the filesystem's unallocated ranges
+  --align A           (carve) probe alignment in bytes (default: 512)
+
+EXAMPLES
+  sutramfs detect disk.dd
+  sutramfs parts disk.dd
+  sutramfs ls disk.dd -p 2 -d -o json > deleted.jsonl
+  sutramfs cat phone.img /data/user/0/com.whatsapp/databases/msgstore.db -p 5
+  sutramfs carve usb.img --unallocated
