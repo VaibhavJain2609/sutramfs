@@ -1,0 +1,14 @@
+[package]
+name = "sutram-fat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "FAT12/16/32 forensic filesystem parser (deleted entries, orphan chains, slack, magic verdicts)"
+keywords = ["forensics", "filesystem", "fat32", "dfir", "carving"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
