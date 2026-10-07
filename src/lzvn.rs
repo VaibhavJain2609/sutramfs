@@ -35,6 +35,22 @@ use crate::{CompError, Result};
 /// `max_out` (decompression-bomb guard).
 pub fn decompress(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(max_out.min(1 << 22));
+    decompress_into(src, &mut out, max_out)?;
+    Ok(out)
+}
+
+/// Decode an LZVN stream, appending to `out`. `max_out` bounds the *total*
+/// length of `out` (including any pre-existing content). On success returns
+/// the number of source bytes consumed, which always includes the 8-byte
+/// `eos` opcode; trailing bytes after `eos` are not examined.
+///
+/// This is shared with the LZFSE decoder, which embeds LZVN payloads inside
+/// `bvxn` blocks and must know exactly how many payload bytes were used.
+pub(crate) fn decompress_into(
+    src: &[u8],
+    out: &mut Vec<u8>,
+    max_out: usize,
+) -> Result<usize> {
     let mut pos = 0usize;
     let mut d_prev = 0usize;
 
@@ -147,7 +163,7 @@ pub fn decompress(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
                         needed: (8 - src_len) as u64,
                     });
                 }
-                return Ok(out); // end_of_stream
+                return Ok(pos + 8); // end_of_stream
             }
             Act::Nop => {
                 if src_len <= 1 {
@@ -189,7 +205,7 @@ pub fn decompress(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
                     )));
                 }
                 pos += opc_len;
-                copy_match(&mut out, d, m, max_out)?;
+                copy_match(out, d, m, max_out)?;
             }
             Act::LitMatch(opc_len, l, m, d) => {
                 // Truncation already validated: src_len > opc_len + L.
@@ -208,7 +224,7 @@ pub fn decompress(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
                     )));
                 }
                 d_prev = d;
-                copy_match(&mut out, d, m, max_out)?;
+                copy_match(out, d, m, max_out)?;
             }
         }
     }
