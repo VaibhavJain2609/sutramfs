@@ -60,7 +60,7 @@ pub struct FileAssessment {
     /// Merged, deduplicated recommended actions.
     pub recommended_actions: Vec<String>,
     /// One-line, court-explainable summary, e.g.
-    /// `"/docs/invoice.docx: declared OOXML document (docx); content is
+    /// `"/docs/invoice.docx: declared OOXML document; content is
     ///  PE/COFF Windows executable; VT 41/72 engines flag trojan.x →
     ///  High suspicion"`.
     pub summary: String,

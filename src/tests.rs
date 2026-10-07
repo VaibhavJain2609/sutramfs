@@ -111,6 +111,60 @@ impl HttpTransport for MockTransport {
     }
 }
 
+/// One recorded egress: (method, url, optional request body).
+type RequestLog = std::sync::Mutex<Vec<(HttpMethod, String, Option<Vec<u8>>)>>;
+
+/// Spy transport: records every request so tests can prove the hash-first
+/// contract — which endpoints are hit, in what order, and that lookups
+/// never carry file bytes. Canned responses are routed by method: `GET`
+/// for `files/{hash}` lookups, `POST` for the opt-in `submit_file` path.
+struct SpyTransport {
+    log: std::sync::Arc<RequestLog>,
+    get: (u16, String),
+    post: (u16, String),
+}
+
+impl SpyTransport {
+    fn new(get: (u16, String), post: (u16, String)) -> Self {
+        SpyTransport {
+            log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            get,
+            post,
+        }
+    }
+
+    fn log(&self) -> std::sync::Arc<RequestLog> {
+        std::sync::Arc::clone(&self.log)
+    }
+}
+
+impl HttpTransport for SpyTransport {
+    fn request(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        _headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, RepError> {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((method, url.to_string(), body.map(|b| b.to_vec())));
+        let (status, body) = match method {
+            HttpMethod::Get => &self.get,
+            HttpMethod::Post => &self.post,
+        };
+        Ok(HttpResponse {
+            status: *status,
+            body: body.clone(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "spy"
+    }
+}
+
 fn service_with(mock: MockTransport) -> ReputationService {
     let cfg = RepConfig {
         api_key: Some("test-key".to_string()),
@@ -512,7 +566,12 @@ fn png_that_is_zip_is_suspicious_not_high() {
     assert!(sus
         .recommended_actions
         .iter()
-        .any(|a| a.contains("container") || a.contains("inspect")));
+        .any(|a| a.contains("manually inspect")));
+    // ZIP is an Archive — the container-enumeration action must fire.
+    assert!(sus
+        .recommended_actions
+        .iter()
+        .any(|a| a.contains("enumerate container members")));
 }
 
 #[test]
@@ -925,10 +984,465 @@ fn rate_limiter_blocking_and_try_acquire() {
     let mut b = TokenBucket::new(1);
     let t0 = Instant::now();
     assert_eq!(b.available(t0), 1.0);
+    assert_eq!(
+        b.time_until_ready(t0),
+        Duration::ZERO,
+        "a full bucket is ready now"
+    );
     assert!(b.try_take(t0));
     let wait = b.time_until_ready(t0);
     assert!(wait > Duration::from_secs(0) && wait <= Duration::from_secs(60));
     // Refill restores readiness after the period.
     let t1 = t0 + Duration::from_secs(61);
     assert!(b.try_take(t1));
+}
+
+#[test]
+fn rate_limiter_acquire_blocks_until_token() {
+    // A high-rpm bucket refills fast (600 rpm = 10 tokens/s), so the
+    // blocking `acquire` path is exercised without stalling the suite.
+    let rl = RateLimiter::new(600);
+    for _ in 0..600 {
+        assert!(rl.try_acquire());
+    }
+    assert!(!rl.try_acquire(), "bucket drained");
+    let t = Instant::now();
+    rl.acquire(); // waits ~100 ms for the next refill, then proceeds
+    assert!(t.elapsed() >= Duration::from_millis(50));
+}
+
+// ---------------------------------------------------------------------------
+// Hash-first ordering + opt-in upload boundary — the privacy contract,
+// asserted at the transport level.
+// ---------------------------------------------------------------------------
+
+const SHA2: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+#[test]
+fn lookups_are_hash_first_get_by_digest_never_post() {
+    let spy = SpyTransport::new(
+        (200, vt_clean_json(SHA)),
+        (200, r#"{"data":{"id":"up-1"}}"#.to_string()),
+    );
+    let log = spy.log();
+    // `allow_uploads = true` on purpose: even a fully-enabled config must
+    // keep every lookup strictly a hash-only GET.
+    let cfg = RepConfig {
+        api_key: Some("k".into()),
+        requests_per_minute: 0,
+        allow_uploads: true,
+        ..RepConfig::default()
+    };
+    let svc = ReputationService::with_transport(cfg, Box::new(spy));
+    let acfg = AnalysisConfig {
+        reputation: Some(&svc),
+        ..Default::default()
+    };
+    let entry = file_entry("invoice.docx");
+    // Full pipeline path AND the batch path: every egress must be
+    // `GET files/{digest}` with no request body.
+    analyze_file(&entry, b"MZ\x90\x00\x03PE\0\0", SHA, &acfg);
+    svc.lookup_many(&[SHA2]);
+    let reqs = log.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(reqs.len(), 2, "one GET per uncached hash, nothing else");
+    for (method, url, body) in reqs.iter() {
+        assert_eq!(*method, HttpMethod::Get, "lookups must never POST");
+        assert!(
+            url.starts_with(&format!("{VT_API_BASE}/files/")),
+            "lookup must address files/{{digest}}: {url}"
+        );
+        assert!(body.is_none(), "a hash lookup carries no file bytes");
+    }
+    assert!(reqs[0].1.ends_with(SHA));
+    assert!(reqs[1].1.ends_with(SHA2));
+}
+
+#[test]
+fn upload_only_via_explicit_submit_file_and_sends_sanitised_content() {
+    let spy = SpyTransport::new(
+        (200, vt_clean_json(SHA)),
+        (200, r#"{"data":{"id":"analysis-9"}}"#.to_string()),
+    );
+    let log = spy.log();
+    let cfg = RepConfig {
+        api_key: Some("k".into()),
+        requests_per_minute: 0,
+        allow_uploads: true,
+        ..RepConfig::default()
+    };
+    let svc = ReputationService::with_transport(cfg, Box::new(spy));
+
+    // Hash-first: the digest query lands before — and independently of —
+    // any upload. `analyze_file` itself never issues the POST.
+    svc.lookup(SHA);
+    let id = svc
+        .submit_file("..\\evidence\\evil<we>ird.exe", b"MZDATA")
+        .unwrap();
+    assert_eq!(id, "analysis-9");
+
+    let reqs = log.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].0, HttpMethod::Get, "digest lookup precedes upload");
+    assert!(reqs[0].1.ends_with(&format!("/files/{SHA}")));
+    assert!(reqs[0].2.is_none());
+    assert_eq!(reqs[1].0, HttpMethod::Post);
+    assert_eq!(reqs[1].1, format!("{VT_API_BASE}/files"));
+    let body = String::from_utf8_lossy(reqs[1].2.as_ref().unwrap());
+    // Path components stripped and <> removed by sanitize_filename.
+    assert!(body.contains("filename=\"evilweird.exe\""), "{body}");
+    assert!(body.contains("MZDATA"), "multipart body carries the bytes");
+    assert!(body.contains("sutramrep-boundary"), "multipart framing");
+}
+
+#[test]
+fn submit_file_transport_error_propagates() {
+    struct Failing;
+    impl HttpTransport for Failing {
+        fn request(
+            &self,
+            _m: HttpMethod,
+            _u: &str,
+            _h: &[(&str, &str)],
+            _b: Option<&[u8]>,
+        ) -> Result<HttpResponse, RepError> {
+            Err(RepError::Transport("connection reset".to_string()))
+        }
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+    }
+    let svc = ReputationService::with_transport(
+        RepConfig {
+            allow_uploads: true,
+            requests_per_minute: 0,
+            ..RepConfig::default()
+        },
+        Box::new(Failing),
+    );
+    assert!(matches!(
+        svc.submit_file("e.exe", b"MZ"),
+        Err(RepError::Transport(_))
+    ));
+}
+
+#[test]
+fn offline_flag_suppresses_configured_transport() {
+    // `cfg.offline` wins even when a transport is wired in — a dry-run
+    // deployment must send zero requests.
+    let spy = SpyTransport::new((200, vt_clean_json(SHA)), (200, "{}".to_string()));
+    let log = spy.log();
+    let cfg = RepConfig {
+        offline: true,
+        requests_per_minute: 0,
+        ..RepConfig::default()
+    };
+    let svc = ReputationService::with_transport(cfg, Box::new(spy));
+    assert!(svc.is_offline());
+    let r = svc.lookup(SHA);
+    assert_eq!(r.verdict, RepVerdict::NotQueried);
+    assert!(svc.pending_hashes().contains(&SHA.to_string()));
+    assert!(
+        log.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "offline mode must send zero requests"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP status handling: auth failures are terminal, everything else is
+// queued for the sneaker-net retry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lookup_auth_failure_is_not_queued() {
+    for status in [401u16, 403] {
+        let svc = service_with(MockTransport::new((status, "{}".to_string())));
+        let r = svc.lookup(SHA);
+        assert_eq!(r.verdict, RepVerdict::NotQueried, "HTTP {status}");
+        assert!(r
+            .reasons
+            .iter()
+            .any(|s| s.contains(&status.to_string()) && s.contains("API key")));
+        assert!(
+            svc.pending_hashes().is_empty(),
+            "auth failure won't fix itself on retry — not pending"
+        );
+    }
+}
+
+#[test]
+fn lookup_429_and_5xx_queue_for_retry() {
+    let svc = service_with(MockTransport::new((429, "{}".to_string())));
+    let r = svc.lookup(SHA);
+    assert_eq!(r.verdict, RepVerdict::NotQueried);
+    assert!(r
+        .reasons
+        .iter()
+        .any(|s| s.contains("429") && s.contains("rate limit")));
+    assert!(svc.pending_hashes().contains(&SHA.to_string()));
+
+    let svc = service_with(MockTransport::new((503, "{}".to_string())));
+    let r = svc.lookup(SHA);
+    assert_eq!(r.verdict, RepVerdict::NotQueried);
+    assert!(r.reasons.iter().any(|s| s.contains("503")));
+    assert!(!r.reasons.iter().any(|s| s.contains("rate limit")));
+    assert!(svc.pending_hashes().contains(&SHA.to_string()));
+}
+
+#[test]
+fn lookup_200_unparseable_is_unknown_not_queued() {
+    // The query *ran* — a malformed 200 is Unknown, not NotQueried, and
+    // not pending (re-querying won't fix a schema change).
+    let svc = service_with(MockTransport::new((200, "definitely not json".to_string())));
+    let r = svc.lookup(SHA);
+    assert_eq!(r.verdict, RepVerdict::Unknown);
+    assert!(r.reasons.iter().any(|s| s.contains("did not parse")));
+    assert!(svc.pending_hashes().is_empty());
+}
+
+#[test]
+fn lookup_many_reports_one_per_input_even_when_invalid() {
+    let mock = MockTransport::new((200, vt_clean_json(SHA)));
+    let counter = mock.counter();
+    let svc = service_with(mock);
+    let reports = svc.lookup_many(&["bogus", SHA]);
+    assert_eq!(reports.len(), 2, "one report per input hash");
+    assert_eq!(reports[0].verdict, RepVerdict::NotQueried);
+    assert!(reports[0]
+        .reasons
+        .iter()
+        .any(|s| s.contains("invalid hash")));
+    assert_eq!(reports[1].verdict, RepVerdict::Clean);
+
+    // All-invalid input still yields reports — and zero requests.
+    let reports = svc.lookup_many(&["bogus", "also-not-hex"]);
+    assert_eq!(reports.len(), 2);
+    assert!(reports.iter().all(|r| r.verdict == RepVerdict::NotQueried));
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "only the valid hash touched the wire"
+    );
+}
+
+#[test]
+fn import_results_skips_malformed_rows() {
+    // A results file containing a row with a non-hash sha256 skips that
+    // row rather than failing the whole batch.
+    let mut bad = parse_vt_file_report(&vt_clean_json(SHA)).unwrap();
+    bad.sha256 = "not-hex".to_string();
+    let good = parse_vt_file_report(&vt_json(SHA, 41, 1, 30, 0)).unwrap();
+    let json = encode_results(&[bad, good]);
+    let svc = ReputationService::new(RepConfig::default());
+    svc.lookup(SHA); // seed the pending queue
+    let n = svc.import_results(&json).unwrap();
+    assert_eq!(n, 1, "the malformed row is skipped, not fatal");
+    assert!(svc.pending_hashes().is_empty());
+    assert_eq!(svc.lookup(SHA).verdict, RepVerdict::Malicious);
+}
+
+#[test]
+fn clean_result_without_threat_label_reports_clean() {
+    let body = format!(
+        r#"{{"data":{{"id":"{SHA}","attributes":{{"sha256":"{SHA}",
+        "last_analysis_stats":{{"harmless":60,"undetected":12}}}}}}}}"#
+    );
+    let svc = service_with(MockTransport::new((200, body)));
+    let r = svc.lookup(SHA);
+    assert_eq!(r.verdict, RepVerdict::Clean);
+    assert!(r.reasons.iter().any(|s| s.contains("clean")));
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline: reputation verdicts other than Malicious feed the assessment.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn analyze_file_suspicious_verdict_without_threat_label() {
+    // 2 flagging engines, no popular-threat label → Suspicious.
+    let body = format!(
+        r#"{{"data":{{"id":"{SHA}","attributes":{{"sha256":"{SHA}",
+        "last_analysis_stats":{{"harmless":60,"malicious":2,"undetected":10}}}}}}}}"#
+    );
+    let svc = service_with(MockTransport::new((200, body)));
+    let cfg = AnalysisConfig {
+        reputation: Some(&svc),
+        ..Default::default()
+    };
+    let entry = file_entry("report.docx");
+    let a = analyze_file(&entry, b"PK\x03\x04\x14\x00\x00\x00", SHA, &cfg);
+    assert_eq!(
+        a.reputation.as_ref().unwrap().verdict,
+        RepVerdict::Suspicious
+    );
+    assert_eq!(a.severity, Severity::Suspicious);
+    assert!(a.summary.contains("VT 2/72"), "{}", a.summary);
+    assert!(a.summary.contains("Suspicious suspicion"), "{}", a.summary);
+    assert!(a
+        .recommended_actions
+        .iter()
+        .any(|s| s.contains("low-confidence")));
+}
+
+#[test]
+fn analyze_file_unknown_hash_recommends_offline_analysis() {
+    let svc = service_with(MockTransport::new((404, "{}".to_string())));
+    let cfg = AnalysisConfig {
+        reputation: Some(&svc),
+        ..Default::default()
+    };
+    let entry = file_entry("report.docx");
+    let a = analyze_file(&entry, b"PK\x03\x04\x14\x00\x00\x00", SHA, &cfg);
+    assert_eq!(a.reputation.as_ref().unwrap().verdict, RepVerdict::Unknown);
+    assert!(a.summary.contains("hash unknown to VT"), "{}", a.summary);
+    assert!(a
+        .recommended_actions
+        .iter()
+        .any(|s| s.contains("unknown to reputation")));
+}
+
+#[test]
+fn rule_scanner_error_and_untagged_hit_become_reasons() {
+    struct ErrScanner;
+    impl RuleScanner for ErrScanner {
+        fn name(&self) -> &str {
+            "err-scanner"
+        }
+        fn scan(&self, _p: &str, _h: &[u8]) -> Result<Vec<RuleHit>, RepError> {
+            Err(RepError::InvalidInput("ruleset failed to compile".to_string()))
+        }
+    }
+    let entry = file_entry("boring.txt");
+    let cfg = AnalysisConfig {
+        scanner: Some(&ErrScanner),
+        ..Default::default()
+    };
+    let a = analyze_file(&entry, b"just text", SHA, &cfg);
+    assert!(a
+        .suspicion
+        .reasons
+        .iter()
+        .any(|r| r.contains("rule scanner failed")));
+
+    struct Untagged;
+    impl RuleScanner for Untagged {
+        fn name(&self) -> &str {
+            "untagged"
+        }
+        fn scan(&self, _p: &str, _h: &[u8]) -> Result<Vec<RuleHit>, RepError> {
+            Ok(vec![RuleHit {
+                rule: "R_no_tags".to_string(),
+                tags: Vec::new(),
+                meta: HashMap::new(),
+                severity: None, // defaults to Suspicious
+            }])
+        }
+    }
+    let cfg = AnalysisConfig {
+        scanner: Some(&Untagged),
+        ..Default::default()
+    };
+    let a = analyze_file(&entry, b"just text", SHA, &cfg);
+    assert_eq!(a.severity, Severity::Suspicious);
+    assert!(a
+        .suspicion
+        .reasons
+        .iter()
+        .any(|r| r.contains("R_no_tags") && r.contains("tags: none")));
+}
+
+#[cfg(not(feature = "sandbox"))]
+#[test]
+fn sandbox_configured_without_feature_is_not_queried() {
+    let cfg = AnalysisConfig {
+        sandbox: Some(&NullSandbox),
+        ..Default::default()
+    };
+    let entry = file_entry("boring.txt");
+    let a = analyze_file(&entry, b"just text", SHA, &cfg);
+    assert!(a.sandbox_verdict.is_none());
+    assert!(a
+        .suspicion
+        .reasons
+        .iter()
+        .any(|r| r.contains("without feature `sandbox`")));
+}
+
+// ---------------------------------------------------------------------------
+// Masquerade: the escalation-rule branches that no real image reliably hits.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mismatch_with_benign_content_raises_floor_to_suspicious() {
+    // Extension/content disagree but the detected type is benign and
+    // sutram-magic left severity at Info — masquerade still raises it.
+    let magic = MagicVerdict {
+        declared: Some(sutram_magic::MagicType::Png),
+        detected: Some(sutram_magic::MagicType::Gif87),
+        mismatch: true,
+        severity: Severity::Info,
+        reasons: vec!["png extension, gif content".to_string()],
+    };
+    let entry = file_entry("photo.png");
+    let sus = analyze_masquerade(&entry, &magic);
+    assert_eq!(sus.severity, Severity::Suspicious);
+    assert!(sus
+        .recommended_actions
+        .iter()
+        .any(|a| a.contains("manually inspect")));
+}
+
+#[test]
+fn polyglot_severity_without_mismatch_recommends_carving() {
+    let magic = MagicVerdict {
+        declared: Some(sutram_magic::MagicType::Png),
+        detected: Some(sutram_magic::MagicType::Png),
+        mismatch: false,
+        severity: Severity::Suspicious, // raised by sutram-magic's polyglot rule
+        reasons: vec!["multiple signatures present".to_string()],
+    };
+    let entry = file_entry("photo.png");
+    let sus = analyze_masquerade(&entry, &magic);
+    assert_eq!(sus.severity, Severity::Suspicious);
+    assert!(sus
+        .recommended_actions
+        .iter()
+        .any(|a| a.contains("polyglot")));
+}
+
+#[test]
+fn code_content_with_no_declared_extension_is_noted() {
+    // No extension → no declared type. Not a masquerade, but executable
+    // material still earns a reason line.
+    let entry = file_entry("payload");
+    let magic = check_entry(&entry.name, b"MZ\x90\x00\x03\x00\x00\x00PE\0\0");
+    assert!(magic.declared.is_none());
+    assert!(!magic.mismatch);
+    let sus = analyze_masquerade(&entry, &magic);
+    assert!(sus
+        .reasons
+        .iter()
+        .any(|r| r.contains("no declared extension")));
+}
+
+// ---------------------------------------------------------------------------
+// Error/verdict surface coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rep_error_source_and_from_io() {
+    use std::error::Error;
+    let e: RepError = std::io::Error::other("disk gone").into();
+    assert!(matches!(e, RepError::Io(_)));
+    assert!(e.source().is_some(), "Io carries the source error");
+    assert!(RepError::Parse("x".to_string()).source().is_none());
+    assert!(RepError::Transport("x".to_string()).source().is_none());
+}
+
+#[test]
+fn rep_verdict_display_all_variants() {
+    assert_eq!(RepVerdict::Clean.to_string(), "clean");
+    assert_eq!(RepVerdict::Suspicious.to_string(), "suspicious");
+    assert_eq!(RepVerdict::Malicious.to_string(), "malicious");
+    assert_eq!(RepVerdict::Unknown.to_string(), "unknown");
+    assert_eq!(RepVerdict::NotQueried.to_string(), "not queried");
 }

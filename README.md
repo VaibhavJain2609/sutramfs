@@ -8,8 +8,8 @@ escalation, optional rule-scanner hits, a combined severity, merged
 recommended actions, and a one-line court-explainable summary such as:
 
 ```text
-/docs/invoice.docx: declared OOXML document (docx); content is PE/COFF
-Windows executable; VT 41/72 engines flag trojan.x/dloader → High suspicion
+/docs/invoice.docx: declared OOXML document; content is PE/COFF Windows
+executable; VT 41/72 engines flag trojan.x/dloader → High suspicion
 ```
 
 ## Forensic design
@@ -89,11 +89,16 @@ for entry in fs.walk().flatten() {
 }
 
 // Later, on a connected host:
-//   let pending = rep.export_pending();          // → JSON file → USB
-//   let online = ReputationService::virustotal(&key);   // feature `net`
-//   let reports = online.lookup_many(&hashes);
-//   let results = encode_results(&reports' VtResults); // → USB back
-//   rep.import_results(&results);
+//   let pending = rep.export_pending();               // → JSON file → USB
+//   let hashes = decode_pending(&pending).unwrap();
+//   let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+//   let online = ReputationService::virustotal(&key); // feature `net`
+//   let reports = online.lookup_many(&refs);
+//   let vts: Vec<VtResult> =
+//       reports.iter().filter_map(|r| r.vt.clone()).collect();
+//   let results = encode_results(&vts);               // → USB back
+//   rep.import_results(&results).unwrap();            // fills the cache,
+//                                                     // clears pending
 ```
 
 The `RuleScanner` trait is the YARA hook point — implement it over

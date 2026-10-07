@@ -291,10 +291,10 @@ impl ReputationService {
             .filter(|h| seen.insert(h.clone()))
             .collect();
 
-        if unique.is_empty() {
-            return Vec::new();
-        }
-
+        // No early return on empty `unique`: the contract is one report
+        // per input hash, so all-invalid input must still yield a
+        // `NotQueried` report per input via the merge below. An empty
+        // queue simply means the workers exit immediately.
         let workers = if self.is_offline() {
             1
         } else {
