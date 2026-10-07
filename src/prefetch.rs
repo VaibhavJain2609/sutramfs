@@ -159,12 +159,10 @@ impl Prefetch {
                 // (220- and 212-byte). The metrics-array offset at file
                 // info +0 disambiguates: 0x130 → run count @0xD0,
                 // 0x128 → @0xC8.
-                let metrics = u32::from_le_bytes([
-                    data[HEADER_LEN],
-                    data[HEADER_LEN + 1],
-                    data[HEADER_LEN + 2],
-                    data[HEADER_LEN + 3],
-                ]);
+                let metrics = data
+                    .get(HEADER_LEN..HEADER_LEN + 4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])))
+                    .unwrap_or(0);
                 let rc = match metrics {
                     0x128 => {
                         warnings.push("v30 variant-2 layout (metrics @0x128)".into());
@@ -235,10 +233,10 @@ impl Prefetch {
 mod tests {
     use super::*;
 
-    fn w32(b: &mut Vec<u8>, off: usize, v: u32) {
+    fn w32(b: &mut [u8], off: usize, v: u32) {
         b[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
-    fn w64(b: &mut Vec<u8>, off: usize, v: u64) {
+    fn w64(b: &mut [u8], off: usize, v: u64) {
         b[off..off + 8].copy_from_slice(&v.to_le_bytes());
     }
 

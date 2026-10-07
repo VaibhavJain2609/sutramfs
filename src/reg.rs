@@ -268,7 +268,7 @@ impl Hive {
                 data[off + 10],
                 data[off + 11],
             ]) as usize;
-            if size < HBIN_HEADER || off.checked_add(size).map_or(true, |e| e > data.len()) {
+            if size < HBIN_HEADER || off.checked_add(size).is_none_or(|e| e > data.len()) {
                 warnings.push(format!("bad hbin size {size:#x} at {off:#x}"));
                 break;
             }

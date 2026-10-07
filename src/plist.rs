@@ -161,7 +161,7 @@ impl Bplist {
             offset: toff as u64,
             msg: "offset table size overflow".into(),
         })?;
-        if ot_off < 8 || ot_off.checked_add(ot_len).map_or(true, |e| e > toff) {
+        if ot_off < 8 || ot_off.checked_add(ot_len).is_none_or(|e| e > toff) {
             return Err(Error::Corrupt {
                 offset: toff as u64,
                 msg: format!(
@@ -426,7 +426,7 @@ fn checked_pow2(info: u8, off: usize) -> Result<u32> {
 
 /// Bounds-checked slice, `Truncated` on overrun.
 fn take(data: &[u8], pos: usize, n: usize) -> Result<&[u8]> {
-    if pos.checked_add(n).map_or(true, |e| e > data.len()) {
+    if pos.checked_add(n).is_none_or(|e| e > data.len()) {
         return Err(Error::Truncated {
             offset: pos as u64,
             needed: n as u64,

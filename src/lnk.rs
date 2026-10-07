@@ -807,9 +807,8 @@ mod tests {
         ] {
             let r = LnkFile::parse(&full[..cut]);
             // Must never panic; partial results or an error both fine.
-            match r {
-                Ok(f) => assert!(f.end_offset <= cut),
-                Err(_) => {}
+            if let Ok(f) = r {
+                assert!(f.end_offset <= cut);
             }
         }
     }
