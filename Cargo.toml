@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 description = "XFS forensic filesystem parser (v5 CRC inodes/dirs, inobt/finobt deleted-inode recovery, free-space carving)"
 keywords = ["forensics", "filesystem", "xfs", "dfir", "carving"]
 categories = ["filesystem", "parsing"]
+exclude = ["fuzz/"]
 
 [dependencies]
 sutram-io = { path = "../sutram-io", version = "0.1" }

@@ -1068,3 +1068,545 @@ fn second_allocation_group_scanned() {
         "ranges: {ranges:?}"
     );
 }
+
+// ---- bmbt interior nodes + reader/recovery edges -----------------------------
+
+#[test]
+fn bmbt_interior_node_walked() {
+    // format=BTREE data fork whose in-inode root is level 2:
+    // root → interior 'BMA3' node (fsb 40) → leaf (fsb 42) → extent.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("deep", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_data(41, b"deep-btree!");
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 3,
+            size: 11,
+            nblocks: 1,
+            ..Default::default()
+        },
+    );
+    {
+        let pos = i.ino_pos(65);
+        let ib = &mut i.b[pos..pos + ISZ];
+        let fork = &mut ib[176..];
+        fork.fill(0);
+        w16(fork, 0, 2); // level 2 → children are interior nodes
+        w16(fork, 2, 1); // numrecs
+        let maxrecs = (fork.len() - 4) / 16;
+        w64(fork, 4, 0); // key[0] = fileoff 0
+        w64(fork, 4 + maxrecs * 8, 40); // ptr[0] → fsb 40
+        write_crc(ib, 100);
+    }
+    // Interior node at fsb 40: BMA3 level 1, 1 rec → ptr to leaf fsb 42.
+    {
+        let blk = i.blk_mut(40);
+        w32(blk, 0, 0x424D_4133); // 'BMA3'
+        w16(blk, 4, 1); // level 1 = interior
+        w16(blk, 6, 1); // numrecs
+        w64(blk, 8, u64::MAX); // leftsib
+        w64(blk, 16, u64::MAX); // rightsib
+        w64(blk, 24, 40); // blkno
+        blk[40..56].copy_from_slice(&UUID);
+        w64(blk, 56, 65); // owner
+        let maxrecs = (BS - 72) / 16; // key/ptr pairs
+        w64(blk, 72, 0); // key[0] = fileoff 0
+        w64(blk, 72 + maxrecs * 8, 42); // ptr[0] → leaf at fsb 42
+        write_crc(blk, 64); // lblock crc is __le32
+    }
+    // Leaf at fsb 42 with the real extent record → fsb 41.
+    {
+        let blk = i.blk_mut(42);
+        w32(blk, 0, 0x424D_4133);
+        w16(blk, 4, 0); // leaf
+        w16(blk, 6, 1);
+        w64(blk, 8, u64::MAX);
+        w64(blk, 16, u64::MAX);
+        w64(blk, 24, 42);
+        blk[40..56].copy_from_slice(&UUID);
+        w64(blk, 56, 65);
+        let rec = extent_rec(&ExtentSpec { fileoff: 0, fsb: 41, len: 1, unwritten: false });
+        blk[72..88].copy_from_slice(&rec);
+        write_crc(blk, 64);
+    }
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 12), (43, 21), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().collect::<Result<_, _>>().expect("walk");
+    let e = entries.iter().find(|e| e.path == "/deep").expect("deep file");
+    assert_eq!(e.allocated_ranges, vec![(41 * 4096, 4096)]);
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"deep-btree!");
+}
+
+#[test]
+fn bmbt_leaf_numrecs_over_capacity_is_lenient() {
+    // Leaf 'BMA3' claims more records than the block can hold → a walk
+    // error record, but the file entry is still emitted (lenient) and
+    // read_file surfaces the decode error instead of panicking.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("over", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 3,
+            size: 11,
+            nblocks: 1,
+            ..Default::default()
+        },
+    );
+    {
+        let pos = i.ino_pos(65);
+        let ib = &mut i.b[pos..pos + ISZ];
+        let fork = &mut ib[176..];
+        fork.fill(0);
+        w16(fork, 0, 1);
+        w16(fork, 2, 1);
+        let maxrecs = (fork.len() - 4) / 16;
+        w64(fork, 4 + maxrecs * 8, 40);
+        write_crc(ib, 100);
+    }
+    {
+        let blk = i.blk_mut(40);
+        w32(blk, 0, 0x424D_4133);
+        w16(blk, 4, 0);
+        w16(blk, 6, 0xFFFF); // numrecs way over leaf capacity
+        w64(blk, 8, u64::MAX);
+        w64(blk, 16, u64::MAX);
+        w64(blk, 24, 40);
+        blk[40..56].copy_from_slice(&UUID);
+        w64(blk, 56, 65);
+        write_crc(blk, 64);
+    }
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    let mut oks = 0;
+    let mut errs = 0;
+    let mut over = None;
+    for r in fs.walk() {
+        match r {
+            Ok(e) => {
+                if e.path == "/over" {
+                    over = Some(e);
+                }
+                oks += 1;
+            }
+            Err(_) => errs += 1,
+        }
+    }
+    assert!(errs >= 1, "expected a walk error record");
+    let over = over.expect("/over entry still emitted");
+    assert!(over.allocated_ranges.is_empty());
+    assert!(fs.read_file(&over).is_err(), "read of bad bmbt must error");
+    let _ = oks;
+}
+
+#[test]
+fn bmbt_interior_numrecs_over_capacity_is_lenient() {
+    // Same fault one level up: the *interior* node claims more children
+    // than the block's key/ptr capacity → walk error, entry survives.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("over2", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 3,
+            size: 11,
+            nblocks: 1,
+            ..Default::default()
+        },
+    );
+    {
+        let pos = i.ino_pos(65);
+        let ib = &mut i.b[pos..pos + ISZ];
+        let fork = &mut ib[176..];
+        fork.fill(0);
+        w16(fork, 0, 2); // level 2 → children are interior nodes
+        w16(fork, 2, 1);
+        let maxrecs = (fork.len() - 4) / 16;
+        w64(fork, 4 + maxrecs * 8, 40);
+        write_crc(ib, 100);
+    }
+    {
+        let blk = i.blk_mut(40);
+        w32(blk, 0, 0x424D_4133);
+        w16(blk, 4, 1); // interior
+        w16(blk, 6, 0xFFFF); // numrecs way over node capacity
+        w64(blk, 8, u64::MAX);
+        w64(blk, 16, u64::MAX);
+        w64(blk, 24, 40);
+        blk[40..56].copy_from_slice(&UUID);
+        w64(blk, 56, 65);
+        write_crc(blk, 64);
+    }
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    assert!(fs.walk().any(|r| r.is_err()), "expected a walk error record");
+}
+
+#[test]
+fn dir_with_non_dir_fork_format_is_walk_error() {
+    // A directory inode whose di_format is DEV — dir_entries and the
+    // walker's process_dir must both turn it into error records.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("weirddir", 65, T_DIR)]),
+            ..Default::default()
+        },
+    );
+    i.write_inode(
+        65,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 0, // DEV — nonsense for a directory
+            size: BS as u64,
+            nlink: 2,
+            ..Default::default()
+        },
+    );
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    let mut errs = 0;
+    let mut dir_seen = false;
+    for r in fs.walk() {
+        match r {
+            Ok(e) if e.path == "/weirddir" => dir_seen = true,
+            Ok(_) => {}
+            Err(_) => errs += 1,
+        }
+    }
+    assert!(dir_seen, "the dir entry itself is still emitted");
+    assert!(errs >= 1, "non-dir fork format must error, not panic");
+}
+
+#[test]
+fn deleted_btree_fork_decode_failure_is_unknown() {
+    // Deleted inode (free bit set, residue present) whose data fork is a
+    // corrupt bmbt root → RecoveryState::Unknown with an honest note.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("a", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 2,
+            size: 6,
+            extents: vec![ExtentSpec { fileoff: 0, fsb: 24, len: 1, unwritten: false }],
+            ..Default::default()
+        },
+    );
+    // ino 130 (chunk 128, all-free): format=BTREE, numrecs > capacity.
+    i.write_inode(
+        130,
+        &InodeSpec {
+            format: 3,
+            size: 4096,
+            nlink: 0,
+            nblocks: 1,
+            ..Default::default()
+        },
+    );
+    {
+        let pos = i.ino_pos(130);
+        let ib = &mut i.b[pos..pos + ISZ];
+        let fork = &mut ib[176..];
+        fork.fill(0);
+        w16(fork, 0, 1);
+        w16(fork, 2, 0xFFFF);
+        write_crc(ib, 100);
+    }
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free: !0b11u64 });
+    i.inobt.push(ChunkRec { startino: 128, freecount: 64, free: u64::MAX });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().filter_map(|r| r.ok()).collect();
+    let d = entries
+        .iter()
+        .find(|e| e.entry_id == 130)
+        .expect("deleted ino 130");
+    assert!(
+        matches!(d.status, FsEntryStatus::Deleted { recovery: RecoveryState::Unknown }),
+        "status {:?}",
+        d.status
+    );
+    assert!(
+        d.meta.values().any(|v| v.contains("extent decode failed")),
+        "meta: {:?}",
+        d.meta
+    );
+}
+
+#[test]
+fn sparse_tail_hole_zero_fills() {
+    // Extent covers fileoff 0 only; size spans two blocks → the tail is a
+    // hole that must read back as zeros (SparseReader's no-extent arm).
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("tail", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_data(24, b"EDGE");
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 2,
+            size: 2 * BS as u64,
+            nblocks: 1,
+            extents: vec![ExtentSpec { fileoff: 0, fsb: 24, len: 1, unwritten: false }],
+            ..Default::default()
+        },
+    );
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().collect::<Result<_, _>>().expect("walk");
+    let e = entries.iter().find(|e| e.path == "/tail").expect("tail file");
+    let mut buf = Vec::new();
+    fs.read_file(e).unwrap().read_to_end(&mut buf).unwrap();
+    assert_eq!(buf.len(), 2 * BS);
+    assert_eq!(&buf[..4], b"EDGE");
+    assert!(buf[BS..].iter().all(|&b| b == 0), "tail hole not zeros");
+}
+
+#[test]
+fn slack_when_eof_lands_in_second_extent() {
+    // Two 1-block extents, size lands inside the second → slack_offset
+    // must be computed against that extent, not the first.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("s", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_data(24, b"DATA");
+    i.write_data(25, b"TAIL");
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 2,
+            size: BS as u64 + 10,
+            nblocks: 2,
+            extents: vec![
+                ExtentSpec { fileoff: 0, fsb: 24, len: 1, unwritten: false },
+                ExtentSpec { fileoff: 1, fsb: 25, len: 1, unwritten: false },
+            ],
+            ..Default::default()
+        },
+    );
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().collect::<Result<_, _>>().expect("walk");
+    let e = entries.iter().find(|e| e.path == "/s").expect("s file");
+    assert_eq!(
+        e.meta.get("slack_offset").map(String::as_str),
+        Some(format!("{:#x}", 25 * BS + 10).as_str())
+    );
+    assert_eq!(
+        e.meta.get("slack_len").map(String::as_str),
+        Some(format!("{}", BS - 10).as_str())
+    );
+}
+
+#[test]
+fn dirent_with_out_of_geometry_ino_is_walk_error() {
+    // A dirent pointing at an inode number beyond the filesystem's
+    // geometry → error record via inode_bytes' ino_valid check.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("ghost", 0xFFFF_FFFF, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.inobt.push(ChunkRec { startino: 64, freecount: 63, free: !0b1u64 });
+    i.free = vec![(28, 36), (64, 448)];
+    let fs = mount(i.finish());
+    assert!(fs.walk().any(|r| r.is_err()));
+}
+
+#[test]
+fn btree_leaf_crc_mismatch_still_decodes_lenient() {
+    // bnobt leaf CRC fails → error record, but records are still decoded
+    // (lenient forensic policy) so unallocated_ranges stays populated.
+    let mut img = weird_image();
+    img[4096 + 100] ^= 0xFF; // inside the bnobt leaf's record area
+    let fs = mount(img);
+    assert!(fs.walk().any(|r| r.is_err()));
+    assert!(
+        !fs.unallocated_ranges().is_empty(),
+        "leaf must still be decoded despite the bad CRC"
+    );
+    // Same for the inobt leaf: free-inode residue scan still runs.
+    let mut img2 = weird_image();
+    img2[2 * 4096 + 100] ^= 0xFF;
+    let fs2 = mount(img2);
+    let entries: Vec<_> = fs2.walk().filter_map(|r| r.ok()).collect();
+    assert!(entries.iter().any(|e| e.entry_id == 74));
+}
+
+#[test]
+fn source_returns_the_mounted_bytes() {
+    let img = weird_image();
+    let len = img.len() as u64;
+    let fs = mount(img);
+    let s = fs.source();
+    assert_eq!(s.len(), len);
+    // And it is actually readable — the superblock magic survives.
+    let b = s.read_slice(0, 4).unwrap();
+    assert_eq!(b, 0x5846_5342u32.to_be_bytes());
+}
+
+#[test]
+fn remote_xattr_value_is_reported_not_fetched() {
+    // Attr leaf with a *remote* value bigger than the eager-fetch bound →
+    // meta reports "N bytes (remote)" without reading XARM blocks.
+    let mut i = Img::new();
+    i.write_inode(
+        ROOTINO,
+        &InodeSpec {
+            mode: 0o40755,
+            format: 1,
+            size: 6,
+            inline_data: sf_dir(ROOTINO, &[("x", 65, T_FILE)]),
+            ..Default::default()
+        },
+    );
+    i.write_data(24, b"data");
+    i.write_inode(
+        65,
+        &InodeSpec {
+            format: 2,
+            size: 4,
+            extents: vec![ExtentSpec { fileoff: 0, fsb: 24, len: 1, unwritten: false }],
+            ..Default::default()
+        },
+    );
+    // Split the fork: forkoff=2 (16 B dfork = the single data extent rec),
+    // afork at 176+16 holds one extent rec → attr leaf at fsb 43.
+    {
+        let pos = i.ino_pos(65);
+        let ib = &mut i.b[pos..pos + ISZ];
+        ib[82] = 2; // di_forkoff (8-byte units)
+        ib[83] = 2; // di_aformat = EXTENTS
+        w16(ib, 80, 1); // anextents
+        let rec = extent_rec(&ExtentSpec { fileoff: 0, fsb: 43, len: 1, unwritten: false });
+        ib[176 + 16..176 + 32].copy_from_slice(&rec);
+        write_crc(ib, 100);
+    }
+    // Attr leaf v3 at fsb 43: count 1, one remote entry named "user.huge".
+    {
+        let blk = i.blk_mut(43);
+        w16(blk, 8, 0x3BEE); // XFS_ATTR3_LEAF_MAGIC in da3 blkinfo
+        w64(blk, 24, 43); // blkno
+        blk[40..56].copy_from_slice(&UUID);
+        w16(blk, 56, 1); // hdr count
+        // entry[0] at 80: {hash u32, nameidx u16, flags u8, pad u8}
+        w32(blk, 80, 0xDEAD_BEEF);
+        w16(blk, 84, 256); // nameidx
+        blk[86] = 0; // flags: remote, user namespace
+        // name block at 256: {valueblk u32, valuelen u32, namelen u8, name}
+        w32(blk, 256, 1); // valueblk
+        w32(blk, 260, 5000); // valuelen > eager-fetch bound
+        blk[264] = 4;
+        blk[265..269].copy_from_slice(b"huge");
+        write_crc_be(blk, 12); // da3 crc is __be32 at blkinfo+4
+    }
+    let free = !0b11u64;
+    i.inobt.push(ChunkRec { startino: 64, freecount: 62, free });
+    i.free = vec![(28, 15), (44, 20), (64, 448)];
+    let fs = mount(i.finish());
+    let entries: Vec<_> = fs.walk().collect::<Result<_, _>>().expect("walk");
+    let e = entries.iter().find(|e| e.path == "/x").expect("x file");
+    assert_eq!(e.meta.get("xattr_count").map(String::as_str), Some("1"));
+    assert_eq!(
+        e.meta.get("xattr_user_huge").map(String::as_str),
+        Some("5000 bytes (remote)")
+    );
+}
+
+#[test]
+fn truncated_image_surfaces_error_records() {
+    // Keep the sb + AG headers + btree leaves (blocks 0-3) but cut the
+    // inode chunk (block 4+) — mount succeeds leniently and the inode
+    // reads arrive as Truncated error records in the walk stream.
+    let img = weird_image();
+    let short = img[..4 * BS].to_vec();
+    let fs = XfsParser.mount(src(short)).expect("lenient mount");
+    let mut errs = 0;
+    let mut saw_truncated = false;
+    for r in fs.walk() {
+        if let Err(e) = r {
+            errs += 1;
+            saw_truncated |= matches!(e, sutram_fs::FsError::Truncated { .. });
+        }
+    }
+    assert!(errs > 0, "expected error records");
+    assert!(saw_truncated, "expected a Truncated record, got {errs} errors");
+}

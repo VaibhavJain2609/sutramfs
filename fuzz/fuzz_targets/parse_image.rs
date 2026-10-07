@@ -8,11 +8,12 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use std::io::Read;
 use sutram_fs::FsParser;
 use sutram_io::ByteSource;
 
 /// Cap on walk/read work per input so a degenerate image can't burn the
-//! whole budget in one case.
+/// whole budget in one case.
 const MAX_ENTRIES: usize = 2048;
 const MAX_READ: u64 = 1 << 20;
 
@@ -25,8 +26,9 @@ fuzz_target!(|data: &[u8]| {
         let _ = fs.unallocated_ranges();
         for item in fs.walk().take(MAX_ENTRIES) {
             if let Ok(e) = item {
-                if let Ok(mut r) = fs.read_file(&e) {
-                    let _ = std::io::copy(&mut r, &mut std::io::sink());
+                if let Ok(r) = fs.read_file(&e) {
+                    let mut capped = r.take(MAX_READ);
+                    let _ = std::io::copy(&mut capped, &mut std::io::sink());
                 }
                 let _ = e;
             }

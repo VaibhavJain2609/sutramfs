@@ -110,3 +110,8 @@ a two-level inobt walk (node → leaf pointer-area layout).
   (the free-run header overwrites them) — flagged via `ino_truncated`.
 * v4 filesystems parse; v4 CRC variants and mixed-version metadata
   combinations are exercised only lightly.
+
+## License
+
+Dual-licensed under MIT or Apache-2.0 (`LICENSE-MIT` / `LICENSE-APACHE`),
+matching every other crate in the SUTRAM-FS family.
