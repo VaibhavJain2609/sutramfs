@@ -230,3 +230,247 @@ fn trait_surface_object_safe_and_works() {
     let n = fs3.read_file_at(&live, 4096, &mut buf).unwrap();
     assert_eq!(n, 0);
 }
+
+#[test]
+fn default_trait_methods_are_empty() {
+    // journal_entries / unallocated_ranges default to "nothing to report".
+    let src: Arc<dyn ByteSource> = Arc::new(vec![0u8; 16]);
+    let fs = TinyParser.mount(src).unwrap();
+    assert_eq!(fs.journal_entries().count(), 0);
+    assert!(fs.unallocated_ranges().is_empty());
+}
+
+// A filesystem whose walk is one corruption record: `deleted_entries` must
+// surface walk errors, not swallow them.
+struct FailFs;
+
+impl FileSystem for FailFs {
+    fn info(&self) -> FsInfo {
+        FsInfo::default()
+    }
+    fn source(&self) -> Arc<dyn ByteSource> {
+        Arc::new(Vec::new())
+    }
+    fn walk(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        Box::new(vec![Err(FsError::corrupt(0x40, "bad dirent"))].into_iter())
+    }
+    fn read_file(&self, _e: &FsEntry) -> Result<Box<dyn std::io::Read + Send>> {
+        Err(FsError::NotFound { path: "n/a".into() })
+    }
+}
+
+#[test]
+fn deleted_entries_passes_error_items_through() {
+    let items: Vec<_> = FailFs.deleted_entries().collect();
+    assert_eq!(items.len(), 1);
+    assert!(matches!(
+        &items[0],
+        Err(FsError::Corrupt { offset: 0x40, .. })
+    ));
+}
+
+// A source that fails every read exercises CarveIter's `Err` item path.
+struct BadSrc;
+
+impl ByteSource for BadSrc {
+    fn len(&self) -> u64 {
+        8192
+    }
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("device gone"))
+    }
+}
+
+#[test]
+fn carve_region_yields_io_error_items() {
+    let fs = TinyFs {
+        src: Arc::new(BadSrc) as Arc<dyn ByteSource>,
+    };
+    let items: Vec<_> = fs.carve_region(0, 64, 8).unwrap().collect();
+    assert_eq!(items.len(), 8); // one Err per probe offset, no panic
+    assert!(items.iter().all(|i| matches!(i, Err(FsError::Io(_)))));
+}
+
+// ---------------------------------------------------------------------------
+// bounded carving
+// ---------------------------------------------------------------------------
+
+/// Assemble a real 45-byte PNG: signature + IHDR + IEND.
+fn test_png() -> Vec<u8> {
+    let mut p = b"\x89PNG\x0D\x0A\x1A\x0A".to_vec();
+    // IHDR: len 13, type, 13 data bytes, crc
+    p.extend_from_slice(&13u32.to_be_bytes());
+    p.extend_from_slice(b"IHDR");
+    p.extend_from_slice(&[0u8; 13]);
+    p.extend_from_slice(&[0u8; 4]);
+    // IEND: len 0, type, crc
+    p.extend_from_slice(&0u32.to_be_bytes());
+    p.extend_from_slice(b"IEND");
+    p.extend_from_slice(&[0u8; 4]);
+    p
+}
+
+#[test]
+fn carve_bounds_png_extent_exactly() {
+    let png = test_png();
+    let mut img = vec![0u8; 8192];
+    img[512..512 + png.len()].copy_from_slice(&png);
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = TinyFs { src };
+    let hits: Vec<_> = fs
+        .carve_region(0, 8192, 512)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    let h = &hits[0];
+    assert_eq!(h.kind, MagicType::Png);
+    assert_eq!(h.offset, 512);
+    assert!(h.exact);
+    // signature + IHDR(25) + IEND(12)
+    assert_eq!(h.len as usize, png.len());
+}
+
+#[test]
+fn carve_bounds_jpeg_by_footer() {
+    let mut img = vec![0u8; 8192];
+    // JPEG: SOI + APP0-ish data + EOI at 1024..1026
+    img[1024] = 0xFF;
+    img[1025] = 0xD8;
+    img[1026] = 0xFF;
+    img[1027] = 0xE0;
+    img[2000] = 0xAA;
+    img[3000] = 0xFF;
+    img[3001] = 0xD9;
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = TinyFs { src };
+    let hits: Vec<_> = fs
+        .carve_region(0, 8192, 512)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let jpg = hits.iter().find(|h| h.kind == MagicType::Jpeg).unwrap();
+    assert_eq!(jpg.offset, 1024);
+    assert_eq!(jpg.len, 3002 - 1024);
+    assert!(jpg.exact);
+}
+
+#[test]
+fn carve_to_next_signature_when_unbounded() {
+    // Two objects with ToNextHit bounds (e.g. zlib streams) carved
+    // back-to-back: the second's header ends the first's extent.
+    let mut img = vec![0u8; 8192];
+    img[512..514].copy_from_slice(b"\x78\x9C");
+    img[1024..1026].copy_from_slice(b"\x78\x01");
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = TinyFs { src };
+    let hits: Vec<_> = fs
+        .carve_region(0, 8192, 512)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].kind, MagicType::Zlib);
+    assert_eq!(hits[0].offset, 512);
+    assert_eq!(hits[0].len, 512); // next hit at 1024 bounds it
+    assert!(!hits[0].exact);
+    assert_eq!(hits[1].offset, 1024);
+}
+
+#[test]
+fn carve_zip_eocd_extents() {
+    let mut img = vec![0u8; 8192];
+    // fake zip: LFH + data + EOCD record (22 bytes, comment_len 0)
+    img[512..516].copy_from_slice(b"PK\x03\x04");
+    let eocd = 1024usize;
+    img[eocd..eocd + 4].copy_from_slice(b"PK\x05\x06");
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = TinyFs { src };
+    let hits: Vec<_> = fs
+        .carve_region(0, 8192, 512)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    // one Zip hit at 512, extent through EOCD end; the EOCD record's own
+    // signature is inside the carved span and must not double-report.
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].kind, MagicType::Zip);
+    assert_eq!(hits[0].offset, 512);
+    assert_eq!(hits[0].len as usize, eocd + 22 - 512);
+    assert!(hits[0].exact);
+}
+
+#[test]
+fn carve_exact_flag_distinguishes_capped() {
+    // A PDF header with no %%EOF inside the region → capped, not exact.
+    let mut img = vec![0u8; 4096];
+    img[512..517].copy_from_slice(b"%PDF-");
+    let src: Arc<dyn ByteSource> = Arc::new(img);
+    let fs = TinyFs { src };
+    let hits: Vec<_> = fs
+        .carve_region(0, 4096, 512)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].kind, MagicType::Pdf);
+    assert!(!hits[0].exact);
+}
+
+#[test]
+fn unix_nanos_rejects_invalid_and_absurd_fields() {
+    assert_eq!(util::unix_nanos(2000, 0, 1, 0, 0, 0, 0), None); // month 0
+    assert_eq!(util::unix_nanos(2000, -3, 1, 0, 0, 0, 0), None); // month < 0
+    assert_eq!(util::unix_nanos(2000, 1, 0, 0, 0, 0, 0), None); // day 0
+    assert_eq!(util::unix_nanos(2000, 1, 32, 0, 0, 0, 0), None); // day 32
+    assert_eq!(util::unix_nanos(2000, 1, 1, 0, -1, 0, 0), None); // min < 0
+    assert_eq!(util::unix_nanos(2000, 1, 1, 0, 60, 0, 0), None); // min 60
+    assert_eq!(util::unix_nanos(2000, 1, 1, 0, 0, -1, 0), None); // sec < 0
+    assert_eq!(util::unix_nanos(2000, 1, 1, 0, 0, 60, 0), None); // sec 60
+    assert_eq!(util::unix_nanos(2000, 1, 1, 0, 0, 0, -1), None); // nanos < 0
+    assert_eq!(util::unix_nanos(2000, 1, 1, 0, 0, 0, 1_000_000_000), None);
+    // Absurd years return None instead of overflowing (hostile fields).
+    assert_eq!(util::unix_nanos(i64::MAX / 2, 1, 1, 0, 0, 0, 0), None);
+    assert_eq!(util::unix_nanos(i64::MIN / 2, 1, 1, 0, 0, 0, 0), None);
+    assert_eq!(util::unix_nanos(i64::MIN, 1, 1, 0, 0, 0, 0), None);
+    // End-of-day stays in the same day; century leap-year rules.
+    assert_eq!(
+        util::unix_nanos(1970, 1, 1, 23, 59, 59, 999_999_999),
+        Some(86_399_999_999_999)
+    );
+    assert_eq!(util::unix_nanos(2100, 2, 29, 0, 0, 0, 0), None); // %100 non-leap
+    // (the %400 leap rule is exercised by year 2000 in unix_nanos_known_dates)
+    // Dates outside ~1678..2262 overflow i64 nanoseconds → None, not a panic.
+    assert_eq!(util::unix_nanos(2400, 1, 1, 0, 0, 0, 0), None);
+    assert_eq!(util::unix_nanos(1600, 1, 1, 0, 0, 0, 0), None);
+}
+
+#[test]
+fn util_edge_cases() {
+    assert_eq!(util::join_path("", "x"), "/x");
+    assert_eq!(util::sanitize_name(""), "");
+    assert_eq!(util::sanitize_name("a\nb\tc\u{7f}"), "a_b_c_");
+    assert_eq!(util::sanitize_name("plain"), "plain");
+    assert_eq!(util::orphan_path(0), "/$ORPHANED/0x0");
+    assert_eq!(util::orphan_path(u64::MAX), "/$ORPHANED/0xffffffffffffffff");
+}
+
+#[test]
+fn fstimestamp_value_is_optional_never_fabricated() {
+    use std::time::Duration;
+    let unset = FsTimestamp {
+        value: None,
+        raw_value: 0,
+        raw_encoding: "fat-dos-datetime",
+        granularity: Duration::from_secs(2),
+    };
+    assert!(unset.value.is_none());
+    assert_eq!(unset.granularity, Duration::from_secs(2));
+    let set = FsTimestamp {
+        value: util::unix_nanos(2020, 1, 1, 0, 0, 0, 0),
+        raw_value: 0x9C21,
+        raw_encoding: "fat-dos-datetime",
+        granularity: Duration::from_secs(2),
+    };
+    assert_eq!(set.value, Some(1_577_836_800_000_000_000)); // 2020-01-01 UTC
+}

@@ -42,11 +42,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod carve;
 mod error;
 mod traits;
 mod types;
 pub mod util;
 
+pub use carve::CarveOptions;
 pub use error::{FsError, Result};
 pub use traits::{FileSystem, FsParser, MountOptions};
 pub use types::{

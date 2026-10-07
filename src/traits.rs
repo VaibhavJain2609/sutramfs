@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use sutram_io::ByteSource;
 
+use crate::carve::CarveOptions;
 use crate::types::{CarveHit, DetectConfidence, FsEntry, FsInfo};
 use crate::{FsError, Result};
 
@@ -164,61 +165,27 @@ pub trait FileSystem: Send + Sync {
     /// Scan `[offset, offset+len)` for embedded file signatures via
     /// `sutram-magic`, at `align`-byte boundaries (512 covers every FS).
     ///
-    /// The default implementation is honest but naive — block-aligned header
-    /// probing. Parsers with format knowledge (e.g. FAT knows cluster
-    /// alignment, NTFS knows MFT records) should override.
+    /// Hits are *bounded* — each [`CarveHit`]'s `len` is the object's
+    /// real extent where the format allows it (footer scan, declared
+    /// size, chunk/box walk), marked `exact`; otherwise the extent runs
+    /// to the next signature or a per-type cap. Parsers with format
+    /// knowledge (e.g. FAT knows cluster alignment, NTFS knows MFT
+    /// records) may override.
     fn carve_region(
         &self,
         offset: u64,
         len: u64,
         align: u64,
     ) -> Result<Box<dyn Iterator<Item = Result<CarveHit>> + Send + '_>> {
-        if align == 0 {
-            return Err(FsError::InvalidInput {
-                msg: "carve alignment must be > 0".into(),
-            });
-        }
-        let src = self.source();
-        Ok(Box::new(CarveIter {
-            src,
-            pos: offset,
-            end: offset.saturating_add(len),
-            align,
-        }))
+        self.carve(&CarveOptions::region(offset, len, align))
     }
-}
 
-/// Default signature-scanning iterator for [`FileSystem::carve_region`].
-struct CarveIter {
-    src: Arc<dyn ByteSource>,
-    pos: u64,
-    end: u64,
-    align: u64,
-}
-
-impl Iterator for CarveIter {
-    type Item = Result<CarveHit>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        const HEADER_PROBE: usize = 4096;
-        while self.pos < self.end {
-            let pos = self.pos;
-            self.pos = self.pos.saturating_add(self.align);
-            let remain = usize::try_from(self.end - pos).unwrap_or(usize::MAX);
-            let probe_len = HEADER_PROBE.min(remain);
-            let header = match self.src.read_slice(pos, probe_len) {
-                Ok(h) => h,
-                Err(e) => return Some(Err(FsError::Io(e))),
-            };
-            if let Some(kind) = sutram_magic::detect(&header) {
-                return Some(Ok(CarveHit {
-                    offset: pos,
-                    len: probe_len as u64,
-                    kind,
-                    header,
-                }));
-            }
-        }
-        None
+    /// Signature carving with full options — see [`CarveOptions`] and
+    /// the `carve` module.
+    fn carve(
+        &self,
+        opts: &CarveOptions,
+    ) -> Result<Box<dyn Iterator<Item = Result<CarveHit>> + Send + '_>> {
+        Ok(Box::new(crate::carve::CarveIter::new(self.source(), opts)?))
     }
 }

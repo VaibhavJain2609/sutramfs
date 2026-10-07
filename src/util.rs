@@ -46,8 +46,9 @@ pub fn orphan_path(id: u64) -> String {
 /// Returns `None` for out-of-range/invalid fields — callers map that to
 /// `FsTimestamp { value: None, .. }`.
 ///
-/// `days_from_civil` algorithm after Hinnant; valid for years in
-/// roughly ±292 million.
+/// `days_from_civil` algorithm after Hinnant. The nanosecond result only
+/// fits an `i64` for years in roughly 1678..2262; dates outside that range
+/// (and absurd inputs) return `None` rather than overflowing.
 #[allow(clippy::too_many_arguments)]
 pub fn unix_nanos(
     year: i64,
@@ -88,13 +89,22 @@ pub fn unix_nanos(
     if day > dim {
         return None;
     }
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let y = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = if y >= 0 { y } else { y.checked_sub(399)? } / 400;
     let yoe = y - era * 400;
     let mp = (month + 9) % 12;
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
+    // Checked arithmetic throughout: absurd year fields must yield `None`,
+    // never an overflow panic on hostile input.
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
     days
         .checked_mul(86_400)?
         .checked_add(hour.checked_mul(3600)? + min * 60 + sec)?

@@ -175,11 +175,16 @@ pub struct FsInfo {
 pub struct CarveHit {
     /// Absolute byte offset of the hit.
     pub offset: u64,
-    /// Byte length of the identified object (header chunk read, or the
-    /// carved span when the parser can bound it).
+    /// Byte length of the carved extent — the object's real size when
+    /// `exact` is set (footer/declared-size/structure-bounded), else the
+    /// cap used (to-next-signature or per-type maximum).
     pub len: u64,
     /// What signature matched.
     pub kind: sutram_magic::MagicType,
+    /// `true` when `len` is the object's actual extent (footer found,
+    /// size field honoured, chunk chain walked); `false` when it was
+    /// capped — the carve may be truncated.
+    pub exact: bool,
     /// The leading bytes that produced the verdict (evidence excerpt;
     /// bounded — never the whole object).
     pub header: Vec<u8>,
