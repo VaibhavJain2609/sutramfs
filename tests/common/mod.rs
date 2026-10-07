@@ -25,6 +25,10 @@
 //!   (nid 12) inodes survive via stale NAT; some extents reallocated
 //!   (SIT-valid) — exercising `PartiallyOverwritten`/`Unrecoverable`.
 //! * segs 3..15 — empty (free) for `unallocated_ranges`.
+//!
+//! Builders and constants are shared by several test targets; not every
+//! target uses every helper.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -845,6 +849,173 @@ fn write_dentries(b: &mut [u8], region_off: usize, len: usize, entries: &[(&[u8]
 /// `Vec<u8>` implements `ByteSource` directly.
 pub fn image() -> Arc<Vec<u8>> {
     Img::new().build()
+}
+
+/// A *minimal* valid image (~104 KiB) — small enough to seed a fuzz
+/// corpus, complete enough to mount, walk and recover one deleted file.
+///
+/// Geometry: 4 KiB blocks, 2 blocks/segment (`log_blocks_per_seg = 1`):
+///
+/// ```text
+/// blocks 0..2    superblocks
+/// blk 2..6       checkpoint area (packs at 2 and 4, 2 blocks each)
+/// blk 6..10      SIT  (copy A blk 6, copy B blk 8)
+/// blk 10..14     NAT  (copy A blks 10-11, copy B blks 12-13)
+/// blk 14..18     SSA
+/// blk 18..26     main area (4 segments of 2 blocks)
+/// ```
+///
+/// Contents: root dir (nid 3) with live `file.txt` (nid 4) and deleted
+/// residue `old.txt` (nid 5); nid 5 is free in the current NAT but its
+/// stale copy still maps the surviving inode+data in SIT-free segment 2.
+pub fn minimal_image() -> Arc<Vec<u8>> {
+    const BPS: u64 = 2; // blocks per segment
+    // blk numbers
+    const CP: u64 = 2;
+    const SIT: u64 = 6;
+    const NAT: u64 = 10;
+    const SSA: u64 = 14;
+    const MAIN: u64 = 18;
+    const SEGS: u32 = 12; // 2 ckpt + 2 sit + 2 nat + 2 ssa + 4 main
+    const NBLK: usize = 2 + SEGS as usize * BPS as usize; // 26
+
+    fn block_mut(bytes: &mut [u8], n: u64) -> &mut [u8] {
+        let s = n as usize * BLK;
+        &mut bytes[s..s + BLK]
+    }
+    let mut bytes = vec![0u8; NBLK * BLK];
+
+    // --- superblocks ---
+    for base in [0x400usize, 0x1400] {
+        let sb = &mut bytes[base..base + 0xC00];
+        put_u32(sb, 0, 0xF2F5_2010);
+        put_u16(sb, 4, 1);
+        put_u16(sb, 6, 15);
+        put_u32(sb, 8, 9); // log_sectorsize
+        put_u32(sb, 12, 3); // log_sectors_per_block
+        put_u32(sb, 16, 12); // log_blocksize
+        put_u32(sb, 20, 1); // log_blocks_per_seg = 2 blocks
+        put_u32(sb, 24, 1); // segs_per_sec
+        put_u32(sb, 28, 1); // secs_per_zone
+        put_u32(sb, 32, 3068); // checksum_offset
+        put_u64(sb, 36, NBLK as u64); // block_count
+        put_u32(sb, 44, SEGS); // section_count
+        put_u32(sb, 48, SEGS); // segment_count
+        put_u32(sb, 52, 2); // ckpt
+        put_u32(sb, 56, 2); // sit
+        put_u32(sb, 60, 2); // nat
+        put_u32(sb, 64, 2); // ssa
+        put_u32(sb, 68, 4); // main
+        put_u32(sb, 72, 2); // segment0_blkaddr
+        put_u32(sb, 76, CP as u32);
+        put_u32(sb, 80, SIT as u32);
+        put_u32(sb, 84, NAT as u32);
+        put_u32(sb, 88, SSA as u32);
+        put_u32(sb, 92, MAIN as u32);
+        put_u32(sb, 96, 3); // root_ino
+        put_u32(sb, 100, 1); // node_ino
+        put_u32(sb, 104, 2); // meta_ino
+        let crc = crc32(0xF2F5_2010, &sb[..3068]);
+        put_u32(sb, 3068, crc);
+    }
+
+    // --- checkpoint packs (pack_total 2: [cp][cp copy]) ---
+    for p in [CP, CP + BPS] {
+        for n in [p, p + 1] {
+            let b = block_mut(&mut bytes, n);
+            put_u64(b, 0, CKPT_VER);
+            put_u64(b, 8, 4 * BPS); // user_block_count
+            put_u64(b, 16, 4); // valid_block_count
+            put_u32(b, 32, 2); // free_segment_count
+            put_u32(b, 132, 0x0001); // UMOUNT
+            put_u32(b, 136, 2); // pack_total
+            put_u32(b, 140, 1); // start_sum
+            put_u32(b, 152, 6); // next_free_nid
+            put_u32(b, 156, 4); // sit bitmap bytes
+            put_u32(b, 160, 4); // nat bitmap bytes (all zero → copy A)
+            put_u32(b, 164, 512); // checksum_offset
+            let crc = {
+                let c = crc32(0xF2F5_2010, &b[..512]);
+                crc32(c, &b[516..])
+            };
+            put_u32(b, 512, crc);
+        }
+    }
+
+    // --- SIT copy A (blk 6): segs 0,1 valid; 2,3 free ---
+    {
+        let b = block_mut(&mut bytes, SIT);
+        for (i, live) in [(0usize, 2u16), (1, 2)] {
+            let e = &mut b[i * 74..i * 74 + 74];
+            put_u16(e, 0, live);
+            e[2] |= 0b11; // blkoffs 0,1 valid
+            put_u64(e, 66, 42);
+        }
+    }
+
+    // --- NAT copies: A blk 10 (current), B blk 12 (stale) ---
+    {
+        let ent = |b: &mut [u8], nid: usize, blk: u32| {
+            b[nid * 9] = 1;
+            put_u32(b, nid * 9 + 1, nid as u32);
+            put_u32(b, nid * 9 + 5, blk);
+        };
+        let a = block_mut(&mut bytes, NAT);
+        ent(a, 3, MAIN as u32); // root inode
+        ent(a, 4, (MAIN + 2) as u32); // file.txt inode
+        let s = block_mut(&mut bytes, NAT + BPS);
+        ent(s, 3, MAIN as u32);
+        ent(s, 4, (MAIN + 2) as u32);
+        ent(s, 5, (MAIN + 4) as u32); // deleted nid — stale copy only
+    }
+
+    // --- main area ---
+    // inode helper: node block with footer nid==ino.
+    let inode_at = |bytes: &mut Vec<u8>, blk: u64, nid: u32, mode: u16, size: u64,
+                        name: &[u8], addrs: &[u32], cp_ver: u64| {
+        let s = blk as usize * BLK;
+        let b = &mut bytes[s..s + BLK];
+        put_u16(b, 0, mode);
+        put_u32(b, 4, 1000);
+        put_u32(b, 8, 1000);
+        put_u32(b, 12, 1);
+        put_u64(b, 16, size);
+        put_u64(b, 24, size / BLK as u64 + 1);
+        put_u64(b, 32, MTIME_SEC);
+        put_u64(b, 40, MTIME_SEC);
+        put_u64(b, 48, MTIME_SEC);
+        put_u32(b, 56, MTIME_NSEC);
+        put_u32(b, 60, MTIME_NSEC);
+        put_u32(b, 64, MTIME_NSEC);
+        put_u32(b, 88, name.len() as u32);
+        put(b, 92, name);
+        for (i, &a) in addrs.iter().enumerate() {
+            put_u32(b, 360 + i * 4, a);
+        }
+        put_u32(b, BLK - 24, nid);
+        put_u32(b, BLK - 20, nid);
+        put_u64(b, BLK - 12, cp_ver);
+    };
+    inode_at(&mut bytes, MAIN, 3, 0o040755, BLK as u64, b"/", &[(MAIN + 1) as u32], CKPT_VER);
+    write_dentries(
+        block_mut(&mut bytes, MAIN + 1),
+        0,
+        BLK,
+        &[
+            (b".", 3, 2, true),
+            (b"..", 3, 2, true),
+            (b"file.txt", 4, 1, true),
+            (b"old.txt", 5, 1, false), // residue
+        ],
+    );
+    inode_at(&mut bytes, MAIN + 2, 4, 0o100644, 10, b"file.txt", &[(MAIN + 3) as u32], CKPT_VER);
+    put(block_mut(&mut bytes, MAIN + 3), 0, b"hello fuzz");
+    // deleted nid 5: inode + data in SIT-free segment 2.
+    inode_at(&mut bytes, MAIN + 4, 5, 0o100644, 18, b"old.txt", &[(MAIN + 5) as u32], OLD_CKPT_VER);
+    put(block_mut(&mut bytes, MAIN + 5), 0, b"stale deleted data");
+
+    let _ = SSA; // summaries left zeroed — no reallocated blocks here
+    Arc::new(bytes)
 }
 
 /// `secret.bin` ciphertext bytes (never decrypted — flagged only).
