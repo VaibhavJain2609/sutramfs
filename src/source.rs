@@ -1,14 +1,15 @@
 //! [`ImageRef`] → [`ByteSource`] resolution.
 //!
-//! Two carriers: a server-local `path` opened read-only via
-//! [`FileSource`], or `inline` bytes (bounded — see
+//! Two carriers: a server-local `path` opened via the format-sniffing
+//! [`sutram_io::open_image`] (raw `dd`, E01, VHD/VHDX, QCOW2,
+//! split-raw), or `inline` bytes (bounded — see
 //! [`service::SutramFsService`] `max_inline_bytes`). `offset`/`length` wrap
 //! the result in a [`sutram_io::OffsetView`] partition window.
 
 use std::sync::Arc;
 
 use sutram_fs::{FsError, Result};
-use sutram_io::{ByteSource, FileSource, OffsetView};
+use sutram_io::{ByteSource, OffsetView};
 
 use crate::pb::image_ref::Source as ImageSource;
 use crate::pb::ImageRef;
@@ -40,10 +41,12 @@ pub fn describe(image: &ImageRef) -> String {
 pub fn resolve(image: &ImageRef, max_inline: u64) -> Result<Arc<dyn ByteSource>> {
     let inner: Arc<dyn ByteSource> = match &image.source {
         Some(ImageSource::Path(p)) => {
-            let src = FileSource::open(p).map_err(|e| FsError::InvalidInput {
+            // Format-sniffing open: raw dd/img files pass straight
+            // through; E01 (with .E02+ siblings), VHD/VHDX, QCOW2 and
+            // split-raw sets are decoded transparently.
+            sutram_io::open_image(p).map_err(|e| FsError::InvalidInput {
                 msg: format!("cannot open image '{p}': {e}"),
-            })?;
-            Arc::new(src)
+            })?
         }
         Some(ImageSource::Inline(b)) => {
             if b.len() as u64 > max_inline {
@@ -137,5 +140,97 @@ mod tests {
             length: 0,
         };
         assert!(resolve(&img, MAX_INLINE_BYTES).is_err());
+        assert_eq!(describe(&img), "empty");
+    }
+
+    #[test]
+    fn describe_covers_every_carrier() {
+        let path = ImageRef {
+            source: Some(ImageSource::Path("/evidence/disk.img".into())),
+            offset: 0,
+            length: 0,
+        };
+        assert_eq!(describe(&path), "path:/evidence/disk.img");
+
+        let inline = ImageRef {
+            source: Some(ImageSource::Inline(vec![0u8; 7])),
+            offset: 0,
+            length: 0,
+        };
+        assert_eq!(describe(&inline), "inline(7 bytes)");
+
+        // A partition window is appended to the carrier description.
+        let win = ImageRef {
+            source: Some(ImageSource::Inline(vec![0u8; 4096])),
+            offset: 0x200,
+            length: 0x400,
+        };
+        assert_eq!(describe(&win), "inline(4096 bytes)@0x200+1024");
+    }
+
+    #[test]
+    fn path_source_opens_read_only() {
+        // Real file on disk, opened via ImageSource::Path: FileSource
+        // wraps File::open — O_RDONLY. A chmod-400 file must still work.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sutram-fsd-src-{:x}.img", std::process::id()));
+        std::fs::write(&path, b"\xAA\x55-sutram").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        let img = ImageRef {
+            source: Some(ImageSource::Path(path.to_string_lossy().into_owned())),
+            offset: 0,
+            length: 0,
+        };
+        let src = resolve(&img, MAX_INLINE_BYTES).unwrap();
+        assert_eq!(src.len(), 9);
+        assert_eq!(src.read_slice(0, 16).unwrap(), b"\xAA\x55-sutram");
+        // Contents are untouched — no write path exists to corrupt them.
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xAA\x55-sutram");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn missing_path_is_invalid_input() {
+        let img = ImageRef {
+            source: Some(ImageSource::Path(
+                "/definitely/not/a/real/image.dd".into(),
+            )),
+            offset: 0,
+            length: 0,
+        };
+        match resolve(&img, MAX_INLINE_BYTES) {
+            Err(FsError::InvalidInput { msg }) => {
+                assert!(msg.contains("cannot open image"), "{msg}");
+            }
+            Err(e) => panic!("expected InvalidInput, got {e}"),
+            Ok(_) => panic!("expected InvalidInput, got a source"),
+        }
+    }
+
+    #[test]
+    fn length_only_window() {
+        // offset = 0, length set → view shorter than the source.
+        let img = ImageRef {
+            source: Some(ImageSource::Inline(vec![0u8; 4096])),
+            offset: 0,
+            length: 1000,
+        };
+        let src = resolve(&img, MAX_INLINE_BYTES).unwrap();
+        assert_eq!(src.len(), 1000);
+    }
+
+    #[test]
+    fn oversized_length_clamps_to_source() {
+        let img = ImageRef {
+            source: Some(ImageSource::Inline(vec![0u8; 4096])),
+            offset: 1024,
+            length: u64::MAX,
+        };
+        let src = resolve(&img, MAX_INLINE_BYTES).unwrap();
+        assert_eq!(src.len(), 4096 - 1024);
     }
 }

@@ -275,5 +275,39 @@ mod tests {
         assert_eq!(meta.get("evidence_id").unwrap(), "EV-42");
         assert_eq!(meta.get("job_id").unwrap(), "JOB-7");
         assert!(m.expires_at_unix() > 0);
+
+        // No ids → empty map; insert forces the table's TTL onto the mount.
+        assert!(stub_mount().meta().is_empty());
+    }
+
+    #[test]
+    fn ids_unique_and_listed() {
+        let t = HandleTable::default();
+        assert_eq!(t.ttl(), DEFAULT_TTL);
+        assert!(t.is_empty());
+        let a = t.insert(stub_mount());
+        let b = t.insert(stub_mount());
+        assert_ne!(a, b, "handle ids must be unique");
+        let mut ids = t.ids();
+        ids.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(ids, want);
+        assert_eq!(t.len(), 2);
+        // Unknown ids never resolve.
+        assert!(t.get("mh-bogus").is_none());
+    }
+
+    #[test]
+    fn expired_mount_stays_listed_until_swept() {
+        let t = HandleTable::new(Duration::from_millis(1));
+        let id = t.insert(stub_mount());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(t.ids().contains(&id), "unswept handles still list");
+        assert_eq!(t.sweep(), 1);
+        assert!(!t.ids().contains(&id));
+        // A fresh sweep over a live table is a no-op.
+        t.insert(stub_mount());
+        assert_eq!(t.sweep(), 0);
     }
 }

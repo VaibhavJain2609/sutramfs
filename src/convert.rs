@@ -274,5 +274,179 @@ mod tests {
             status_err(&FsError::InvalidInput { msg: "x".into() }).code(),
             tonic::Code::InvalidArgument
         );
+        assert_eq!(
+            status_err(&FsError::unsupported("aes-xts")).code(),
+            tonic::Code::Unimplemented
+        );
+        assert_eq!(
+            status_err(&FsError::corrupt(0x10, "bad")).code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            status_err(&FsError::truncated(0x20, 512, 100)).code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            status_err(&FsError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "disk gone"
+            )))
+            .code(),
+            tonic::Code::Internal
+        );
+    }
+
+    #[test]
+    fn unknown_handle_is_not_found() {
+        let s = unknown_handle("mh-dead");
+        assert_eq!(s.code(), tonic::Code::NotFound);
+        assert!(s.message().contains("mh-dead"));
+    }
+
+    #[test]
+    fn confidence_strings_cover_all() {
+        for (c, want) in [
+            (DetectConfidence::None, "none"),
+            (DetectConfidence::Low, "low"),
+            (DetectConfidence::Medium, "medium"),
+            (DetectConfidence::High, "high"),
+            (DetectConfidence::Certain, "certain"),
+        ] {
+            assert_eq!(confidence_str(c), want);
+        }
+    }
+
+    #[test]
+    fn deleted_recovery_variants() {
+        let intact = entry_to_proto(&entry(
+            EntryKind::File,
+            FsEntryStatus::Deleted {
+                recovery: RecoveryState::Intact,
+            },
+        ));
+        assert_eq!(intact.recovery, "intact");
+        assert_eq!(intact.recovered_bytes, 42);
+        assert_eq!(intact.total_bytes, 42);
+
+        let gone = entry_to_proto(&entry(
+            EntryKind::File,
+            FsEntryStatus::Deleted {
+                recovery: RecoveryState::Unrecoverable,
+            },
+        ));
+        assert_eq!(gone.recovery, "unrecoverable");
+        assert_eq!(gone.recovered_bytes, 0);
+        assert_eq!(gone.total_bytes, 42);
+
+        let unk = entry_to_proto(&entry(
+            EntryKind::File,
+            FsEntryStatus::Deleted {
+                recovery: RecoveryState::Unknown,
+            },
+        ));
+        assert_eq!(unk.recovery, "unknown");
+        assert_eq!(unk.recovered_bytes, 0);
+        assert_eq!(unk.total_bytes, 0);
+    }
+
+    #[test]
+    fn magic_verdict_converts() {
+        let mut e = entry(EntryKind::File, FsEntryStatus::Live);
+        e.magic = Some(sutram_fs::MagicVerdict {
+            declared: Some(sutram_fs::MagicType::PlainText),
+            detected: Some(sutram_fs::MagicType::Pe),
+            mismatch: true,
+            severity: Severity::High,
+            reasons: vec!["PE under .txt".into()],
+        });
+        let p = entry_to_proto(&e);
+        let m = p.magic.expect("verdict");
+        assert!(m.present);
+        assert_eq!(m.declared, "text data");
+        assert_eq!(m.detected, "PE/COFF Windows executable");
+        assert!(m.mismatch);
+        assert_eq!(m.severity, "high");
+        assert_eq!(m.reasons, ["PE under .txt"]);
+
+        // Other severities map too.
+        e.magic = Some(sutram_fs::MagicVerdict {
+            declared: None,
+            detected: None,
+            mismatch: false,
+            severity: Severity::Suspicious,
+            reasons: vec![],
+        });
+        assert_eq!(entry_to_proto(&e).magic.unwrap().severity, "suspicious");
+        e.magic = Some(sutram_fs::MagicVerdict {
+            declared: None,
+            detected: None,
+            mismatch: false,
+            severity: Severity::Info,
+            reasons: vec![],
+        });
+        let m = entry_to_proto(&e).magic.unwrap();
+        assert_eq!(m.severity, "info");
+        assert!(m.declared.is_empty() && m.detected.is_empty());
+    }
+
+    #[test]
+    fn unset_timestamp_slot_is_explicit() {
+        let mut e = entry(EntryKind::File, FsEntryStatus::Live);
+        e.timestamps = Timestamps {
+            modified: Some(FsTimestamp {
+                value: None,
+                raw_value: 0,
+                raw_encoding: "fat-dos-datetime",
+                granularity: Duration::MAX, // saturates u64 nanos
+            }),
+            ..Default::default()
+        };
+        let p = entry_to_proto(&e);
+        let t = p.timestamps.as_ref().unwrap().modified.as_ref().unwrap();
+        assert!(!t.has_value);
+        assert_eq!(t.unix_nanos, 0);
+        assert_eq!(t.granularity_nanos, u64::MAX);
+        assert!(p.timestamps.as_ref().unwrap().accessed.is_none());
+    }
+
+    #[test]
+    fn mount_options_maps_proto() {
+        // Absent proto → parser-layer defaults (lenient, magic, orphans).
+        let d = mount_options(None);
+        assert!(!d.strict && d.check_magic && d.include_orphans);
+        let p = mount_options(Some(&pb::MountOptionsProto {
+            strict: true,
+            check_magic: false,
+            include_orphans: false,
+        }));
+        assert!(p.strict && !p.check_magic && !p.include_orphans);
+    }
+
+    #[test]
+    fn info_to_proto_optional_fields() {
+        let full = FsInfo {
+            fs_type: "STUB".into(),
+            label: Some("LABEL".into()),
+            uuid: Some("uuid-1".into()),
+            block_size: 4096,
+            total_blocks: 128,
+            free_blocks: Some(64),
+            total_nodes: Some(32),
+            meta: HashMap::from([("note".into(), "v".into())]),
+        };
+        let meta = HashMap::from([("evidence_id".into(), "EV".into())]);
+        let p = info_to_proto(&full, meta);
+        assert_eq!(p.fs_type, "STUB");
+        assert_eq!(p.label, "LABEL");
+        assert_eq!(p.uuid, "uuid-1");
+        assert!(p.has_free_blocks && p.free_blocks == 64);
+        assert!(p.has_total_nodes && p.total_nodes == 32);
+        assert_eq!(p.fs_meta.get("note").unwrap(), "v");
+        assert_eq!(p.meta.get("evidence_id").unwrap(), "EV");
+
+        // Sparse info: has_* flags flip off, strings default to "".
+        let p = info_to_proto(&FsInfo::default(), HashMap::new());
+        assert!(!p.has_free_blocks && !p.has_total_nodes);
+        assert!(p.label.is_empty() && p.uuid.is_empty());
     }
 }

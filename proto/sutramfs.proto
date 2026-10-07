@@ -7,6 +7,8 @@
 //   Mount(ImageRef, MountOptions)     -> MountHandle
 //   Walk(MountHandle, filters)        -> stream FsEntryProto
 //   Read(MountHandle, path, off, len) -> stream ReadChunk (bytes)
+//   ReadRaw(MountHandle, off, len)    -> stream ReadChunk (bytes)
+//   Carve(MountHandle, region)        -> stream CarveHitProto
 //   Info(MountHandle)                 -> FsInfoProto
 //   Unmount(MountHandle)              -> UnmountReply
 //
@@ -32,6 +34,12 @@ service SutramFs {
   rpc Walk(WalkRequest) returns (stream FsEntryProto);
   // Stream a file's (recoverable) content in bounded chunks.
   rpc Read(ReadRequest) returns (stream ReadChunk);
+  // Stream raw volume bytes at absolute offsets — for extracting carved
+  // objects and inspecting structures that are not part of the file tree.
+  rpc ReadRaw(ReadRawRequest) returns (stream ReadChunk);
+  // Scan a region for embedded-file signatures; hits carry resolved
+  // extents (footer-bounded, declared-size, or capped).
+  rpc Carve(CarveRequest) returns (stream CarveHitProto);
   // Volume summary for a mounted handle.
   rpc Info(HandleRequest) returns (FsInfoProto);
   // Drop a handle before its TTL expires.
@@ -221,6 +229,47 @@ message ReadChunk {
   bytes data = 2;
   // True on the final chunk.
   bool eof = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Raw read / carving
+// ---------------------------------------------------------------------------
+
+message ReadRawRequest {
+  string handle_id = 1;
+  // Absolute byte offset within the mounted source window.
+  uint64 offset = 2;
+  // Bytes wanted; 0 = to end of source.
+  uint64 len = 3;
+  // Preferred bytes per stream message; clamped like ReadRequest.
+  uint32 chunk_size = 4;
+}
+
+message CarveRequest {
+  string handle_id = 1;
+  // "unallocated" (default) | "whole" | "range".
+  string region = 2;
+  // Used when region = "range".
+  uint64 offset = 3;
+  uint64 length = 4;
+  // Probe alignment in bytes; 0 = parser default (512).
+  uint64 align = 5;
+}
+
+message CarveHitProto {
+  // Absolute offset of the object's first byte.
+  uint64 offset = 1;
+  // Resolved extent in bytes.
+  uint64 len = 2;
+  // Magic kind name, e.g. "png", "zip".
+  string kind = 3;
+  // Preferred extraction extension, e.g. ".png".
+  string ext = 4;
+  // True when `len` was resolved from the format's structure (footer,
+  // declared size, chunk chain); false when capped by region/max extent.
+  bool exact = 5;
+  // First bytes of the hit (bounded) for client-side inspection.
+  bytes header = 6;
 }
 
 // ---------------------------------------------------------------------------
