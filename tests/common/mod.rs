@@ -263,6 +263,7 @@ pub fn restart_area() -> Vec<u8> {
 }
 
 /// LOG_RECORD header + client data (extent = 0x48 + data, 8-aligned).
+#[allow(dead_code)]
 pub fn log_record(lsn: u64, rtype: u32, tid: u32, client_data: &[u8]) -> Vec<u8> {
     let mut r = vec![0u8; 0x48 + client_data.len()];
     w64(&mut r, 0x00, lsn); // this_lsn
@@ -275,6 +276,43 @@ pub fn log_record(lsn: u64, rtype: u32, tid: u32, client_data: &[u8]) -> Vec<u8>
     w16(&mut r, 0x2E, client_data.len() as u16); // redo_len
     w16(&mut r, 0x32, 0x10); // undo_len
     r[0x48..].copy_from_slice(client_data);
+    r
+}
+
+/// LOG_RECORD with explicit operation codes and payloads: the redo
+/// buffer sits at client-data offset 0, the undo buffer follows it
+/// 8-aligned. `mft_cluster` is the `mft_cluster_index` anchor (VCN of
+/// the $MFT extent holding the target file-record segment).
+#[allow(clippy::too_many_arguments)]
+pub fn log_record_ex(
+    lsn: u64,
+    rtype: u32,
+    tid: u32,
+    redo_op: u16,
+    undo_op: u16,
+    target_attr: u16,
+    mft_cluster: u64,
+    redo: &[u8],
+    undo: &[u8],
+) -> Vec<u8> {
+    let undo_off = (redo.len() + 7) & !7;
+    let client_len = undo_off + undo.len();
+    let mut r = vec![0u8; 0x48 + client_len];
+    w64(&mut r, 0x00, lsn); // this_lsn
+    w64(&mut r, 0x08, lsn.saturating_sub(0x40)); // client_prev_lsn
+    w16(&mut r, 0x18, client_len as u16); // client_data_len
+    w32(&mut r, 0x1C, rtype); // record_type
+    w32(&mut r, 0x20, tid); // transaction_id
+    w16(&mut r, 0x28, redo_op);
+    w16(&mut r, 0x2A, undo_op);
+    w16(&mut r, 0x2C, 0); // redo_offset
+    w16(&mut r, 0x2E, redo.len() as u16); // redo_len
+    w16(&mut r, 0x30, undo_off as u16); // undo_offset
+    w16(&mut r, 0x32, undo.len() as u16); // undo_len
+    w16(&mut r, 0x34, target_attr); // target_attribute
+    w64(&mut r, 0x40, mft_cluster); // mft_cluster_index
+    r[0x48..0x48 + redo.len()].copy_from_slice(redo);
+    r[0x48 + undo_off..0x48 + undo_off + undo.len()].copy_from_slice(undo);
     r
 }
 
@@ -636,12 +674,21 @@ pub fn build_ntfs() -> Vec<u8> {
     // one record page (two LOG_RECORDs), one checkpoint.
     put(&mut img, 31, &lfs_page(b"RSTR", &[(0x30, restart_area())]));
     put(&mut img, 32, &lfs_page(b"RSTR", &[(0x30, restart_area())]));
-    let rec1 = log_record(0x4A80, 1, 7, b"redo-undo-payload!");
-    let rec2 = log_record(0x4AE0, 1, 7, b"");
+    // rec1: $I30 index add of BIG.BIN into the root — the redo payload
+    // is the INDEX_ENTRY; the cluster anchor points at the directory's
+    // record cluster (floor = rec 4, bound-flagged).
+    let idx = indx_entry(17 | (1u64 << 48), "BIG.BIN", 5, 6000, [t; 4]);
+    let rec1 = log_record_ex(0x4A80, 1, 7, 0x0E, 0x0F, 0, 1, &idx, b"");
+    // rec2: deallocate the file-record segment whose MFT cluster covers
+    // rec 20 — correlates with DELETED1.TXT's file_delete USN.
+    let rec2 = log_record_ex(0x4AE0, 1, 7, 0x03, 0x02, 0, 5, b"", b"");
     put(
         &mut img,
         33,
-        &lfs_page(b"RCRD", &[(0x40, rec1), (0x40 + 0x60, rec2)]),
+        &lfs_page(
+            b"RCRD",
+            &[(0x40, rec1.clone()), (0x40 + rec1.len(), rec2)],
+        ),
     );
     put(
         &mut img,

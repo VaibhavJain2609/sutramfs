@@ -53,11 +53,24 @@ mod boot;
 mod fs;
 mod indx;
 mod journal;
+pub mod rebuild;
 mod record;
+pub mod remnants;
 mod walk;
 
 pub use fs::{NtfsFs, NtfsParser};
-pub use journal::{JournalEvent, LogRecord, RestartArea, UsnRecord};
+pub use journal::{
+    JournalEvent, JournalOp, LogInterpret, LogOp, LogRecord, RestartArea, UsnRecord,
+};
+pub use remnants::{
+    live_mft_extents, probe_geometry, scan_remnants, scan_to_jsonl, to_jsonl, Remnant, RemnantData,
+    RemnantIndex, RemnantIndexEntry, RemnantName, RemnantRecord, RemnantScanOpts,
+    RemnantStats,
+};
+pub use rebuild::{
+    match_live, parse_remnant_line, LiveFile, OldMember, RemnantNode, RemnantTree, RestoredEntry,
+    RestorePlan, ROOT_REC,
+};
 
 #[cfg(test)]
 mod tests;

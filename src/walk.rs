@@ -15,7 +15,7 @@ use crate::indx;
 use crate::record::apply_indx_fixup;
 
 /// Well-known metafile names for the reserved MFT slots.
-fn metafile_name(rec_no: u64) -> Option<&'static str> {
+pub(crate) fn metafile_name(rec_no: u64) -> Option<&'static str> {
     Some(match rec_no {
         0 => "$MFT",
         1 => "$MFTMirr",

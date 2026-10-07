@@ -338,6 +338,82 @@ impl NtfsFs {
         slot
     }
 
+    /// recno → (display name, parent recno) for every live base record.
+    /// Used by remnant rebuild to filter entries that merely echo the
+    /// current filesystem's own index blocks.
+    pub fn live_names(&self) -> HashMap<u64, (String, u64)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.state == SlotState::Live && s.base_ref == 0)
+            .filter_map(|(i, s)| {
+                let f = s
+                    .fns
+                    .iter()
+                    .find(|f| f.namespace != 2)
+                    .or_else(|| s.fns.first())?;
+                Some((
+                    i as u64,
+                    (f.name.clone(), crate::attr::file_ref_rec(f.parent_ref)),
+                ))
+            })
+            .collect()
+    }
+
+    /// Debug: number of scanned MFT slots.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Debug: human-readable summary of one slot's mount-scan state.
+    pub fn debug_slot(&self, rec_no: u64) -> String {
+        match self.slots.get(rec_no as usize) {
+            None => "beyond slot table".into(),
+            Some(s) => format!(
+                "{:?} in_use={} is_dir={} base_ref={:#x} seq={} fns={:?} err={:?}",
+                s.state, s.in_use, s.is_dir, s.base_ref, s.seq,
+                s.fns.iter().map(|f| (f.name.clone(), f.parent_ref, f.namespace))
+                    .collect::<Vec<_>>(),
+                s.error
+            ),
+        }
+    }
+
+    /// Debug: dump parsed attribute headers of record `n`.
+    pub fn debug_attrs(&self, rec_no: u64) -> String {
+        match self.parse_record(rec_no) {
+            Err(e) => format!("parse_record: {e}"),
+            Ok(rec) => {
+                let (attrs, err) = Self::collect_attrs(&rec);
+                let mut s = format!(
+                    "first_attr={:#x} used={:#x} data_len={} nattr={} err={:?}\n",
+                    rec.first_attr_off, rec.used_size, rec.data.len(), attrs.len(), err
+                );
+                for a in &attrs {
+                    let body_ok = a
+                        .resident
+                        .map(|(o, l)| self.src.read_slice(o, l as usize).is_ok());
+                    s.push_str(&format!(
+                        "  type={:#06x} len n/a off={:#x} nonres={} resident={:?} body_ok={:?} name={:?}\n",
+                        a.type_code, a.offset, a.non_resident, a.resident, body_ok, a.name
+                    ));
+                    if a.type_code == attr::T_FILE_NAME {
+                        if let Some((o, l)) = a.resident {
+                            if let Ok(b) = self.src.read_slice(o, l as usize) {
+                                s.push_str(&format!(
+                                    "    body[0..8]={:02x?} parse_fn={:?}\n",
+                                    &b[..b.len().min(8)],
+                                    attr::parse_fn(&b).map(|f| (f.name, f.parent_ref, f.real_size))
+                                ));
+                            }
+                        }
+                    }
+                }
+                s
+            }
+        }
+    }
+
     /// Absolute disk offset of MFT record `n`, via $MFT's data runs.
     pub(crate) fn mft_offset(&self, rec_no: u64) -> Option<u64> {
         let csz = self.bs.cluster_size;
@@ -927,6 +1003,61 @@ impl NtfsFs {
                 meta.insert("redo_len".into(), lr.redo_len.to_string());
                 meta.insert("undo_len".into(), lr.undo_len.to_string());
                 meta.insert("client_data_len".into(), lr.client_data_len.to_string());
+                // Payload interpretation: op names, target MFT record,
+                // $I30/$FILE_NAME filenames, attribute type codes.
+                let it = lr.interpret(self.bs.cluster_size, self.bs.file_record_size);
+                meta.insert("op".into(), it.redo_op.name().into());
+                if it.redo_op != it.undo_op {
+                    meta.insert("undo_op_name".into(), it.undo_op.name().into());
+                }
+                if !it.detail.is_empty() {
+                    meta.insert("op_detail".into(), it.detail.clone());
+                }
+                if lr.target_attribute != 0 {
+                    meta.insert(
+                        "target_attr_offset".into(),
+                        format!("{:#x}", lr.target_attribute),
+                    );
+                }
+                if lr.lcns_to_follow != 0 {
+                    meta.insert("lcns_to_follow".into(), lr.lcns_to_follow.to_string());
+                }
+                if lr.mft_cluster_index != 0 {
+                    meta.insert(
+                        "mft_cluster_index".into(),
+                        format!("{:#x}", lr.mft_cluster_index),
+                    );
+                }
+                if let Some(rec) = it.mft_record {
+                    meta.insert("target_mft_record".into(), rec.to_string());
+                    if it.record_is_bound {
+                        meta.insert(
+                            "target_mft_record_bound".into(),
+                            "cluster floor — exact record not encoded".into(),
+                        );
+                    }
+                    // Resolve the slot's current name for context.
+                    if let Some(slot) = self.slots.get(rec as usize) {
+                        if let Some(f) = slot.fns.first() {
+                            meta.insert("target_name".into(), f.name.clone());
+                        }
+                    }
+                }
+                if let Some(name) = &it.file_name {
+                    meta.insert("target_file_name".into(), name.clone());
+                }
+                if let Some(p) = it.parent_ref {
+                    meta.insert("target_parent_ref".into(), format!("{:#x}", p));
+                }
+                if let Some(c) = it.child_ref {
+                    meta.insert("target_child_ref".into(), format!("{:#x}", c));
+                }
+                if let Some(t) = it.attr_type {
+                    meta.insert("attr_type".into(), format!("{:#x}", t));
+                }
+                if let Some(n) = &it.attr_name {
+                    meta.insert("attr_name".into(), n.clone());
+                }
                 let name = format!("lsn_{:#x}", lr.this_lsn);
                 (
                     name.clone(),
@@ -1104,12 +1235,63 @@ impl FileSystem for NtfsFs {
     /// Journal artefacts as pseudo-entries: `$UsnJrnl` change records
     /// under `/$USN_JRNL/` and `$LogFile` structures under `/$LOGFILE/`.
     /// These sit alongside — never inside — the `walk()` tree.
+    ///
+    /// USN records stream before `$LogFile` records (the streams are
+    /// chained that way), so a `file_ref → usns` map accumulates as items
+    /// pass through; each interpreted log record whose target record
+    /// number matches a seen USN file ref is annotated with
+    /// `correlated_usn` — the journal's own cross-stream link between a
+    /// transaction record and the change journal entry.
     fn journal_entries(&self) -> Box<dyn Iterator<Item = Result<FsEntry>> + Send + '_> {
+        // Bounded: cap tracked refs and USNs per ref (hostile journals).
+        const MAX_CORR_REFS: usize = 1 << 18;
+        const MAX_CORR_USNS: usize = 8;
+        let mut corr: HashMap<u64, (Vec<i64>, u64)> = HashMap::new();
         Box::new(
             self.journal_events()
-                .filter_map(|item| match item {
+                .filter_map(move |item| match item {
                     Err(e) => Some(Err(e)),
-                    Ok(ev) => self.journal_entry(&ev).map(Ok),
+                    Ok(ev) => {
+                        if let JournalEvent::Usn(u) = &ev {
+                            // Key by bare record number — a log record's
+                            // target carries no sequence number.
+                            let rec = attr::file_ref_rec(u.file_ref);
+                            if corr.len() < MAX_CORR_REFS || corr.contains_key(&rec) {
+                                let ent = corr.entry(rec).or_default();
+                                if ent.0.len() < MAX_CORR_USNS {
+                                    ent.0.push(u.usn);
+                                }
+                                ent.1 += 1;
+                            }
+                        }
+                        let mut e = self.journal_entry(&ev)?;
+                        if let JournalEvent::LogRecord(lr) = &ev {
+                            let it = lr.interpret(
+                                self.bs.cluster_size,
+                                self.bs.file_record_size,
+                            );
+                            // Correlate on the exact record number when
+                            // known, else the record cluster's floor.
+                            if let Some(rec) = it.mft_record {
+                                if let Some((usns, total)) = corr.get(&rec) {
+                                    if !usns.is_empty() {
+                                        e.meta.insert(
+                                            "correlated_usn".into(),
+                                            usns.iter()
+                                                .map(|u| format!("{u:#x}"))
+                                                .collect::<Vec<_>>()
+                                                .join(","),
+                                        );
+                                        e.meta.insert(
+                                            "correlated_usn_count".into(),
+                                            total.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(e))
+                    }
                 }),
         )
     }

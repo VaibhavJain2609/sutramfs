@@ -360,6 +360,8 @@ pub(crate) struct FileName {
     pub mft_changed: u64,
     pub accessed: u64,
     pub real_size: u64,
+    /// Win32 file-attribute flags (read-only/hidden/directory/…) at 0x38.
+    pub flags: u32,
     /// Namespace: 0 POSIX, 1 WIN32, 2 DOS, 3 WIN32&DOS.
     pub namespace: u8,
     pub name: String,
@@ -380,6 +382,7 @@ pub(crate) fn parse_fn(body: &[u8]) -> Option<FileName> {
         mft_changed: le::u64(body, 24)?,
         accessed: le::u64(body, 32)?,
         real_size: le::u64(body, 48)?,
+        flags: le::u32(body, 0x38).unwrap_or(0),
         namespace,
         name: utf16(name_bytes),
     })

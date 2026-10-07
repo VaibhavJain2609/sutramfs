@@ -49,6 +49,10 @@ const USN_MIN: usize = 0x40;
 const USN_MAX: usize = 0x1_0000;
 /// Bound on candidate-record probes per RCRD page.
 const MAX_PAGE_PROBES: usize = 512;
+/// Bound on client-data bytes retained per log record (u16 field, but a
+/// hostile page could claim 64 KiB — still cheap, and `client_data_len`
+/// is already validated against the page extent).
+const MAX_CLIENT_DATA: usize = 0x1_0000;
 
 // USN reason flags.
 const REASONS: &[(u32, &str)] = &[
@@ -285,8 +289,9 @@ pub struct RestartArea {
     pub disk_offset: u64,
 }
 
-/// Parsed LOG_RECORD header inside an RCRD page (structural parse —
-/// redo/undo buffers are pointed at, not interpreted).
+/// Parsed LOG_RECORD header inside an RCRD page plus its bounded client
+/// data (redo/undo buffers are *interpreted* by [`LogRecord::interpret`],
+/// never applied).
 #[derive(Debug, Clone)]
 pub struct LogRecord {
     /// This record's log sequence number.
@@ -299,12 +304,467 @@ pub struct LogRecord {
     pub flags: u16,
     pub redo_op: u16,
     pub undo_op: u16,
+    /// Byte offset of the redo payload within `client_data`.
+    pub redo_offset: u16,
     pub redo_len: u16,
+    /// Byte offset of the undo payload within `client_data`.
+    pub undo_offset: u16,
     pub undo_len: u16,
+    /// Offset of the attribute the record targets inside the file record.
+    pub target_attribute: u16,
+    /// Number of LCNs listed after the fixed header (targets of a
+    /// multi-cluster write).
+    pub lcns_to_follow: u16,
+    /// Offset of this record within its page (LFS bookkeeping).
+    pub record_offset: u16,
+    /// Offset of the affected attribute-list entry, when the record
+    /// concerns an attribute list.
+    pub attr_list_offset: u16,
+    /// VCN within `$MFT`'s data holding the target file-record segment —
+    /// the record number's cluster-granular anchor.
+    pub mft_cluster_index: u64,
+    /// The client-data area (redo/undo payloads), bounded by
+    /// [`MAX_CLIENT_DATA`].
+    pub client_data: Vec<u8>,
     /// Absolute disk offset of the record header.
     pub disk_offset: Option<u64>,
     /// Computed record extent (header + lcn list + client data, aligned).
     pub extent: usize,
+}
+
+/// The redo operation a `$LogFile` record performs (the `redo_op` /
+/// `undo_op` code table — ntfsdoc "Log Record Operation Codes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOp {
+    Noop,
+    /// A compensation record — undoes a named earlier operation.
+    CompensationLogRecord,
+    /// Initialise a file-record segment (a new/reused MFT slot).
+    InitializeFileRecordSegment,
+    /// Free a file-record segment (the MFT slot is being deallocated).
+    DeallocateFileRecordSegment,
+    /// Write the trailer of a file-record segment.
+    WriteEndOfFileRecordSegment,
+    /// Insert an attribute into a file record.
+    CreateAttribute,
+    /// Remove an attribute from a file record.
+    DeleteAttribute,
+    /// Rewrite a resident attribute's content (a.k.a.
+    /// `SetResidentAttributeContent`).
+    UpdateResidentValue,
+    /// Rewrite non-resident clusters' content.
+    UpdateNonresidentValue,
+    /// Replace a non-resident attribute's runlist (mapping pairs).
+    UpdateMappingPairs,
+    /// Drop dirty clusters from a runlist tail.
+    DeleteDirtyClusters,
+    /// Record new allocated/real sizes for an attribute.
+    SetNewAttributeSizes,
+    /// Insert an index entry into the resident index root ($I30 creates).
+    AddIndexEntryRoot,
+    /// Remove an index entry from the index root ($I30 deletes).
+    DeleteIndexEntryRoot,
+    /// Insert an index entry into an index-allocation block.
+    AddIndexEntryAllocation,
+    /// Remove an index entry from an index-allocation block.
+    DeleteIndexEntryAllocation,
+    /// Rewrite the VCN stored in an index-root entry (a directory index
+    /// tree reshuffle).
+    SetIndexEntryVcnRoot,
+    /// Same, inside an index-allocation block.
+    SetIndexEntryVcnAllocation,
+    /// Update a $FILE_NAME attribute in the index root.
+    UpdateFileNameRoot,
+    /// Update a $FILE_NAME attribute in an index-allocation block.
+    UpdateFileNameAllocation,
+    /// Set bits in a non-resident $BITMAP (allocation log).
+    SetBitsInNonresidentBitmap,
+    /// Clear bits in a non-resident $BITMAP (freeing clusters).
+    ClearBitsInNonresidentBitmap,
+    /// Sector relocation (bad-cluster remapping).
+    HotFix,
+    /// End of a top-level action — the transaction committed.
+    EndTopLevelAction,
+    PrepareTransaction,
+    CommitTransaction,
+    ForgetTransaction,
+    /// Open a non-resident attribute (attribute-table maintenance).
+    OpenNonresidentAttribute,
+    OpenAttributeTableDump,
+    AttributeNameDump,
+    DirtyPageTableDump,
+    TransactionTableDump,
+    UpdateRecordDataRoot,
+    UpdateRecordDataAllocation,
+    /// A code outside the documented table.
+    Unknown(u16),
+}
+
+impl LogOp {
+    /// Decode a raw `redo_op`/`undo_op` code.
+    pub fn from_code(code: u16) -> LogOp {
+        use LogOp::*;
+        match code {
+            0x00 => Noop,
+            0x01 => CompensationLogRecord,
+            0x02 => InitializeFileRecordSegment,
+            0x03 => DeallocateFileRecordSegment,
+            0x04 => WriteEndOfFileRecordSegment,
+            0x05 => CreateAttribute,
+            0x06 => DeleteAttribute,
+            0x07 => UpdateResidentValue,
+            0x08 => UpdateNonresidentValue,
+            0x09 => UpdateMappingPairs,
+            0x0A => DeleteDirtyClusters,
+            0x0B => SetNewAttributeSizes,
+            0x0C => AddIndexEntryRoot,
+            0x0D => DeleteIndexEntryRoot,
+            0x0E => AddIndexEntryAllocation,
+            0x0F => DeleteIndexEntryAllocation,
+            0x10 => SetIndexEntryVcnRoot,
+            0x11 => SetIndexEntryVcnAllocation,
+            0x12 => UpdateFileNameRoot,
+            0x13 => UpdateFileNameAllocation,
+            0x14 => SetBitsInNonresidentBitmap,
+            0x15 => ClearBitsInNonresidentBitmap,
+            0x16 => HotFix,
+            0x17 => EndTopLevelAction,
+            0x18 => PrepareTransaction,
+            0x19 => CommitTransaction,
+            0x1A => ForgetTransaction,
+            0x1B => OpenNonresidentAttribute,
+            0x1C => OpenAttributeTableDump,
+            0x1D => AttributeNameDump,
+            0x1E => DirtyPageTableDump,
+            0x1F => TransactionTableDump,
+            0x20 => UpdateRecordDataRoot,
+            0x21 => UpdateRecordDataAllocation,
+            c => Unknown(c),
+        }
+    }
+
+    /// Stable snake_case name for `meta` values.
+    pub fn name(self) -> &'static str {
+        use LogOp::*;
+        match self {
+            Noop => "noop",
+            CompensationLogRecord => "compensation_log_record",
+            InitializeFileRecordSegment => "initialize_file_record_segment",
+            DeallocateFileRecordSegment => "deallocate_file_record_segment",
+            WriteEndOfFileRecordSegment => "write_end_of_file_record_segment",
+            CreateAttribute => "create_attribute",
+            DeleteAttribute => "delete_attribute",
+            UpdateResidentValue => "update_resident_value",
+            UpdateNonresidentValue => "update_nonresident_value",
+            UpdateMappingPairs => "update_mapping_pairs",
+            DeleteDirtyClusters => "delete_dirty_clusters",
+            SetNewAttributeSizes => "set_new_attribute_sizes",
+            AddIndexEntryRoot => "add_index_entry_root",
+            DeleteIndexEntryRoot => "delete_index_entry_root",
+            AddIndexEntryAllocation => "add_index_entry_allocation",
+            DeleteIndexEntryAllocation => "delete_index_entry_allocation",
+            SetIndexEntryVcnRoot => "set_index_entry_vcn_root",
+            SetIndexEntryVcnAllocation => "set_index_entry_vcn_allocation",
+            UpdateFileNameRoot => "update_file_name_root",
+            UpdateFileNameAllocation => "update_file_name_allocation",
+            SetBitsInNonresidentBitmap => "set_bits_in_nonresident_bitmap",
+            ClearBitsInNonresidentBitmap => "clear_bits_in_nonresident_bitmap",
+            HotFix => "hot_fix",
+            EndTopLevelAction => "end_top_level_action",
+            PrepareTransaction => "prepare_transaction",
+            CommitTransaction => "commit_transaction",
+            ForgetTransaction => "forget_transaction",
+            OpenNonresidentAttribute => "open_nonresident_attribute",
+            OpenAttributeTableDump => "open_attribute_table_dump",
+            AttributeNameDump => "attribute_name_dump",
+            DirtyPageTableDump => "dirty_page_table_dump",
+            TransactionTableDump => "transaction_table_dump",
+            UpdateRecordDataRoot => "update_record_data_root",
+            UpdateRecordDataAllocation => "update_record_data_allocation",
+            Unknown(_) => "unknown",
+        }
+    }
+
+    /// `true` for the index-entry insert/remove family — the payload is a
+    /// `$I30` INDEX_ENTRY carrying a whole $FILE_NAME.
+    fn is_index_entry_op(self) -> bool {
+        matches!(
+            self,
+            LogOp::AddIndexEntryRoot
+                | LogOp::DeleteIndexEntryRoot
+                | LogOp::AddIndexEntryAllocation
+                | LogOp::DeleteIndexEntryAllocation
+        )
+    }
+}
+
+/// What a `$LogFile` record's payload says — targets recovered by
+/// interpreting redo/undo buffers (still read-only: evidence, not replay).
+#[derive(Debug, Clone)]
+pub struct LogInterpret {
+    /// Decoded redo/undo operation classes.
+    pub redo_op: LogOp,
+    pub undo_op: LogOp,
+    /// Human-readable detail ("mft 20 attr 0x30 delete", "i30 'X.TXT'").
+    pub detail: String,
+    /// MFT record number the operation targets. Exact when a FILE header
+    /// or index entry survives in the payload; otherwise the first record
+    /// of `mft_cluster_index`'s cluster (a lower bound — flagged by
+    /// `record_is_bound`).
+    pub mft_record: Option<u64>,
+    /// `true` when `mft_record` is the cluster-floor estimate, not exact.
+    pub record_is_bound: bool,
+    /// Filename recovered from the payload ($I30 index entry, $FILE_NAME
+    /// update, or a created/deleted named attribute).
+    pub file_name: Option<String>,
+    /// Parent file reference from an embedded $FILE_NAME / index entry.
+    pub parent_ref: Option<u64>,
+    /// File reference the index entry pointed at (the indexed child).
+    pub child_ref: Option<u64>,
+    /// Attribute type code touched (`$FILE_NAME` = 0x30, …).
+    pub attr_type: Option<u32>,
+    /// Named attribute's decoded name, when the payload carries one.
+    pub attr_name: Option<String>,
+}
+
+/// Read a length-prefixed UTF-16LE name at `buf[off]` (`name_len` u8
+/// count, then that many u16s) — the tail of a $FILE_NAME body or an
+/// attribute header's name field.
+fn utf16_name(buf: &[u8], count_off: usize, chars_off: usize) -> Option<String> {
+    let n = *buf.get(count_off)? as usize;
+    let bytes = le::get(buf, chars_off, n.checked_mul(2)?)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// Parse a $FILE_NAME body: `(parent_ref, name)`.
+fn parse_file_name(b: &[u8]) -> Option<(u64, String)> {
+    if b.len() < 0x42 {
+        return None;
+    }
+    let parent = le::u64(b, 0x00).unwrap_or(0);
+    let name = utf16_name(b, 0x40, 0x42)?;
+    Some((parent, name))
+}
+
+/// Parse an INDEX_ENTRY (`file_ref, entry_len, stream_len, flags, stream`)
+/// — the payload of AddIndexEntry*/DeleteIndexEntry* records. Returns
+/// `(child_ref, parent_ref, name)` when the stream is a $FILE_NAME.
+fn parse_index_entry(b: &[u8]) -> Option<(u64, u64, String)> {
+    if b.len() < 0x10 + 0x42 {
+        return None;
+    }
+    let child = le::u64(b, 0x00).unwrap_or(0);
+    let entry_len = le::u16(b, 0x08).unwrap_or(0) as usize;
+    let stream_len = le::u16(b, 0x0A).unwrap_or(0) as usize;
+    if entry_len < 0x10 || stream_len < 0x42 {
+        return None;
+    }
+    let (parent, name) = parse_file_name(b.get(0x10..)?)?;
+    Some((child, parent, name))
+}
+
+/// Attribute type code + optional name from an attribute-record payload
+/// (the redo/undo buffer of CreateAttribute/DeleteAttribute).
+fn parse_attr_header(b: &[u8]) -> Option<(u32, Option<String>)> {
+    if b.len() < 0x10 {
+        return None;
+    }
+    let ty = le::u32(b, 0x00).unwrap_or(0);
+    // Plausibility: known attribute type codes are ≤ 0x100 and nonzero;
+    // 0xFFFFFFFF is the record terminator, never an attribute here.
+    if ty == 0 || ty == 0xFFFF_FFFF || ty > 0x100 {
+        return None;
+    }
+    let name_len = *b.get(0x09)? as usize;
+    let name = if name_len > 0 {
+        let off = le::u16(b, 0x0A).unwrap_or(0) as usize;
+        utf16_name(b, 0x09, off)
+    } else {
+        None
+    };
+    Some((ty, name))
+}
+
+impl LogRecord {
+    /// The redo payload slice (`redo_offset`/`redo_len` are relative to
+    /// the client-data area per ntfsdoc), when the record carries one.
+    pub fn redo(&self) -> Option<&[u8]> {
+        let s = self.redo_offset as usize;
+        self.client_data
+            .get(s..s.saturating_add(self.redo_len as usize))
+            .filter(|b| !b.is_empty())
+    }
+
+    /// The undo payload slice, when present.
+    pub fn undo(&self) -> Option<&[u8]> {
+        let s = self.undo_offset as usize;
+        self.client_data
+            .get(s..s.saturating_add(self.undo_len as usize))
+            .filter(|b| !b.is_empty())
+    }
+
+    /// The payload that carries the forensic content for `op`: adds,
+    /// creates and writes leave the new state in redo; deletes leave the
+    /// removed state in undo.
+    fn op_payload(&self, op: LogOp) -> Option<&[u8]> {
+        let (first, second) = match op {
+            LogOp::DeleteIndexEntryRoot
+            | LogOp::DeleteIndexEntryAllocation
+            | LogOp::DeleteAttribute
+            | LogOp::CompensationLogRecord => (self.undo(), self.redo()),
+            _ => (self.redo(), self.undo()),
+        };
+        first.or(second)
+    }
+
+    /// Interpret the record's payloads: decode the operation classes and
+    /// pull out whichever targets survive — the MFT record number, the
+    /// filename an index/$FILE_NAME op touched, the attribute type. Needs
+    /// the volume's `cluster_size` and `file_record_size` to translate
+    /// `mft_cluster_index` into a record number.
+    pub fn interpret(&self, cluster_size: u64, record_size: u64) -> LogInterpret {
+        let redo_op = LogOp::from_code(self.redo_op);
+        let undo_op = LogOp::from_code(self.undo_op);
+        let mut it = LogInterpret {
+            redo_op,
+            undo_op,
+            detail: String::new(),
+            mft_record: None,
+            record_is_bound: false,
+            file_name: None,
+            parent_ref: None,
+            child_ref: None,
+            attr_type: None,
+            attr_name: None,
+        };
+        // Cluster-floor anchor: the record lives somewhere in this MFT
+        // cluster — a lower bound, refined below when the payload names it.
+        if self.mft_cluster_index != 0 && cluster_size != 0 && record_size != 0 {
+            it.mft_record = Some(self.mft_cluster_index * (cluster_size / record_size));
+            it.record_is_bound = true;
+        }
+        let payload = self.op_payload(redo_op);
+        match redo_op {
+            op if op.is_index_entry_op() => {
+                if let Some(p) = payload {
+                    if let Some((child, parent, name)) = parse_index_entry(p) {
+                        it.child_ref = Some(child);
+                        it.parent_ref = Some(parent);
+                        it.file_name = Some(name.clone());
+                        it.attr_type = Some(0x30); // $I30 indexes $FILE_NAME
+                        it.detail = format!(
+                            "$I30 {}: '{}' ref={:#x} parent={:#x}",
+                            op.name(),
+                            name,
+                            child,
+                            parent
+                        );
+                    } else {
+                        it.detail = format!(
+                            "$I30 {}: {} payload bytes (unparsed)",
+                            op.name(),
+                            p.len()
+                        );
+                    }
+                }
+            }
+            LogOp::UpdateFileNameRoot | LogOp::UpdateFileNameAllocation => {
+                if let Some(p) = payload {
+                    if let Some((parent, name)) = parse_file_name(p) {
+                        it.parent_ref = Some(parent);
+                        it.file_name = Some(name.clone());
+                        it.attr_type = Some(0x30);
+                        it.detail = format!(
+                            "$FILE_NAME update: '{}' parent={:#x}",
+                            name, parent
+                        );
+                    }
+                }
+            }
+            LogOp::CreateAttribute | LogOp::DeleteAttribute => {
+                if let Some(p) = payload {
+                    if let Some((ty, name)) = parse_attr_header(p) {
+                        it.attr_type = Some(ty);
+                        it.attr_name = name.clone();
+                        it.detail = format!(
+                            "{} attr {ty:#x}{} (attr_off {:#x})",
+                            op_verb(redo_op),
+                            name.map(|n| format!(" '{n}'")).unwrap_or_default(),
+                            self.target_attribute,
+                        );
+                    }
+                }
+            }
+            LogOp::InitializeFileRecordSegment => {
+                // The redo payload is the new FILE record header; NTFS ≥3
+                // stores the record number at +0x2C.
+                if let Some(p) = payload {
+                    if p.len() >= 0x30 && &p[0..4] == b"FILE" {
+                        it.mft_record = Some(le::u32(p, 0x2C).unwrap_or(0) as u64);
+                        it.record_is_bound = false;
+                    }
+                }
+                it.detail = "initialise file record segment".to_string();
+            }
+            LogOp::DeallocateFileRecordSegment => {
+                it.detail = "deallocate file record segment".to_string();
+            }
+            LogOp::UpdateResidentValue => {
+                it.detail = format!(
+                    "resident attribute content: {} bytes at attr_off {:#x}",
+                    self.redo_len, self.target_attribute,
+                );
+            }
+            LogOp::UpdateMappingPairs => {
+                it.detail = format!("runlist rewrite: {} bytes", self.redo_len);
+            }
+            LogOp::SetNewAttributeSizes => {
+                if let Some(p) = payload {
+                    if p.len() >= 0x10 {
+                        it.detail = format!(
+                            "new sizes: alloc={} real={}",
+                            le::u64(p, 0).unwrap_or(0),
+                            le::u64(p, 8).unwrap_or(0),
+                        );
+                    }
+                }
+            }
+            LogOp::SetBitsInNonresidentBitmap | LogOp::ClearBitsInNonresidentBitmap => {
+                // bit_ops payloads: (bit index u32? , count) — report span.
+                if let Some(p) = payload {
+                    if p.len() >= 0x08 {
+                        it.detail = format!(
+                            "bitmap bits {}..+{}",
+                            le::u32(p, 0).unwrap_or(0),
+                            le::u32(p, 4).unwrap_or(0),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        if it.detail.is_empty() {
+            it.detail = format!(
+                "{} (undo {})",
+                redo_op.name(),
+                undo_op.name()
+            );
+        }
+        it
+    }
+}
+
+/// Verb for attribute ops in detail strings.
+fn op_verb(op: LogOp) -> &'static str {
+    match op {
+        LogOp::CreateAttribute => "create",
+        LogOp::DeleteAttribute => "delete",
+        _ => "modify",
+    }
 }
 
 /// One `$LogFile` artefact.
@@ -334,6 +794,36 @@ pub enum JournalEvent {
     Checkpoint { lsn: u64, disk_offset: u64 },
     /// A torn write page (`BAAD`) — the last in-flight log page.
     TornPage { disk_offset: u64 },
+}
+
+/// Semantic operation class of a journal event — `JournalEvent::op()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalOp {
+    /// A `$UsnJrnl` change record (its `reason` bits say what changed).
+    UsnChange,
+    /// A `$LogFile` restart area (`RSTR` page).
+    LogRestart,
+    /// A `$LogFile` client record — the carried op is its redo operation.
+    Log(LogOp),
+    /// A `$LogFile` checkpoint page (`CHKD`).
+    LogCheckpoint,
+    /// A torn log page (`BAAD`).
+    TornPage,
+}
+
+impl JournalEvent {
+    /// The semantic operation this event records. For `$LogFile` client
+    /// records this is the decoded `redo_op`; USN records classify as
+    /// `UsnChange` (their reason bits are the detail).
+    pub fn op(&self) -> JournalOp {
+        match self {
+            JournalEvent::Usn(_) => JournalOp::UsnChange,
+            JournalEvent::Restart(_) => JournalOp::LogRestart,
+            JournalEvent::LogRecord(lr) => JournalOp::Log(LogOp::from_code(lr.redo_op)),
+            JournalEvent::Checkpoint { .. } => JournalOp::LogCheckpoint,
+            JournalEvent::TornPage { .. } => JournalOp::TornPage,
+        }
+    }
 }
 
 impl From<LogEvent> for JournalEvent {
@@ -373,7 +863,12 @@ fn parse_logrec(page: &[u8], pos: usize) -> Option<(LogRecord, usize)> {
         return None;
     }
     let client_data_len = le::u16(h, 0x18).unwrap_or(0);
-    let lcns = le::u16(h, 0x38).unwrap_or(0) as usize;
+    // Header layout (ntfsdoc "Log Record"): 0x28 redo_op, 0x2A undo_op,
+    // 0x2C redo_off, 0x2E redo_len, 0x30 undo_off, 0x32 undo_len,
+    // 0x34 target_attr, 0x36 lcns_to_follow, 0x38 record_offset,
+    // 0x3A attr_list_offset, 0x40 mft_cluster_index, then the LCN list
+    // and the client data (redo/undo buffers).
+    let lcns = le::u16(h, 0x36).unwrap_or(0) as usize;
     if lcns > 64 {
         return None; // an LCN list that long is not a record
     }
@@ -386,6 +881,15 @@ fn parse_logrec(page: &[u8], pos: usize) -> Option<(LogRecord, usize)> {
     if pos + extent > page.len() {
         return None;
     }
+    // Client data follows the LCN list, capped at the page-bounded extent.
+    let data_start = pos + LOGREC_HDR + lcns * 8;
+    let data_end = (data_start + client_data_len as usize)
+        .min(data_start + MAX_CLIENT_DATA)
+        .min(pos + extent);
+    let client_data = page
+        .get(data_start..data_end)
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
     Some((
         LogRecord {
             this_lsn,
@@ -397,8 +901,16 @@ fn parse_logrec(page: &[u8], pos: usize) -> Option<(LogRecord, usize)> {
             flags: le::u16(h, 0x24).unwrap_or(0),
             redo_op: le::u16(h, 0x28).unwrap_or(0),
             undo_op: le::u16(h, 0x2A).unwrap_or(0),
+            redo_offset: le::u16(h, 0x2C).unwrap_or(0),
             redo_len: le::u16(h, 0x2E).unwrap_or(0),
+            undo_offset: le::u16(h, 0x30).unwrap_or(0),
             undo_len: le::u16(h, 0x32).unwrap_or(0),
+            target_attribute: le::u16(h, 0x34).unwrap_or(0),
+            lcns_to_follow: lcns as u16,
+            record_offset: le::u16(h, 0x38).unwrap_or(0),
+            attr_list_offset: le::u16(h, 0x3A).unwrap_or(0),
+            mft_cluster_index: le::u64(h, 0x40).unwrap_or(0),
+            client_data,
             disk_offset: None,
             extent,
         },

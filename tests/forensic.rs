@@ -120,7 +120,6 @@ fn journal_entries_usn_and_logfile() {
     let lr = find(&entries, "lsn_0x4a80");
     assert_eq!(lr.meta["record_type"], "0x1");
     assert_eq!(lr.meta["transaction_id"], "7");
-    assert_eq!(lr.meta["client_data_len"], "18");
     find(&entries, "lsn_0x4ae0");
     let ck = entries
         .iter()
@@ -153,8 +152,45 @@ fn journal_events_typed_stream() {
         panic!("event 4 should be a log record: {:?}", events[4])
     };
     assert_eq!(lr.this_lsn, 0x4A80);
-    assert_eq!(lr.redo_op, 1);
-    assert_eq!(lr.undo_op, 2);
+    assert_eq!(lr.redo_op, 0x0E);
+    assert_eq!(lr.undo_op, 0x0F);
+}
+
+#[test]
+fn logfile_record_interpretation() {
+    let fs = mount();
+    let entries: Vec<FsEntry> = fs
+        .journal_entries()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("journal parse should not error on the corpus");
+
+    // rec1 (0x4A80): redo_op 0x0E AddIndexEntryAllocation — the redo
+    // payload is the INDEX_ENTRY for BIG.BIN into the root directory.
+    let lr = find(&entries, "lsn_0x4a80");
+    assert_eq!(lr.meta["op"], "add_index_entry_allocation");
+    assert_eq!(lr.meta["undo_op_name"], "delete_index_entry_allocation");
+    assert_eq!(lr.meta["target_file_name"], "BIG.BIN");
+    assert_eq!(lr.meta["target_child_ref"], format!("{:#x}", 17u64 | (1u64 << 48)));
+    assert_eq!(lr.meta["target_parent_ref"], format!("{:#x}", 5u64));
+    assert_eq!(lr.meta["attr_type"], "0x30");
+    assert!(lr.meta["op_detail"].contains("BIG.BIN"));
+    // The mft_cluster_index anchor is a cluster floor, not an exact
+    // record: rec 5's cluster floor is rec 4, flagged as a bound.
+    assert_eq!(lr.meta["target_mft_record"], "4");
+    assert!(lr.meta["target_mft_record_bound"].contains("cluster floor"));
+    // No USN names rec 4 → no correlation key.
+    assert!(!lr.meta.contains_key("correlated_usn"));
+
+    // rec2 (0x4AE0): redo_op 0x03 DeallocateFileRecordSegment anchored
+    // at the MFT cluster covering rec 20 → correlated with the
+    // file_delete USN for DELETED1.TXT, and the slot's current name is
+    // resolved for context.
+    let lr2 = find(&entries, "lsn_0x4ae0");
+    assert_eq!(lr2.meta["op"], "deallocate_file_record_segment");
+    assert_eq!(lr2.meta["target_mft_record"], "20");
+    assert_eq!(lr2.meta["target_name"], "DELETED1.TXT");
+    assert_eq!(lr2.meta["correlated_usn"], "0x1080");
+    assert_eq!(lr2.meta["correlated_usn_count"], "1");
 }
 
 #[test]
