@@ -847,3 +847,747 @@ fn dir_with_short_isize_still_walks() {
         "short i_size hid /subdir/inner.txt: {paths:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Coverage-oriented tests: feature flags, recovery-note paths and hostile
+// mutations of the synthetic corpus.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parser_name_and_source() {
+    assert_eq!(Ext4Parser.name(), "ext4");
+    let img = common::build_ext4();
+    let len = img.len() as u64;
+    let fs = Ext4Parser.mount(Arc::new(img) as Arc<dyn ByteSource>).unwrap();
+    assert_eq!(fs.source().len(), len);
+}
+
+#[test]
+fn ext3_variant_without_extents() {
+    // Journal but no INCOMPAT_EXTENTS → the volume reports as ext3.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, 1024 + 0x60, 0x0002); // incompat = filetype only
+    let fs = Ext4Parser.mount(Arc::new(img) as Arc<dyn ByteSource>).unwrap();
+    assert_eq!(fs.info().fs_type, "EXT3");
+    assert_eq!(fs.info().meta["ext_variant"], "ext3");
+}
+
+#[test]
+fn htree_dir_flag_surfaced() {
+    // Set EXT4_INDEX_FL on /subdir — leaf blocks still store linear
+    // dirents so the walk is unaffected, but `htree` must be flagged.
+    let mut img = common::build_ext4();
+    let o = common::inode_off(12) + 0x20;
+    common::w32(&mut img, o, common::EXT4_EXTENTS_FL | 0x1000);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let d = find(&entries, "subdir");
+    assert_eq!(d.meta["htree"], "true");
+    // Contents still walked linearly.
+    assert!(entries.iter().any(|e| e.path == "/subdir/inner.txt"));
+}
+
+#[test]
+fn encrypt_casefold_flags_surfaced() {
+    let mut img = common::build_ext4();
+    let o = common::inode_off(11) + 0x20;
+    common::w32(&mut img, o, common::EXT4_EXTENTS_FL | 0x0000_0800 | 0x4000_0000);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "hello.txt");
+    assert_eq!(e.meta["encrypted"], "true");
+    assert_eq!(e.meta["casefold"], "true");
+}
+
+#[test]
+fn orphan_special_inode_is_other() {
+    // An allocated, unreferenced socket inode → orphan artefact of kind
+    // Other (not File/Dir/Symlink).
+    let mut img = common::build_ext4();
+    common::put_inode(
+        &mut img, 50, 0o140777, 0, 0, 0, 0, [0; 60], 0, 1_705_314_620, 0, None, 0,
+    );
+    common::set_inode_bit(&mut img, 50);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_50");
+    assert_eq!(e.kind, EntryKind::Other);
+    assert_eq!(e.meta["orphan"], "true");
+}
+
+#[test]
+fn deleted_inode_map_unreadable_is_unknown() {
+    // Trash the deleted inode's extent magic: the block map cannot be
+    // parsed → RecoveryState::Unknown with an explanatory note.
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::inode_off(13) + 0x28, 0xBEEF);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_13");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unknown
+        }
+    ));
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("block map unreadable")));
+}
+
+#[test]
+fn deleted_inode_extent_hole_partial() {
+    // ino 13 declares two blocks but its surviving extent only maps the
+    // first → partial recovery plus an "extent info lost" note.
+    let mut img = common::build_ext4();
+    let o = common::inode_off(13);
+    common::w32(&mut img, o + 4, 2000); // size → 2 blocks expected
+    common::w32(&mut img, o + 0x6C, 0);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_13");
+    match e.status {
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::PartiallyOverwritten { .. },
+        } => {}
+        other => panic!("expected partial, got {other:?}"),
+    }
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("extent info lost")));
+}
+
+#[test]
+fn group_flag_notes_on_recovery() {
+    // (a) BG_BLOCK_UNINIT → allocation-status disclaimer note.
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::blk_off(common::GDT_BLK) + 0x12, 0x0002);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_13");
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("block bitmap marked uninitialised")));
+
+    // (b) block bitmap unreadable → "bitmap read failed" note.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::blk_off(common::GDT_BLK), 9000);
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    let ok: Vec<FsEntry> = items.into_iter().filter_map(|i| i.ok()).collect();
+    let e = find(&ok, "ino_13");
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("block bitmap read failed")));
+}
+
+#[test]
+fn inode_uninit_group_skips_deleted_scan() {
+    // BG_INODE_UNINIT|BG_INODE_ZEROED guarantees unallocated inode slots
+    // are zeroed — the deleted-inode scan must skip them entirely.
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::blk_off(common::GDT_BLK) + 0x12, 0x0005);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!entries.iter().any(|e| e.name == "ino_13"));
+    // Carved dirents and allocated orphans are unaffected.
+    assert!(entries.iter().any(|e| e.name == "notes.txt"));
+    assert!(entries.iter().any(|e| e.name == "ino_20"));
+}
+
+#[test]
+fn dirent_ino_beyond_table_errors_leniently() {
+    // Point hello.txt's dirent at inode 200 (past s_inodes_count) —
+    // read_inode fails → Err item, walk continues.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::dirent_off(40, 24), 200);
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    assert!(items.iter().any(|i| i.is_err()));
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok().map(|e| e.name.clone()))
+        .collect();
+    assert!(names.iter().any(|n| n == "hello2.txt"));
+    assert!(!names.iter().any(|n| n == "hello.txt"));
+}
+
+#[test]
+fn dead_dirent_ino_zero_skipped() {
+    // A live-scanned dirent with inode 0 is a dead slot — never emitted.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::dirent_off(40, 140), 0); // "evil.doc" slot
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!entries.iter().any(|e| e.name == "evil.doc"));
+}
+
+#[test]
+fn carved_duplicate_ino_suppressed() {
+    // Second carved dirent pointing at an already-emitted deleted inode
+    // must be suppressed (dedup via deleted_seen).
+    let mut img = common::build_ext4();
+    // subdir block 42: "inner.txt" rec_len covers the rest; slack carving
+    // scans it. Add "dup.txt" → ino 24 (same as notes.txt's inode).
+    let inner_pos = 24usize; // ".", ".." entries occupy 0..24
+    common::put_dirent(&mut img, 42, inner_pos + 44, 24, 20, b"dup.txt", common::FT_REG);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!entries.iter().any(|e| e.name == "dup.txt"));
+    assert_eq!(
+        entries.iter().filter(|e| e.name == "notes.txt").count(),
+        1
+    );
+}
+
+#[test]
+fn carved_dirent_odd_filetypes() {
+    // ino-0 carved dirents: file_type DIR → Directory; an unusual type
+    // (socket=5) → Other.
+    let mut img = common::build_ext4();
+    let inner_pos = 24usize;
+    common::put_dirent(&mut img, 42, inner_pos + 44, 0, 20, b"gone.d", common::FT_DIR);
+    common::put_dirent(&mut img, 42, inner_pos + 64, 0, 20, b"sock.s", 5);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(find(&entries, "gone.d").kind, EntryKind::Directory);
+    assert_eq!(find(&entries, "sock.s").kind, EntryKind::Other);
+}
+
+#[test]
+fn corrupt_dir_extent_map_lenient() {
+    // Corrupt subdir's extent magic: its dirent read errors (lenient),
+    // the dir's children are unreachable, everything else still walks.
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::inode_off(12) + 0x28, 0xBEEF);
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    assert!(items.iter().any(|i| i.is_err()));
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok().map(|e| e.path.clone()))
+        .collect();
+    assert!(names.iter().any(|p| p == "/subdir"));
+    assert!(!names.iter().any(|p| p == "/subdir/inner.txt"));
+    assert!(names.iter().any(|p| p == "/hello.txt"));
+}
+
+#[test]
+fn corrupt_extent_live_file_read_errors() {
+    // Corrupt hello.txt's extent magic: emit_live flags the map error;
+    // read_file must then fail cleanly rather than panic.
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::inode_off(11) + 0x28, 0xBEEF);
+    let fs = Ext4Parser.mount(Arc::new(img) as Arc<dyn ByteSource>).unwrap();
+    let items: Vec<_> = fs.walk().collect();
+    assert!(items.iter().any(|i| i.is_err()));
+    let e = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok())
+        .find(|e| e.name == "hello.txt")
+        .expect("hello.txt entry still emitted with empty ranges");
+    assert!(fs.read_file(e).is_err());
+}
+
+#[test]
+fn sparse_dir_reads_across_hole() {
+    // subdir's extent maps only logical block 1 (a hole at logical 0):
+    // the read must pad the hole so dirents keep their offsets.
+    let mut img = common::build_ext4();
+    let o = common::inode_off(12) + 0x28;
+    common::w32(&mut img, o + 12, 1); // extent logical = 1 (hole at 0)
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    let paths: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok().map(|e| e.path.clone()))
+        .collect();
+    // Logical block 0 is a zeroed hole → corrupt dirent header → Err item.
+    assert!(items.iter().any(|i| i.is_err()));
+    assert!(
+        paths.iter().any(|p| p == "/subdir/inner.txt"),
+        "hole padding shifted dirents: {paths:?}"
+    );
+}
+
+#[test]
+fn mount_without_orphans_skips_inode_scan() {
+    let opts = MountOptions {
+        include_orphans: false,
+        ..Default::default()
+    };
+    let entries: Vec<_> = Ext4Parser
+        .mount_with(
+            Arc::new(common::build_ext4()) as Arc<dyn ByteSource>,
+            &opts,
+        )
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    // The unallocated-inode / orphan scan is skipped.
+    assert!(!entries.iter().any(|e| e.name.starts_with("ino_")));
+    // Live tree and slack carving are unaffected.
+    assert!(entries.iter().any(|e| e.name == "hello.txt"));
+    assert!(entries.iter().any(|e| e.name == "notes.txt"));
+}
+
+#[test]
+fn unallocated_second_group_bitmap_fails() {
+    // Corrupt group 1's block-bitmap pointer: its space is conservatively
+    // treated as allocated; group 0's free ranges still enumerate.
+    let mut img = common::build_ext4_two_groups();
+    common::w32(&mut img, common::blk_off(common::GDT_BLK) + 32, 9000);
+    let fs = Ext4Parser.mount(Arc::new(img) as Arc<dyn ByteSource>).unwrap();
+    let ranges = fs.unallocated_ranges();
+    assert!(!ranges.is_empty());
+    // Nothing reported inside group 1 (blocks ≥ 128).
+    assert!(ranges.iter().all(|(o, _)| *o < 128 * 1024));
+    // Group 0's data area is still free.
+    let t = common::blk_off(100) as u64;
+    assert!(ranges.iter().any(|(o, l)| *o <= t && t < o + l));
+}
+
+#[test]
+fn inode_reader_eof_on_short_source() {
+    // Truncate so big2.dat's second data block is gone — the reader hits
+    // a zero-length source read and stops instead of erroring.
+    let mut img = common::build_ext4();
+    img.truncate(common::blk_off(56));
+    let fs = Ext4Parser.mount(Arc::new(img) as Arc<dyn ByteSource>).unwrap();
+    let entries: Vec<_> = fs.walk().collect::<Result<Vec<_>, _>>().unwrap();
+    let e = find(&entries, "big2.dat");
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut fs.read_file(e).unwrap(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 1024);
+    assert_eq!(&buf[..10], b"BIG2-FIRST");
+}
+
+#[test]
+fn carve_region_honours_large_alignment() {
+    let fs = mount();
+    // align = 2048 (a multiple of the 1 KiB block size) → step 2048.
+    let hits: Vec<_> = fs
+        .carve_region(0, 128 * 1024, 2048)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(hits.iter().all(|h| h.offset % 2048 == 0));
+}
+
+#[test]
+fn inline_deleted_missing_spillover_partial() {
+    // ino 35 (deleted inline file): claim a size beyond the 60-byte
+    // i_block payload without the system.data xattr → partial recovery
+    // plus a spillover-lost note.
+    let mut img = common::build_ext4();
+    let o = common::inode_off(35);
+    common::w32(&mut img, o + 4, 75);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = entries
+        .iter()
+        .find(|e| e.meta.get("inode").map(|s| s == "35").unwrap_or(false))
+        .expect("ino 35 artefact missing");
+    match e.status {
+        FsEntryStatus::Deleted {
+            recovery:
+                RecoveryState::PartiallyOverwritten {
+                    recovered_bytes,
+                    total_bytes,
+                },
+        } => assert_eq!((recovered_bytes, total_bytes), (60, 75)),
+        other => panic!("expected partial inline recovery, got {other:?}"),
+    }
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("system.data xattr missing")));
+}
+
+#[test]
+fn deleted_empty_and_zeroed_map_inodes() {
+    // ino 37: plausible mode + size but no map survives → Unrecoverable.
+    // ino 38: plausible mode + dtime, size 0 → Intact (nothing to lose).
+    let mut img = common::build_ext4();
+    common::put_inode(
+        &mut img, 37, 0o100644, 500, 0, 0, 0, [0; 60], 1_705_320_500, 1_705_314_620, 0, None, 0,
+    );
+    common::put_inode(
+        &mut img, 38, 0o100644, 0, 0, 0, 0, [0; 60], 1_705_320_600, 1_705_314_620, 0, None, 0,
+    );
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e37 = find(&entries, "ino_37");
+    assert!(matches!(
+        e37.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unrecoverable
+        }
+    ));
+    assert!(e37
+        .meta
+        .values()
+        .any(|v| v.contains("no block map survives")));
+    let e38 = find(&entries, "ino_38");
+    assert!(matches!(
+        e38.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    ));
+}
+
+#[test]
+fn multi_extent_slack_points_into_second_run() {
+    // big.dat (1500 B over two extents): slack begins inside the second
+    // extent at block 48 + 476.
+    let entries = all_entries();
+    let e = find(&entries, "big.dat");
+    assert_eq!(e.meta["slack_len"], "548");
+    assert_eq!(
+        e.meta["slack_offset"],
+        format!("{:#x}", common::blk_off(48) + 476)
+    );
+}
+
+#[test]
+fn inode_bitmap_failure_surfaces_errors() {
+    // Corrupt the inode-bitmap pointer: allocation checks fail; lenient
+    // mode emits Err items and still produces entries.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::blk_off(common::GDT_BLK) + 4, 9000);
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    assert!(items.iter().any(|i| i.is_err()));
+    assert!(items.iter().any(|i| i.is_ok()));
+}
+
+#[test]
+fn slow_symlink_with_corrupt_map_lacks_target() {
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::inode_off(31) + 0x28, 0xBEEF);
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    let e = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok())
+        .find(|e| e.name == "slowlink")
+        .expect("slowlink entry missing");
+    assert!(!e.meta.contains_key("symlink_target"));
+}
+
+#[test]
+fn orphan_chain_marks_deleted_member() {
+    // Extend the orphan chain: ino 26's i_dtime links to deleted ino 13,
+    // which then carries orphan_list evidence in its notes/meta.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::inode_off(26) + 0x14, 13);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_13");
+    assert_eq!(e.meta["orphan_list"], "true");
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("orphan inode list")));
+}
+
+#[test]
+fn dir_trailing_partial_record_skipped() {
+    // Shrink inner.txt's rec_len by 4: the tail < 8 bytes of the block
+    // must be skipped as a partial record, not an error.
+    let mut img = common::build_ext4();
+    let pos = common::dirent_off(42, 24);
+    let cur = u16::from_le_bytes([img[pos + 4], img[pos + 5]]);
+    common::w16(&mut img, pos + 4, cur - 4);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(entries.iter().any(|e| e.path == "/subdir/inner.txt"));
+}
+
+#[test]
+fn orphan_with_unreadable_map_noted() {
+    // Allocated orphan inode with corrupt extents → the artefact is
+    // emitted with a "block map unreadable" note and Unknown recovery.
+    let mut img = common::build_ext4();
+    common::w16(&mut img, common::inode_off(20) + 0x28, 0xBEEF);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_20");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Unknown
+        }
+    ));
+    assert!(e
+        .meta
+        .values()
+        .any(|v| v.contains("block map unreadable")));
+}
+
+#[test]
+fn inline_dir_xattr_spill_ranges() {
+    // Give inlinedir a system.data ibody xattr — the spill region counts
+    // as a second provenance range for the directory artefact.
+    let mut img = common::build_ext4();
+    let o = common::inode_off(32) + 160;
+    common::w32(&mut img, o, 0xEA02_0000);
+    img[o + 4] = 11; // name_len
+    img[o + 5] = 7; // system index
+    common::w16(&mut img, o + 6, 241); // value_offs (inode-relative)
+    common::w32(&mut img, o + 12, 20); // value_size
+    img[o + 20..o + 31].copy_from_slice(b"system.data");
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "inlinedir");
+    assert_eq!(e.allocated_ranges.len(), 2, "{:?}", e.allocated_ranges);
+}
+
+#[test]
+fn empty_dir_map_walks() {
+    // A directory inode with no extents flag and no blocks → Empty map;
+    // the dir is emitted, nothing inside, no error.
+    let mut img = common::build_ext4();
+    let o = common::inode_off(12);
+    common::w32(&mut img, o + 0x20, 0); // clear EXT4_EXTENTS_FL
+    common::w32(&mut img, o + 0x1C, 0); // i_blocks = 0
+    let items: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect();
+    let paths: Vec<String> = items
+        .iter()
+        .filter_map(|i| i.as_ref().ok().map(|e| e.path.clone()))
+        .collect();
+    assert!(paths.iter().any(|p| p == "/subdir"));
+    assert!(!paths.iter().any(|p| p == "/subdir/inner.txt"));
+}
+
+#[test]
+fn duplicate_dir_dirent_not_rewalked() {
+    // A second dirent naming the same dir inode: the entry is emitted but
+    // the directory is not re-queued or re-walked.
+    let mut img = common::build_ext4();
+    // Root dir "x" entry at pos 304 has rec_len 720. Shrink to 300 and
+    // insert "subdir2" → ino 12 at pos 604 covering the block tail.
+    let x = common::dirent_off(40, 304);
+    common::w16(&mut img, x + 4, 300);
+    common::put_dirent(&mut img, 40, 604, 12, (1024 - 604) as u16, b"subdir2", common::FT_DIR);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(entries.iter().any(|e| e.path == "/subdir2"));
+    assert_eq!(
+        entries.iter().filter(|e| e.path == "/subdir2/inner.txt").count(),
+        0,
+        "directory must not be walked twice"
+    );
+    assert_eq!(
+        entries.iter().filter(|e| e.path == "/subdir/inner.txt").count(),
+        1
+    );
+}
+
+#[test]
+fn deleted_zero_size_extent_inode_intact() {
+    // Unallocated inode: extents flag set, size 0 → nothing to lose.
+    let mut img = common::build_ext4();
+    common::put_inode(
+        &mut img, 37, 0o100644, 0, 0, 2, common::EXT4_EXTENTS_FL,
+        common::extent_root(&[(0, 1, 43)]), 1_705_320_500, 1_705_314_620, 0, None, 0,
+    );
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "ino_37");
+    assert!(matches!(
+        e.status,
+        FsEntryStatus::Deleted {
+            recovery: RecoveryState::Intact
+        }
+    ));
+}
+
+#[test]
+fn flex_bg_and_empty_label_meta() {
+    let mut img = common::build_ext4();
+    // Enable flex_bg + set log_groups_per_flex; clear the volume label.
+    common::w32(&mut img, 1024 + 0x60, 0x0002 | 0x0040 | 0x0200);
+    img[1024 + 0x174] = 4;
+    img[1024 + 0x78..1024 + 0x88].fill(0);
+    let fs = Ext4Parser.mount(Arc::new(img) as Arc<dyn ByteSource>).unwrap();
+    let info = fs.info();
+    assert_eq!(info.meta["incompat_flex_bg"], "true");
+    assert_eq!(info.meta["groups_per_flex"], "16");
+    assert_eq!(info.label, None);
+}
+
+#[test]
+fn carve_region_surfaces_io_errors() {
+    // A source that errors past a cutoff: the carver must yield Err items.
+    struct Flaky(Vec<u8>, u64);
+    impl ByteSource for Flaky {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            if off >= self.1 {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "read fault"));
+            }
+            let n = buf.len().min(self.0.len().saturating_sub(off as usize));
+            buf[..n].copy_from_slice(&self.0[off as usize..off as usize + n]);
+            Ok(n)
+        }
+    }
+    let img = common::build_ext4();
+    let src: Arc<dyn ByteSource> = Arc::new(Flaky(img, common::blk_off(50) as u64));
+    let fs = Ext4Parser.mount(src).unwrap();
+    let items: Vec<_> = fs.carve_region(0, 200 * 1024, 1024).unwrap().collect();
+    assert!(items.iter().any(|i| i.is_err()));
+}
+
+#[test]
+fn mount_fails_on_truncated_gdt() {
+    // Cut inside the GDT (offset 2048..2080): mount must fail Truncated.
+    let img = common::build_ext4();
+    let src: Arc<dyn ByteSource> = Arc::new(img[..2060].to_vec());
+    assert!(Ext4Parser.mount(src).is_err());
+}
+
+#[test]
+fn detect_certain_on_volume_sized_image() {
+    // The corpus' declared block count exceeds the padded image by one
+    // block; append it so the detect() length check fires → Certain.
+    let mut img = common::build_ext4();
+    img.resize(img.len() + 1024, 0);
+    assert_eq!(
+        Ext4Parser.detect(&img as &dyn ByteSource),
+        DetectConfidence::Certain
+    );
+}
+
+#[test]
+fn orphan_cycle_terminates() {
+    // ino 26's i_dtime links to itself → the chain walk must terminate.
+    let mut img = common::build_ext4();
+    common::w32(&mut img, common::inode_off(26) + 0x14, 26);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(find(&entries, "ino_26").meta["orphan_list"], "true");
+}
+
+#[test]
+fn carved_dirent_into_out_of_range_inode() {
+    // A carved dirent pointing past s_inodes_count counts as "allocated"
+    // (conservative) → the reuse branch, not a crash.
+    let mut img = common::build_ext4();
+    let inner_pos = 24usize;
+    common::put_dirent(&mut img, 42, inner_pos + 44, 200, 20, b"far.out", common::FT_REG);
+    let entries: Vec<_> = Ext4Parser
+        .mount(Arc::new(img) as Arc<dyn ByteSource>)
+        .unwrap()
+        .walk()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let e = find(&entries, "far.out");
+    assert_eq!(e.meta["inode_reused"], "true");
+}

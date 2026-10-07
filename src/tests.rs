@@ -555,3 +555,358 @@ fn inode_short_buffer_and_fast_symlink() {
     let ino = Inode::parse(&raw, 1, 0).unwrap();
     assert!(!ino.is_fast_symlink());
 }
+
+/// Triple-indirect + NULL-pointer hole coverage. A tiny 16-byte
+/// `block_size` keeps the slot counts small (4 ptrs/block) so a triple
+/// tree fits in a test image; the walker doesn't care that real ext
+/// volumes never use such a block size.
+#[test]
+fn indirect_triple_and_null_holes() {
+    let bs = 16u64;
+    let mut src = vec![0u8; 2048];
+    // Inode: all 12 direct NULL (logical 0..12), slot12 single-indirect
+    // NULL → +4 slots (logical 12..16), slot13 double-indirect NULL →
+    // +16 slots (logical 16..32), slot14 triple → block 10.
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w32(&mut raw, 0x04, 1 << 20); // huge size → cap generous
+    w32(&mut raw, 0x1C, 64);
+    w32(&mut raw, 0x28 + 14 * 4, 10); // triple-indirect root
+    let ino = Inode::parse(&raw, 1, 0).unwrap();
+    // Triple root @10: [NULL → +16 slots, 20 (double), 0, 0].
+    // Logical at this point: 12+4+16 = 32; NULL slot → +16 → 48;
+    // double @20: [NULL → +4 → 52, 30 (single), 0, 0];
+    // single @30: [90 (data), 0, 0, 0] → run at logical 52.
+    w32(&mut src, 10 * bs as usize, 0); // NULL → hole of 16 slots
+    w32(&mut src, 10 * bs as usize + 4, 20);
+    w32(&mut src, 20 * bs as usize, 0); // NULL → hole of 4 slots
+    w32(&mut src, 20 * bs as usize + 4, 30);
+    w32(&mut src, 30 * bs as usize, 90);
+    match extent::map_inode(&src, &ino, bs, 1000).unwrap() {
+        BlockMap::Runs(runs) => {
+            assert_eq!(runs.len(), 1);
+            assert_eq!((runs[0].logical, runs[0].phys, runs[0].len), (52, 90, 1));
+        }
+        _ => panic!("expected Runs"),
+    }
+}
+
+/// An indirect block pointer beyond the image must produce a Truncated
+/// error, not a panic.
+#[test]
+fn indirect_beyond_image_truncates() {
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w32(&mut raw, 0x04, 14 * 1024);
+    w32(&mut raw, 0x1C, 30);
+    w32(&mut raw, 0x28 + 12 * 4, 50); // single-indirect → block 50
+    let ino = Inode::parse(&raw, 1, 0).unwrap();
+    let src = vec![0u8; 1024]; // way too small
+    assert!(extent::map_inode(&src, &ino, 1024, 1000).is_err());
+}
+
+/// An extent index child pointing beyond the image must produce a
+/// Truncated error, not a panic.
+#[test]
+fn extent_child_beyond_image_truncates() {
+    let mut b = [0u8; 60];
+    w16(&mut b, 0, 0xF30A);
+    w16(&mut b, 2, 1);
+    w16(&mut b, 4, 4);
+    w16(&mut b, 6, 1); // depth 1
+    w32(&mut b, 16, 999); // child leaf at fs block 999 — beyond image
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w32(&mut raw, 0x04, 4096);
+    w32(&mut raw, 0x1C, 16);
+    w32(&mut raw, 0x20, inode::EXT4_EXTENTS_FL);
+    raw[0x28..0x28 + 60].copy_from_slice(&b);
+    let ino = Inode::parse(&raw, 1, 0).unwrap();
+    let src = vec![0u8; 2048];
+    assert!(extent::map_inode(&src, &ino, 1024, 1000).is_err());
+}
+
+#[test]
+fn journal_info_tag_size_block_offset_features() {
+    use crate::journal::JournalInfo;
+    let mk = |incompat: u32| JournalInfo {
+        version: 2,
+        block_size: 1024,
+        maxlen: 16,
+        first: 1,
+        sequence: 5,
+        start: 1,
+        nr_users: 1,
+        feature_compat: 0,
+        feature_incompat: incompat,
+        disk_offset: 0,
+        ranges: vec![(1000, 2048), (4000, 1024)],
+    };
+    assert_eq!(mk(0).tag_size(), 8);
+    assert_eq!(mk(0x02).tag_size(), 12); // 64bit
+    assert_eq!(mk(0x10).tag_size(), 16); // csum_v3
+    // block_offset walks the extent list; beyond it → None.
+    let j = mk(0);
+    assert_eq!(j.block_offset(0), Some(1000));
+    assert_eq!(j.block_offset(1), Some(2024));
+    assert_eq!(j.block_offset(2), Some(4000));
+    assert_eq!(j.block_offset(3), None);
+    // Feature names joined for FsInfo.meta.
+    assert_eq!(mk(0x23).feature_names(), vec!["revoke", "64bit", "fast_commit"]);
+}
+
+#[test]
+fn meta_layout_classifies_targets() {
+    use crate::journal::{JournalTarget, MetaLayout};
+    let l = MetaLayout {
+        blocks_count: 100,
+        superblock: 1,
+        backups: vec![50],
+        gdt: (2, 4),
+        tables: vec![(0, 5, 6, 7, 10)],
+    };
+    assert!(matches!(l.classify(150), JournalTarget::OutOfVolume));
+    assert!(matches!(l.classify(1), JournalTarget::Superblock));
+    assert!(matches!(l.classify(50), JournalTarget::Superblock)); // backup
+    assert!(matches!(l.classify(3), JournalTarget::Gdt));
+    assert!(matches!(l.classify(5), JournalTarget::BlockBitmap(0)));
+    assert!(matches!(l.classify(6), JournalTarget::InodeBitmap(0)));
+    assert!(matches!(l.classify(8), JournalTarget::InodeTable(0)));
+    assert!(matches!(l.classify(40), JournalTarget::Data));
+    // name() strings cover every variant.
+    assert_eq!(JournalTarget::Data.name(), "data");
+    assert_eq!(JournalTarget::Superblock.name(), "superblock");
+    assert_eq!(JournalTarget::Gdt.name(), "gdt");
+    assert_eq!(JournalTarget::BlockBitmap(2).name(), "block_bitmap_g2");
+    assert_eq!(JournalTarget::InodeBitmap(2).name(), "inode_bitmap_g2");
+    assert_eq!(JournalTarget::InodeTable(2).name(), "inode_table_g2");
+    assert_eq!(JournalTarget::OutOfVolume.name(), "out_of_volume");
+}
+
+/// Prior-state evidence: metadata targets always flag; data targets
+/// only when the block is now free; unknown allocation → not flagged.
+#[test]
+fn journal_tag_prior_state_logic() {
+    use crate::journal::{JournalTag, JournalTarget};
+    let mk = |t: JournalTarget, a: Option<bool>| JournalTag {
+        fs_block: 0,
+        flags: 0,
+        escaped: false,
+        deleted: false,
+        uuid_present: false,
+        data_offset: None,
+        target: t,
+        target_allocated: a,
+        tag_offset: 0,
+    };
+    assert!(mk(JournalTarget::InodeTable(0), Some(true)).prior_state());
+    assert!(mk(JournalTarget::Data, Some(false)).prior_state()); // freed
+    assert!(!mk(JournalTarget::Data, Some(true)).prior_state());
+    assert!(!mk(JournalTarget::Data, None).prior_state());
+    assert!(!mk(JournalTarget::OutOfVolume, Some(true)).prior_state());
+}
+
+#[test]
+fn superblock_rev0_64bit_and_huge_groups() {
+    let base = || {
+        let mut img = vec![0u8; 4096];
+        let sb = 1024;
+        w32(&mut img, sb, 64);
+        w32(&mut img, sb + 4, 256);
+        w32(&mut img, sb + 0x14, 1);
+        w32(&mut img, sb + 0x20, 8192);
+        w32(&mut img, sb + 0x28, 64);
+        w16(&mut img, sb + 0x38, 0xEF53);
+        w16(&mut img, sb + 0x58, 256);
+        img
+    };
+    // rev_level 0 → fixed 128-byte inodes (s_inode_size ignored).
+    let mut i = base();
+    w32(&mut i, 1024 + 0x4C, 0); // rev 0
+    w16(&mut i, 1024 + 0x58, 0xBEEF);
+    let s = Superblock::parse(&i).unwrap();
+    assert_eq!(s.inode_size, 128);
+    // INCOMPAT_64BIT: high block-count word + s_desc_size honoured.
+    let mut i = base();
+    w32(&mut i, 1024 + 0x60, 0x0080);
+    w16(&mut i, 1024 + 0xFE, 64); // s_desc_size
+    let s = Superblock::parse(&i).unwrap();
+    assert_eq!(s.desc_size, 64);
+    // desc_size below 32 still clamps to 32.
+    let mut i = base();
+    w32(&mut i, 1024 + 0x60, 0x0080);
+    w16(&mut i, 1024 + 0xFE, 16);
+    let s = Superblock::parse(&i).unwrap();
+    assert_eq!(s.desc_size, 32);
+    // Absurd group count → corrupt. Needs the 64-bit high word so the
+    // block count can exceed 2^32 while the earlier geometry stays sane.
+    let mut i = base();
+    w32(&mut i, 1024 + 0x60, 0x0080); // INCOMPAT_64BIT
+    w32(&mut i, 1024 + 0x150, 100); // s_blocks_count_hi → ~430G blocks
+    let s = Superblock::parse(&i);
+    assert!(s.is_err(), "expected implausible group count to fail");
+    // Truncated superblock read → error, not panic.
+    assert!(Superblock::parse(&vec![0u8; 1500]).is_err());
+}
+
+#[test]
+fn xattr_edge_cases() {
+    // name_len running past the buffer → iteration stops, no panic.
+    let mut blk = vec![0u8; 64];
+    w32(&mut blk, 0, 0xEA02_0000);
+    blk[32] = 200; // name_len beyond block
+    blk[33] = 1;
+    assert!(inode::parse_xattr_block(&blk).is_empty());
+    // Unknown name index → bare name, no prefix.
+    let mut blk = vec![0u8; 64];
+    w32(&mut blk, 0, 0xEA02_0000);
+    blk[32] = 4;
+    blk[33] = 9; // unlisted index
+    blk[48..52].copy_from_slice(b"what");
+    assert_eq!(inode::parse_xattr_block(&blk), vec!["what"]);
+    // e_value_inum set → value lives in another inode → None.
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w16(&mut raw, 0x80, 32);
+    w32(&mut raw, 160, 0xEA02_0000);
+    raw[164] = 11;
+    raw[165] = inode::XATTR_IDX_SYSTEM;
+    w16(&mut raw, 166, 241);
+    w32(&mut raw, 168, 9); // e_value_inum — indirected away
+    w32(&mut raw, 172, 15);
+    raw[180..191].copy_from_slice(b"system.data");
+    let ino = Inode::parse(&raw, 5, 0).unwrap();
+    assert_eq!(
+        ino.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data"),
+        None
+    );
+    // extra_isize pushing the ibody region past the inode → no names.
+    w16(&mut raw, 0x80, 200);
+    let ino = Inode::parse(&raw, 5, 0).unwrap();
+    assert!(ino.ibody_xattr_names().is_empty());
+    assert_eq!(
+        ino.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data"),
+        None
+    );
+}
+
+/// More than `MAX_EXTENT_NODES` nodes must error, not walk forever.
+/// Uses a 24-byte "block size" (eh_max = 1 index entry) and a forward
+/// chain of single-entry index nodes — 64K+2 hops is well under 2 MiB.
+#[test]
+fn extent_tree_node_cap() {
+    const NODES: u64 = (1 << 16) + 2;
+    let bs = 24u64;
+    let base = 10u64;
+    let mut src = vec![0u8; (base + NODES + 2) as usize * bs as usize];
+    // Inode root: depth 1, one idx entry → block `base`.
+    let mut b = [0u8; 60];
+    w16(&mut b, 0, 0xF30A);
+    w16(&mut b, 2, 1);
+    w16(&mut b, 4, 4);
+    w16(&mut b, 6, 1);
+    w32(&mut b, 16, base as u32);
+    // Chain: each node has depth 1 and one idx → next block.
+    for i in 0..NODES {
+        let o = ((base + i) * bs) as usize;
+        w16(&mut src, o, 0xF30A);
+        w16(&mut src, o + 2, 1);
+        w16(&mut src, o + 4, 1);
+        w16(&mut src, o + 6, 1);
+        w32(&mut src, o + 16, (base + i + 1) as u32);
+    }
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w32(&mut raw, 0x04, 4096);
+    w32(&mut raw, 0x1C, 16);
+    w32(&mut raw, 0x20, inode::EXT4_EXTENTS_FL);
+    raw[0x28..0x28 + 60].copy_from_slice(&b);
+    let ino = Inode::parse(&raw, 1, 0).unwrap();
+    let err = extent::map_inode(&src, &ino, bs, 1 << 20).unwrap_err();
+    assert!(err.to_string().contains("nodes"), "{err}");
+}
+
+/// The logical-slot cap cuts an indirect walk whose file's declared size
+/// plus the 4M-slot floor still can't reach its indirect region.
+#[test]
+fn indirect_cap_cuts_walk() {
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w32(&mut raw, 0x04, 0); // size 0
+    w32(&mut raw, 0x1C, 2);
+    w32(&mut raw, 0x28 + 12 * 4, 50); // single-indirect root
+    let ino = Inode::parse(&raw, 1, 0).unwrap();
+    // blocks_count 10 → cap 10; 12 direct slots already exceed it.
+    let mut src = vec![0u8; 64 * 1024];
+    w32(&mut src, 50 * 1024, 60);
+    match extent::map_inode(&src, &ino, 1024, 10).unwrap() {
+        BlockMap::Runs(runs) => assert!(runs.is_empty(), "{runs:?}"),
+        _ => panic!("expected Runs"),
+    }
+}
+
+/// A read failure deep inside a nested indirect level must propagate.
+#[test]
+fn indirect_nested_level_error() {
+    let bs = 16u64;
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w32(&mut raw, 0x04, 1 << 20);
+    w32(&mut raw, 0x1C, 64);
+    w32(&mut raw, 0x28 + 13 * 4, 10); // double-indirect root
+    let ino = Inode::parse(&raw, 1, 0).unwrap();
+    // Double root @10 → indirect @200 — beyond the tiny image.
+    let mut src = vec![0u8; 64 * bs as usize];
+    w32(&mut src, 10 * bs as usize, 200);
+    assert!(extent::map_inode(&src, &ino, bs, 1000).is_err());
+}
+
+/// ibody xattr iteration stops at entry headers/name runs that would
+/// escape the inode buffer.
+#[test]
+fn xattr_truncated_entry_bounds() {
+    let mut raw = vec![0u8; 256];
+    w16(&mut raw, 0x00, 0x8000);
+    w16(&mut raw, 0x80, 32);
+    w32(&mut raw, 160, 0xEA02_0000);
+    // First entry: name_len 64 → next aligned entry offset 244, where
+    // the 16-byte header check (off+16 > raw.len) breaks the loop.
+    raw[164] = 64;
+    raw[165] = 1;
+    raw[180..244].copy_from_slice(&[b'x'; 64]);
+    let ino = Inode::parse(&raw, 5, 0).unwrap();
+    assert_eq!(ino.ibody_xattr_names().len(), 1);
+    // The value lookup walks the same bounds when no name matches.
+    assert_eq!(
+        ino.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data"),
+        None
+    );
+    // name_off + name_len beyond the buffer → break with prior names.
+    let mut raw2 = vec![0u8; 256];
+    w16(&mut raw2, 0x00, 0x8000);
+    w16(&mut raw2, 0x80, 32);
+    w32(&mut raw2, 160, 0xEA02_0000);
+    raw2[164] = 250; // name extends past inode end
+    raw2[165] = 1;
+    let ino = Inode::parse(&raw2, 5, 0).unwrap();
+    assert!(ino.ibody_xattr_names().is_empty());
+    assert_eq!(
+        ino.ibody_xattr_value(inode::XATTR_IDX_SYSTEM, "system.data"),
+        None
+    );
+    // Prefix table: acl/trusted/richacl indexes.
+    let mut blk = vec![0u8; 160];
+    w32(&mut blk, 0, 0xEA02_0000);
+    let mut pos = 32usize;
+    for (idx, name) in [(2u8, "acl_a"), (3, "acl_d"), (4, "cap"), (8, "rcl")] {
+        blk[pos] = name.len() as u8;
+        blk[pos + 1] = idx;
+        blk[pos + 16..pos + 16 + name.len()].copy_from_slice(name.as_bytes());
+        pos = (pos + 16 + name.len() + 3) & !3;
+    }
+    let names = inode::parse_xattr_block(&blk);
+    assert!(names.contains(&"system.posix_acl_access.acl_a".to_string()));
+    assert!(names.contains(&"system.posix_acl_default.acl_d".to_string()));
+    assert!(names.contains(&"trusted.cap".to_string()));
+    assert!(names.contains(&"system.richacl.rcl".to_string()));
+}

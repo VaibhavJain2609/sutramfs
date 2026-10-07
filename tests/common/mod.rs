@@ -1,3 +1,7 @@
+// Each integration-test file gets its own copy of this module; not every
+// helper is used by every test file.
+#![allow(dead_code)]
+
 //! Synthetic ext4/ext2 image construction for tests — the test-corpus
 //! pattern: bytes written field-by-field into a `Vec<u8>`, mounted via
 //! `Arc<Vec<u8>>` as the `ByteSource`. No fixture files, no network.
@@ -337,12 +341,14 @@ fn write_xattrs(img: &mut [u8]) {
 
 const JBD2_MAGIC: u32 = 0xC03B_3998;
 
-fn wj(img: &mut [u8], off: usize, v: u32) {
+/// Big-endian u32 write — jbd2 structures are the only big-endian
+/// structures on an ext filesystem.
+pub fn wj(img: &mut [u8], off: usize, v: u32) {
     img[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
 /// Common 12-byte journal block header.
-fn jbd2_header(img: &mut [u8], blk: u32, blocktype: u32, seq: u32) {
+pub fn jbd2_header(img: &mut [u8], blk: u32, blocktype: u32, seq: u32) {
     let b = blk_off(blk);
     wj(img, b, JBD2_MAGIC);
     wj(img, b + 4, blocktype);
@@ -350,10 +356,25 @@ fn jbd2_header(img: &mut [u8], blk: u32, blocktype: u32, seq: u32) {
 }
 
 /// One 8-byte journal_block_tag (32-bit tags): blocknr be32 + flags be32.
-fn jbd2_tag(img: &mut [u8], blk: u32, pos: usize, fs_block: u32, flags: u32) {
+pub fn jbd2_tag(img: &mut [u8], blk: u32, pos: usize, fs_block: u32, flags: u32) {
     let o = blk_off(blk) + pos;
     wj(img, o, fs_block);
     wj(img, o + 4, flags);
+}
+
+/// One 12-byte journal_block_tag used when the journal advertises
+/// `INCOMPAT_64BIT`: blocknr_lo be32 + flags be32 + blocknr_hi be32.
+pub fn jbd2_tag64(img: &mut [u8], blk: u32, pos: usize, fs_block: u64, flags: u32) {
+    let o = blk_off(blk) + pos;
+    wj(img, o, fs_block as u32);
+    wj(img, o + 4, flags);
+    wj(img, o + 8, (fs_block >> 32) as u32);
+}
+
+/// Rewrite the jbd2 superblock's `s_feature_incompat` (offset 0x28 of the
+/// journal superblock at fs block 30).
+pub fn jbd2_set_feature_incompat(img: &mut [u8], v: u32) {
+    wj(img, blk_off(30) + 0x28, v);
 }
 
 /// jbd2 superblock at block 30 (all big-endian) plus a small transaction
