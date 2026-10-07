@@ -1,0 +1,36 @@
+[package]
+name = "sutram-capi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "C FFI and Python bindings for the SUTRAM-FS forensic filesystem parser family"
+keywords = ["ffi", "c-api", "forensics", "filesystem", "python"]
+categories = ["api-bindings", "filesystem"]
+
+[lib]
+name = "sutram_capi"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Python bindings via PyO3. Off by default: requires a Python toolchain at
+# build time (set PYO3_PYTHON to the interpreter if needed). The pure C FFI
+# surface builds without it.
+python = ["dep:pyo3"]
+default = []
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-fs = { path = "../sutram-fs", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
+sutram-part = { path = "../sutram-part", version = "0.1" }
+sutram-fat = { path = "../sutram-fat", version = "0.1" }
+sutram-exfat = { path = "../sutram-exfat", version = "0.1" }
+sutram-ntfs = { path = "../sutram-ntfs", version = "0.1" }
+sutram-ext4 = { path = "../sutram-ext4", version = "0.1" }
+sutram-btrfs = { path = "../sutram-btrfs", version = "0.1" }
+sutram-f2fs = { path = "../sutram-f2fs", version = "0.1" }
+sutram-xfs = { path = "../sutram-xfs", version = "0.1" }
+sutram-hfs = { path = "../sutram-hfs", version = "0.1" }
+sutram-apfs = { path = "../sutram-apfs", version = "0.1" }
+pyo3 = { version = "0.22", optional = true }
