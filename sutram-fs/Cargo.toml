@@ -1,0 +1,13 @@
+[package]
+name = "sutram-fs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Core forensic filesystem-parser traits and types for the SUTRAM-FS crate family"
+keywords = ["forensics", "filesystem", "dfir", "traits"]
+categories = ["filesystem", "parsing"]
+
+[dependencies]
+sutram-io = { path = "../sutram-io", version = "0.1" }
+sutram-magic = { path = "../sutram-magic", version = "0.1" }
