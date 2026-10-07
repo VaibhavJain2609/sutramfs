@@ -195,7 +195,7 @@ fn truncated_member_is_partially_overwritten() {
         while b.buf.len() % 4 != 0 {
             b.buf.push(0);
         }
-        b.buf.extend_from_slice(&vec![0xDD; 64]);
+        b.buf.extend_from_slice(&[0xDD; 64]);
         off
     };
     let img = b.finish_bare();
@@ -253,7 +253,7 @@ fn garbage_mount_fails() {
     assert!(CpioParser.mount(src(vec![0xAAu8; 512])).is_err());
     // Magic alone isn't enough — an unparseable first header fails too.
     let mut img = b"070701".to_vec();
-    img.extend_from_slice(&vec![0xFF; 200]);
+    img.extend_from_slice(&[0xFF; 200]);
     assert!(CpioParser.mount(src(img)).is_err());
 }
 

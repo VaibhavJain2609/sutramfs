@@ -75,15 +75,13 @@ impl FsParser for ZipParser {
     }
 
     fn detect(&self, src: &dyn ByteSource) -> DetectConfidence {
-        match find_eocd(src) {
-            Ok(Some(_)) => return DetectConfidence::Certain,
-            _ => {}
+        if let Ok(Some(_)) = find_eocd(src) {
+            return DetectConfidence::Certain;
         }
         // No EOCD: a parseable LFH at offset 0 is still strong evidence
         // (streaming-written zips, truncated archives).
-        match parse_lfh(src, 0) {
-            Ok(Some(_)) => return DetectConfidence::High,
-            _ => {}
+        if let Ok(Some(_)) = parse_lfh(src, 0) {
+            return DetectConfidence::High;
         }
         // Self-extracting stub? Probe the first 64 KiB for an LFH.
         if let Ok(Some(_)) = scan_next_lfh(src, 0, src.len().min(EOCD_SEARCH)) {
@@ -458,21 +456,19 @@ fn parse_extra(extra: &[u8], need_uncomp: bool, need_comp: bool, need_off: bool)
                     j += alen;
                 }
             }
-            0x7875 => {
+            0x7875 if f.len() >= 2 => {
                 // Unix uid/gid: ver(1) uid_len(1) uid gid_len(1) gid.
-                if f.len() >= 2 {
-                    let ul = f[1] as usize;
-                    if 2 + ul < f.len() {
-                        let uid = f[2..2 + ul].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
-                        let gl = f[2 + ul] as usize;
-                        let gid = f
-                            .get(3 + ul..3 + ul + gl)
-                            .unwrap_or(&[])
-                            .iter()
-                            .fold(0u64, |a, &b| (a << 8) | b as u64);
-                        out.meta.push(("uid".into(), uid.to_string()));
-                        out.meta.push(("gid".into(), gid.to_string()));
-                    }
+                let ul = f[1] as usize;
+                if 2 + ul < f.len() {
+                    let uid = f[2..2 + ul].iter().fold(0u64, |a, &b| (a << 8) | b as u64);
+                    let gl = f[2 + ul] as usize;
+                    let gid = f
+                        .get(3 + ul..3 + ul + gl)
+                        .unwrap_or(&[])
+                        .iter()
+                        .fold(0u64, |a, &b| (a << 8) | b as u64);
+                    out.meta.push(("uid".into(), uid.to_string()));
+                    out.meta.push(("gid".into(), gid.to_string()));
                 }
             }
             _ => {}
@@ -704,8 +700,10 @@ impl ZipFs {
 
         let (path, mut is_dir) = member_path(&name_raw, flags & FLAG_UTF8 != 0);
         let mut meta: HashMap<String, String> = HashMap::new();
-        let mut ts = Timestamps::default();
-        ts.modified = Some(dos_timestamp(mdate, mtime));
+        let mut ts = Timestamps {
+            modified: Some(dos_timestamp(mdate, mtime)),
+            ..Default::default()
+        };
         if x.accessed.is_some() {
             ts.accessed = x.accessed;
         }
@@ -998,8 +996,10 @@ impl ZipFs {
                     .join(","),
             );
         }
-        let mut ts = Timestamps::default();
-        ts.modified = Some(dos_timestamp(l.mdate, l.mtime));
+        let ts = Timestamps {
+            modified: Some(dos_timestamp(l.mdate, l.mtime)),
+            ..Default::default()
+        };
 
         // Data span: trust the LFH's compressed size; when a data
         // descriptor holds it (bit 3, size 0), bound by the next
@@ -1263,65 +1263,63 @@ impl Iterator for ZipWalk<'_> {
     type Item = Result<FsEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(e) = self.pending.pop_front() {
-                return Some(Ok(e));
+        if let Some(e) = self.pending.pop_front() {
+            return Some(Ok(e));
+        }
+        if !self.root_done {
+            self.root_done = true;
+            self.emitted_dirs.insert(String::new());
+            return Some(Ok(FsEntry {
+                path: "/".into(),
+                name: "/".into(),
+                entry_id: u64::MAX,
+                kind: EntryKind::Directory,
+                size: 0,
+                disk_offset: 0,
+                allocated_ranges: Vec::new(),
+                timestamps: Default::default(),
+                status: FsEntryStatus::Live,
+                meta: Default::default(),
+                magic: None,
+            }));
+        }
+        if let Some(e) = self.errors.pop_front() {
+            return Some(Err(e));
+        }
+        if self.next >= self.fs.members.len() {
+            return None;
+        }
+        let idx = self.next;
+        self.next += 1;
+        // Emit implied parent directories first.
+        let m = &self.fs.members[idx];
+        let comps: Vec<&str> = m.path.split('/').collect();
+        let mut acc = String::new();
+        for c in &comps[..comps.len().saturating_sub(1)] {
+            if !acc.is_empty() {
+                acc.push('/');
             }
-            if !self.root_done {
-                self.root_done = true;
-                self.emitted_dirs.insert(String::new());
-                return Some(Ok(FsEntry {
-                    path: "/".into(),
-                    name: "/".into(),
+            acc.push_str(c);
+            if !self.emitted_dirs.contains(&acc) {
+                self.emitted_dirs.insert(acc.clone());
+                let mut meta = HashMap::new();
+                meta.insert("implied".into(), "true".into());
+                self.pending.push_back(FsEntry {
+                    path: util::join_path("/", &acc),
+                    name: acc.rsplit('/').next().unwrap_or(&acc).to_string(),
                     entry_id: u64::MAX,
                     kind: EntryKind::Directory,
                     size: 0,
-                    disk_offset: 0,
+                    disk_offset: m.disk_offset,
                     allocated_ranges: Vec::new(),
                     timestamps: Default::default(),
                     status: FsEntryStatus::Live,
-                    meta: Default::default(),
+                    meta,
                     magic: None,
-                }));
+                });
             }
-            if let Some(e) = self.errors.pop_front() {
-                return Some(Err(e));
-            }
-            if self.next >= self.fs.members.len() {
-                return None;
-            }
-            let idx = self.next;
-            self.next += 1;
-            // Emit implied parent directories first.
-            let m = &self.fs.members[idx];
-            let comps: Vec<&str> = m.path.split('/').collect();
-            let mut acc = String::new();
-            for c in &comps[..comps.len().saturating_sub(1)] {
-                if !acc.is_empty() {
-                    acc.push('/');
-                }
-                acc.push_str(c);
-                if !self.emitted_dirs.contains(&acc) {
-                    self.emitted_dirs.insert(acc.clone());
-                    let mut meta = HashMap::new();
-                    meta.insert("implied".into(), "true".into());
-                    self.pending.push_back(FsEntry {
-                        path: util::join_path("/", &acc),
-                        name: acc.rsplit('/').next().unwrap_or(&acc).to_string(),
-                        entry_id: u64::MAX,
-                        kind: EntryKind::Directory,
-                        size: 0,
-                        disk_offset: m.disk_offset,
-                        allocated_ranges: Vec::new(),
-                        timestamps: Default::default(),
-                        status: FsEntryStatus::Live,
-                        meta,
-                        magic: None,
-                    });
-                }
-            }
-            return Some(Ok(member_entry(self.fs, idx)));
         }
+        Some(Ok(member_entry(self.fs, idx)))
     }
 }
 

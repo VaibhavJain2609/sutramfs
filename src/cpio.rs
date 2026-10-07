@@ -410,14 +410,16 @@ impl CpioFs {
                 meta.insert("raw_name".into(), name.clone());
             }
 
-            let mut ts = Timestamps::default();
-            ts.modified = Some(FsTimestamp {
-                value: util::unix_nanos(1970, 1, 1, 0, 0, 0, 0)
-                    .and_then(|b| b.checked_add(hdr.mtime as i64 * 1_000_000_000)),
-                raw_value: hdr.mtime,
-                raw_encoding: "unix-sec",
-                granularity: Duration::from_secs(1),
-            });
+            let ts = Timestamps {
+                modified: Some(FsTimestamp {
+                    value: util::unix_nanos(1970, 1, 1, 0, 0, 0, 0)
+                        .and_then(|b| b.checked_add(hdr.mtime as i64 * 1_000_000_000)),
+                    raw_value: hdr.mtime,
+                    raw_encoding: "unix-sec",
+                    granularity: Duration::from_secs(1),
+                }),
+                ..Default::default()
+            };
 
             let mut status = FsEntryStatus::Live;
             if truncated {
@@ -582,66 +584,64 @@ impl Iterator for CpioWalk<'_> {
     type Item = Result<FsEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(e) = self.pending.pop_front() {
-                return Some(Ok(e));
-            }
-            if !self.root_done {
-                self.root_done = true;
-                self.emitted_dirs.insert(String::new());
-                return Some(Ok(FsEntry {
-                    path: "/".into(),
-                    name: "/".into(),
-                    entry_id: u64::MAX,
-                    kind: EntryKind::Directory,
-                    size: 0,
-                    disk_offset: 0,
-                    allocated_ranges: Vec::new(),
-                    timestamps: Default::default(),
-                    status: FsEntryStatus::Live,
-                    meta: Default::default(),
-                    magic: None,
-                }));
-            }
-            if let Some(e) = self.errors.pop_front() {
-                return Some(Err(e));
-            }
-            if self.next >= self.fs.members.len() {
-                return None;
-            }
-            let idx = self.next;
-            self.next += 1;
-            let m = &self.fs.members[idx];
-            if !m.path.starts_with("/$") {
-                let comps: Vec<&str> = m.path.split('/').collect();
-                let mut acc = String::new();
-                for c in &comps[..comps.len().saturating_sub(1)] {
-                    if !acc.is_empty() {
-                        acc.push('/');
-                    }
-                    acc.push_str(c);
-                    if !self.emitted_dirs.contains(&acc) {
-                        self.emitted_dirs.insert(acc.clone());
-                        let mut meta = HashMap::new();
-                        meta.insert("implied".into(), "true".into());
-                        self.pending.push_back(FsEntry {
-                            path: util::join_path("/", &acc),
-                            name: acc.rsplit('/').next().unwrap_or(&acc).to_string(),
-                            entry_id: u64::MAX,
-                            kind: EntryKind::Directory,
-                            size: 0,
-                            disk_offset: m.disk_offset,
-                            allocated_ranges: Vec::new(),
-                            timestamps: Default::default(),
-                            status: FsEntryStatus::Live,
-                            meta,
-                            magic: None,
-                        });
-                    }
+        if let Some(e) = self.pending.pop_front() {
+            return Some(Ok(e));
+        }
+        if !self.root_done {
+            self.root_done = true;
+            self.emitted_dirs.insert(String::new());
+            return Some(Ok(FsEntry {
+                path: "/".into(),
+                name: "/".into(),
+                entry_id: u64::MAX,
+                kind: EntryKind::Directory,
+                size: 0,
+                disk_offset: 0,
+                allocated_ranges: Vec::new(),
+                timestamps: Default::default(),
+                status: FsEntryStatus::Live,
+                meta: Default::default(),
+                magic: None,
+            }));
+        }
+        if let Some(e) = self.errors.pop_front() {
+            return Some(Err(e));
+        }
+        if self.next >= self.fs.members.len() {
+            return None;
+        }
+        let idx = self.next;
+        self.next += 1;
+        let m = &self.fs.members[idx];
+        if !m.path.starts_with("/$") {
+            let comps: Vec<&str> = m.path.split('/').collect();
+            let mut acc = String::new();
+            for c in &comps[..comps.len().saturating_sub(1)] {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(c);
+                if !self.emitted_dirs.contains(&acc) {
+                    self.emitted_dirs.insert(acc.clone());
+                    let mut meta = HashMap::new();
+                    meta.insert("implied".into(), "true".into());
+                    self.pending.push_back(FsEntry {
+                        path: util::join_path("/", &acc),
+                        name: acc.rsplit('/').next().unwrap_or(&acc).to_string(),
+                        entry_id: u64::MAX,
+                        kind: EntryKind::Directory,
+                        size: 0,
+                        disk_offset: m.disk_offset,
+                        allocated_ranges: Vec::new(),
+                        timestamps: Default::default(),
+                        status: FsEntryStatus::Live,
+                        meta,
+                        magic: None,
+                    });
                 }
             }
-            return Some(Ok(member_entry(self.fs, idx)));
         }
+        Some(Ok(member_entry(self.fs, idx)))
     }
 }
 
