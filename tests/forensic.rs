@@ -554,3 +554,32 @@ fn read_file_unknown_entry_uses_ranges_fallback() {
     fs.read_file(&fake).unwrap().read_exact(&mut head).unwrap();
     assert_eq!(&head, b"PNGDATA2");
 }
+
+#[test]
+fn decmpfs_compressed_file_flagged_not_decompressed() {
+    // A file carrying a `com.apple.decmpfs` xattr holds a compressed data
+    // fork. Decompression is unsupported (LZFSE is a separate crate), so the
+    // parser flags it honestly: `compressed`/`note` meta and `read_file`
+    // still yields the stored bytes.
+    let mut hdr = Vec::new();
+    hdr.extend_from_slice(&0x636D_7066u32.to_le_bytes()); // 'fpmc' magic
+    hdr.extend_from_slice(&4u32.to_le_bytes()); // LZFSE-in-rsrc
+    hdr.extend_from_slice(&8192u64.to_le_bytes()); // uncompressed size
+    let extra = vec![common::xattr_kv(200, "com.apple.decmpfs", &hdr)];
+    let img = common::build_image_with(false, &extra, &[]);
+    let fs = mount(img);
+    let photo = entries(fs.as_ref())
+        .into_iter()
+        .find(|e| e.path == "/photo.png")
+        .expect("photo.png entry");
+    assert_eq!(photo.meta["compressed"], "decmpfs");
+    assert!(photo.meta["note"].contains("decmpfs"));
+    assert_eq!(photo.meta["xattr_com.apple.decmpfs"], "16");
+    // Stored bytes remain readable (they are the compressed/plain payload).
+    let mut buf = Vec::new();
+    fs.read_file(&photo)
+        .unwrap()
+        .read_to_end(&mut buf)
+        .unwrap();
+    assert_eq!(buf.len(), 8192);
+}

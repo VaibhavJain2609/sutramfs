@@ -17,6 +17,13 @@ sutram-apfs = { path = ".." }
 sutram-io = { path = "../../sutram-io" }
 sutram-fs = { path = "../../sutram-fs" }
 
+[[bin]]
+name = "parse_image"
+path = "fuzz_targets/parse_image.rs"
+test = false
+doc = false
+bench = false
+
 # Keep the fuzz crate out of the parent crate's build graph.
 [workspace]
 members = ["."]

@@ -85,8 +85,62 @@ publicly documented format (the *Apple File System Reference*).
 - **Provenance** — `FsEntry.disk_offset` is the absolute byte offset of the
   inode/drec/sibling record inside the image; per-extent record offsets land
   in `meta.extent_<i>_record_off`.
+- **Compression awareness without decompression** — inodes carrying a
+  `com.apple.decmpfs` xattr are flagged (`meta.compressed=decmpfs`, plus a
+  `note`); `read_file` still yields the stored bytes.
 
-## Scope notes (v1)
+## Usage
+
+```rust,no_run
+use std::sync::Arc;
+use sutram_apfs::ApfsParser;
+use sutram_fs::{FsParser, DetectConfidence, FsEntryStatus};
+use sutram_io::{ByteSource, FileSource};
+
+let src = Arc::new(FileSource::open("container.raw")?) as Arc<dyn ByteSource>;
+if ApfsParser.detect(src.as_ref()) >= DetectConfidence::Medium {
+    let fs = ApfsParser.mount(src)?;
+    for item in fs.walk() {
+        match item {
+            Ok(e) => println!("{}\t{} B\t{:?}", e.path, e.size, e.status),
+            Err(e) => eprintln!("corruption: {e}"), // lenient-mode warnings
+        }
+    }
+}
+# Ok::<(), sutram_fs::FsError>(())
+```
+
+`ApfsParser` also offers `mount_volume(src, opts, i)` to select among the
+container's `nx_fs_oid[]` volumes, and `mount_snapshot(src, opts, snap_xid)`
+for a read-only view of the volume bounded at a snapshot's transaction id.
+A mounted `ApfsFs` exposes `snapshots()`, `volumes()`, `checkpoint_xid()`
+and `xid_bound()`.
+
+## Deleted / recovery semantics
+
+APFS never overwrites metadata in place — every commit writes a new
+checkpoint of new object versions. This parser exploits that: up to 8
+superseded checkpoints are re-mounted as *generations* and their fs trees
+are diffed against the live generation. An inode present in an old tree but
+absent live is emitted as `FsEntryStatus::Deleted` with a `RecoveryState`
+computed by intersecting the file's old extents against the blocks claimed
+by the live object graph:
+
+- `Intact` — every extent block is still unclaimed;
+- `PartiallyOverwritten { recovered_bytes, total_bytes }` — some blocks were
+  reallocated; `allocated_ranges` lists only the surviving ranges and
+  `read_file` returns only those bytes;
+- `Unrecoverable` — all blocks reused, or the inode had no extents;
+- `Unknown` — the recovery assessment could not be made.
+
+The old path is reconstructed from the old generation's directory records
+(broken parent chains fall back to `/$ORPHANED/<id>`), and
+`meta.recovered_from_xid` names the source checkpoint. Limits: recovery is
+block-granular (a partially reused block counts as lost), generations beyond
+the 8 scanned checkpoints are not searched, and data on trimmed or
+physically overwritten media is unrecoverable by definition.
+
+## Known limitations
 
 - **Contiguous checkpoint descriptor areas only.** When
   `xp_desc_blocks` high bit is set (descriptor area lives in a B-tree), the
@@ -98,6 +152,15 @@ publicly documented format (the *Apple File System Reference*).
   anyway).
 - **No decryption.** FileVault/crypto-state contents are flagged, not
   decrypted. Keys are never read from the keybag area.
+- **No decompression.** Files whose data fork is stored via the
+  `com.apple.decmpfs` mechanism (LZFSE/ZLIB/LZ4, HFS+-style compression
+  carried into APFS) are flagged `meta.compressed=decmpfs` but the stored
+  bytes are returned as-is. LZFSE decompression depends on the sibling
+  `sutram-compress` crate, which is still in progress; until it lands,
+  treating compressed forks as opaque is the honest behaviour.
+- **Sealed volumes stay sealed.** `APFS_INCOMPATIBLE_SEALED_VOLUME` is
+  reported (`meta.sealed=true`); the seal is never verified and the volume
+  is parsed structurally anyway — a torn seal is not validated against.
 - **Extent-reference tree** (`extentref_tree_oid`) and inode-delta trees are
   not interpreted; their oids are reported in `meta`.
 - **Single fs-tree per volume generation** — the file tree is the B-tree at
@@ -130,12 +193,15 @@ publicly documented format (the *Apple File System Reference*).
 
 ## Tests
 
-`cargo test` runs 12 unit tests (checksum, object header, NXSB, B-tree ToC,
-xid-bounded omap lookup) plus 15 integration tests that mount a synthetic
-two-checkpoint container built in `tests/common/mod.rs` — exercising live
-walk, file reads, hardlinks, xattrs, snapshot mounting, deleted-file
-recovery (`PartiallyOverwritten`), corrupted-block-0 tolerance, checkpoint
-fallback, strict-mode abort, truncation, and the free-space map.
+`cargo test` runs 37 unit tests (Fletcher-64, object header, NXSB, B-tree
+ToC/descent, xid-bounded omap lookup, jrecord decoding, snapshot metadata)
+plus 63 integration tests across `forensic.rs`, `robustness.rs` and
+`hostile.rs` that mount a synthetic two-checkpoint container built in
+`tests/common/mod.rs` — exercising live walk, file reads, hardlinks,
+xattrs, decmpfs flagging, snapshot mounting, deleted-file recovery
+(`Intact`/`PartiallyOverwritten`/`Unrecoverable`), corrupted-block-0
+tolerance, checkpoint fallback and rollback, strict-mode abort, truncation,
+mass corruption, and the free-space map.
 
 ## License
 

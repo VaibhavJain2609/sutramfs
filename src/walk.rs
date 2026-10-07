@@ -321,6 +321,18 @@ impl<'m> Walk<'m> {
                         );
                     }
                 }
+                if x.name == "com.apple.decmpfs" {
+                    // decmpfs: the data fork is compressed (LZFSE/ZLIB/LZ4)
+                    // inside this xattr or a dstream it points to. Flag it
+                    // honestly — decompression is not supported, so
+                    // `read_file` yields the stored (compressed) bytes.
+                    meta.insert("compressed".into(), "decmpfs".into());
+                    meta.insert(
+                        "note".into(),
+                        "decmpfs-compressed fork; read_file returns compressed bytes"
+                            .into(),
+                    );
+                }
             }
         }
 
